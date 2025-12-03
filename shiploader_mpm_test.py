@@ -12,6 +12,7 @@ import newton
 from newton.solvers import SolverImplicitMPM
 import os
 import datetime
+from trimesh import repair
 
 # MPM Parameters (from working granular example)
 DENSITY = 800.0  # kg/m³ (wheat bulk density)
@@ -29,7 +30,7 @@ SUBSTEPS = 1
 
 # Particle streaming parameters
 FEED_RATE_MTPH = 600.0  # Metric tons per hour
-INJECTION_CENTER = wp.vec3(18.75, 25.8, 5.05)  # Above spout entrance
+INJECTION_CENTER = wp.vec3(18.40, 26.34, 0.75)  # Above spout entrance
 INJECTION_RADIUS = 0.7  # 0.7m radius circular injection
 PARTICLE_POOL_MULTIPLIER = 3.0  # Pre-allocate 3x particles for streaming
 
@@ -38,18 +39,22 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 VTK_OUTPUT_DIR = f"/home/shakil/newton/vtk_output_mpm_test_{timestamp}"
 
 # Calculate derived parameters
-FRAME_DT = 1.0 / FPS
+FRAME_DT = 1/FPS
 SIM_DT = FRAME_DT / SUBSTEPS
 
 def load_shiploader_mesh():
     """Load and process the shiploader STL file."""
-    mesh = trimesh.load('/home/shakil/newton/Assemr2.STL', force='mesh')
+    mesh = trimesh.load('/home/shakil/newton/23087midslopemesh.stl', force='mesh')
+
+    # Fix inconsistent face orientations
+    repair.fix_normals(mesh, multibody=True)
 
     # CRITICAL FIX: Invert normals so interior channel is treated as exterior
     # This prevents particles from disappearing when entering the spout interior
     print(f"Mesh watertight before inversion: {mesh.is_watertight}")
     mesh.invert()
-    print(f"Mesh inverted - interior surfaces now treated as collision exteriors")
+    print(f"Mesh inverted - interior surfaces now treated as collision exteriors")                  
+
 
     vertices = mesh.vertices
     indices = mesh.faces.flatten()
@@ -82,45 +87,100 @@ def activate_particle_stream_kernel(
     particle_q[idx] = spawn_pos
     particle_qd[idx] = spawn_velocity
 
-def export_frame_vtk(frame, positions, radii, mesh_vertices, mesh_faces, filename):
-    """Export particles AND mesh geometry to VTK format (ParaView compatible)."""
-    num_particles = len(positions)
-    num_mesh_verts = len(mesh_vertices)
-    num_mesh_faces = len(mesh_faces)
+def export_frame_vtk(frame, positions, radii, velocities, mesh_vertices, mesh_faces, filename_base):
+    """Export particles and mesh geometry to TWO separate legacy VTK files
+    so ParaView can treat them as independent objects (surface vs particles).
 
-    with open(filename, 'w') as f:
+    This function will write:
+      - "<base>_particles.vtk" : unstructured grid of VTK_VERTEX cells with radius point data
+      - "<base>_mesh.vtk"      : polydata surface mesh (triangles)
+
+    The filename_base argument can still be something like ".../frame_0000.vtk";
+    the suffixes are appended automatically.
+    """
+    # Derive filenames
+    if filename_base.lower().endswith(".vtk"):
+        base = filename_base[:-4]
+    else:
+        base = filename_base
+
+    particles_filename = base + "_particles.vtk"
+    mesh_filename = base + "_mesh.vtk"
+
+    # -------------------------
+    # Part 1: particle vertices
+    # -------------------------
+    num_particles = len(positions)
+
+    with open(particles_filename, "w") as f:
         f.write("# vtk DataFile Version 3.0\n")
-        f.write(f"MPM Test frame {frame}\n")
+        f.write(f"MPM particles frame {frame}\n")
         f.write("ASCII\n")
         f.write("DATASET UNSTRUCTURED_GRID\n\n")
-        f.write(f"POINTS {num_particles + num_mesh_verts} float\n")
+
+        # Points
+        f.write(f"POINTS {num_particles} float\n")
         for pos in positions:
             f.write(f"{pos[0]} {pos[1]} {pos[2]}\n")
-        for v in mesh_vertices:
-            f.write(f"{v[0]} {v[1]} {v[2]}\n")
 
-        total_cells = num_particles + num_mesh_faces
-        cell_size = num_particles * 2 + num_mesh_faces * 4
-        f.write(f"\nCELLS {total_cells} {cell_size}\n")
+        # One VTK_VERTEX cell per particle
+        f.write(f"\nCELLS {num_particles} {num_particles * 2}\n")
         for i in range(num_particles):
             f.write(f"1 {i}\n")
-        for face in mesh_faces:
-            v0, v1, v2 = face
-            f.write(f"3 {v0 + num_particles} {v1 + num_particles} {v2 + num_particles}\n")
 
-        f.write(f"\nCELL_TYPES {total_cells}\n")
-        for i in range(num_particles):
+        # Cell types: 1 = VTK_VERTEX
+        f.write(f"\nCELL_TYPES {num_particles}\n")
+        for _ in range(num_particles):
             f.write("1\n")
-        for i in range(num_mesh_faces):
-            f.write("5\n")
 
-        f.write(f"\nPOINT_DATA {num_particles + num_mesh_verts}\n")
+        # ---- Point data: radius + velocity ----
+        f.write(f"\nPOINT_DATA {num_particles}\n")
+
+
+        # 1) radius scalar
         f.write("SCALARS radius float 1\n")
         f.write("LOOKUP_TABLE default\n")
         for r in radii:
             f.write(f"{r}\n")
-        for i in range(num_mesh_verts):
-            f.write("0.0\n")
+
+
+        # 2) velocity vector (for vector glyphs / streamlines)
+        f.write("\nVECTORS velocity float\n")
+        for v in velocities:
+            f.write(f"{v[0]} {v[1]} {v[2]}\n")
+
+
+        # 3) speed scalar (nice for colour maps)
+        speeds = np.linalg.norm(velocities, axis=1)
+        f.write("\nSCALARS speed float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for s in speeds:
+            f.write(f"{s}\n")
+
+    # -------------------------
+    # Part 2: surface mesh
+    # -------------------------
+    num_mesh_verts = len(mesh_vertices)
+    num_mesh_faces = len(mesh_faces)
+
+    with open(mesh_filename, "w") as f:
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(f"MPM mesh frame {frame}\n")
+        f.write("ASCII\n")
+        # Surface as POLYDATA
+        f.write("DATASET POLYDATA\n\n")
+
+        # Mesh vertices
+        f.write(f"POINTS {num_mesh_verts} float\n")
+        for v in mesh_vertices:
+            f.write(f"{v[0]} {v[1]} {v[2]}\n")
+
+        # Mesh faces as triangles (POLYGONS)
+        f.write(f"\nPOLYGONS {num_mesh_faces} {num_mesh_faces * 4}\n")
+        for face in mesh_faces:
+            v0, v1, v2 = face
+            f.write(f"3 {v0} {v1} {v2}\n")
+
 
 def calculate_streaming_params():
     """Calculate particle streaming parameters from feed rate."""
@@ -252,7 +312,7 @@ def main():
     # Enable collision on both inside and outside of mesh surfaces
     mpm_model.setup_collider(
         body_mass=wp.zeros_like(model.body_mass),  # Static/kinematic meshes
-        collider_thicknesses=[0.15],  # 15cm collision margin for bidirectional contact
+        collider_thicknesses=[0.04],  # 15cm collision margin for bidirectional contact
         ground_height=-1000.0  # Disable ground plane (using mesh instead)
     )
 
@@ -341,14 +401,18 @@ def main():
             if step % VTK_EXPORT_INTERVAL == 0 or step == num_steps - 1:
                 # Get active particle positions (exclude those above Y=90)
                 positions = state_0.particle_q.numpy()
+                velocities = state_0.particle_qd.numpy()
+
                 particle_y = positions[:, 1]
-                active_indices = np.where((particle_y < 90.0) & (particle_y > -20.0))[0]
+                active_indices = np.where(particle_y < 90.0)[0
+                        ]
                 active_positions = positions[active_indices]
+                active_velocities = velocities[active_indices]
                 radii = np.full(len(active_positions), PARTICLE_RADIUS)
 
                 vtk_filename = os.path.join(VTK_OUTPUT_DIR, f"frame_{frame_count:04d}.vtk")
                 if len(active_positions) > 0:
-                    export_frame_vtk(frame_count, active_positions, radii, mesh_vertices, mesh_faces, vtk_filename)
+                    export_frame_vtk(frame_count, active_positions, radii, active_velocities, mesh_vertices, mesh_faces, vtk_filename)
 
                 frame_count += 1
 
