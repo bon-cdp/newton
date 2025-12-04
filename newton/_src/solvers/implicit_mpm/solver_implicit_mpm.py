@@ -178,6 +178,40 @@ def free_velocity(
     velocity_avg[i] = vel
 
 
+@wp.kernel
+def clamp_grid_velocities(
+    velocity: wp.array(dtype=wp.vec3),
+    max_velocity: float,
+):
+    """Clamp grid velocities to CFL-safe values after P2G transfer.
+
+    This prevents extreme grid states when particles have high velocities
+    (e.g., 20+ m/s in long free-fall scenarios) that would otherwise
+    seed the implicit solve with values the iterative solver struggles to correct.
+    """
+    i = wp.tid()
+    v_norm_sq = wp.length_sq(velocity[i])
+    if v_norm_sq > max_velocity * max_velocity:
+        velocity[i] = velocity[i] * max_velocity / wp.sqrt(v_norm_sq)
+
+
+@wp.kernel
+def clamp_velocity_gradients(
+    vel_grad: wp.array(dtype=wp.mat33),
+    max_grad: float,
+):
+    """Clamp velocity gradient (C matrix) to prevent APIC amplification.
+
+    For high-speed impacts, the velocity gradient can have large eigenvalues.
+    When multiplied by node_offset in APIC transfer, this can create
+    spurious velocities that exceed the actual particle velocity.
+    """
+    i = wp.tid()
+    for row in range(3):
+        for col in range(3):
+            vel_grad[i][row, col] = wp.clamp(vel_grad[i][row, col], -max_grad, max_grad)
+
+
 @wp.struct
 class MaterialParameters:
     young_modulus: wp.array(dtype=float)
@@ -2072,6 +2106,18 @@ class SolverImplicitMPM(SolverBase):
             )
 
             if self.apic:
+                # Clamp velocity gradients before APIC transfer to prevent amplification
+                # For high-speed impacts, C matrix can have large eigenvalues
+                max_vel_grad = 100.0  # 100 s^-1 max gradient
+                wp.launch(
+                    clamp_velocity_gradients,
+                    dim=model.particle_count,
+                    inputs=[
+                        state_in.particle_qd_grad,
+                        max_vel_grad,
+                    ],
+                )
+
                 fem.integrate(
                     integrate_velocity_apic,
                     quadrature=pic,
@@ -2111,6 +2157,18 @@ class SolverImplicitMPM(SolverBase):
                 outputs=[
                     scratch.inv_mass_matrix,
                     state_out.velocity_field.dof_values,
+                ],
+            )
+
+            # CFL-based velocity clamping for high-speed flows
+            # Clamp to 2x CFL limit to prevent extreme grid states
+            max_grid_velocity = 2.0 * self.mpm_model.voxel_size / dt
+            wp.launch(
+                clamp_grid_velocities,
+                dim=vel_node_count,
+                inputs=[
+                    state_out.velocity_field.dof_values,
+                    max_grid_velocity,
                 ],
             )
 

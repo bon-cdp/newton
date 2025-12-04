@@ -16,17 +16,24 @@ from trimesh import repair
 
 # MPM Parameters (from working granular example)
 DENSITY = 800.0  # kg/m³ (wheat bulk density)
-YOUNG_MODULUS = 1.0e15  # Pa (MPM default for granular)
+YOUNG_MODULUS = 1.0e15  # Pa (penalty parameter for incompressibility - intentionally high!)
 POISSON_RATIO = 0.3
-FRICTION_COEFF = 0.68  # From MPM example
+FRICTION_COEFF = 0.75  # Slightly higher for better pile stability
 DAMPING = 0.0
-VOXEL_SIZE = 0.06  # 60mm grid cells (controls particle size in MPM)
-PARTICLE_RADIUS = 0.020  # Target: 40mm diameter particles
+VOXEL_SIZE = 0.06  # 60mm grid cells (voxel/radius ratio = 2.0)
+PARTICLE_RADIUS = 0.030  # 60mm diameter particles (faster testing)
 
 # Simulation parameters
-DURATION = 10.0  # seconds - short test
+DURATION = 10.0  # seconds
 FPS = 60.0
 SUBSTEPS = 1
+
+# Plasticity parameters
+YIELD_PRESSURE = 1.0e12  # Pa - high = stay elastic (marble-like behavior)
+TENSILE_YIELD_RATIO = 0.0  # No tensile strength (cohesionless)
+YIELD_STRESS = 0.0  # No cohesive yield stress
+HARDENING = 5.0  # Moderate exponential stiffening (was 50 = too extreme)
+CRITICAL_FRACTION = 0.0  # Disabled - mesh volume calculation issues with inverted mesh
 
 # Particle streaming parameters
 FEED_RATE_MTPH = 600.0  # Metric tons per hour
@@ -34,9 +41,10 @@ INJECTION_CENTER = wp.vec3(18.40, 26.34, 0.75)  # Above spout entrance
 INJECTION_RADIUS = 0.7  # 0.7m radius circular injection
 PARTICLE_POOL_MULTIPLIER = 3.0  # Pre-allocate 3x particles for streaming
 
-# VTK Output
+# VTK Output - use current directory for output
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-VTK_OUTPUT_DIR = f"/home/shakil/newton/vtk_output_mpm_test_{timestamp}"
+VTK_OUTPUT_DIR = os.path.join(SCRIPT_DIR, f"vtk_output_mpm_test_{timestamp}")
 
 # Calculate derived parameters
 FRAME_DT = 1/FPS
@@ -44,7 +52,8 @@ SIM_DT = FRAME_DT / SUBSTEPS
 
 def load_shiploader_mesh():
     """Load and process the shiploader STL file."""
-    mesh = trimesh.load('/home/shakil/newton/23087midslopemesh.stl', force='mesh')
+    stl_path = os.path.join(SCRIPT_DIR, '23087midslopemesh.stl')
+    mesh = trimesh.load(stl_path, force='mesh')
 
     # Fix inconsistent face orientations
     repair.fix_normals(mesh, multibody=True)
@@ -261,7 +270,7 @@ def main():
     builder = newton.ModelBuilder()
 
     # Load shiploader STL as collision mesh
-    print("Loading Assemr2.STL...")
+    print("Loading Assem...")
     shiploader_mesh, bounds, trimesh_obj = load_shiploader_mesh()
     print(f"Mesh bounds:")
     print(f"  X: {bounds[0][0]:.2f} to {bounds[1][0]:.2f} m")
@@ -299,10 +308,19 @@ def main():
     mpm_options.poisson_ratio = POISSON_RATIO
     mpm_options.friction_coeff = FRICTION_COEFF
     mpm_options.damping = DAMPING
+
+    # Plasticity - key fix for overcompression
+    mpm_options.yield_pressure = YIELD_PRESSURE
+    mpm_options.tensile_yield_ratio = TENSILE_YIELD_RATIO
+    mpm_options.yield_stress = YIELD_STRESS
+    mpm_options.hardening = HARDENING
+    mpm_options.critical_fraction = CRITICAL_FRACTION
+
     mpm_options.voxel_size = VOXEL_SIZE
     mpm_options.grid_type = "sparse"
-    mpm_options.max_iterations = 250
-    mpm_options.tolerance = 1.0e-6
+    mpm_options.max_iterations = 500  # Increased for better convergence
+    mpm_options.tolerance = 1.0e-7  # Tighter convergence threshold
+    mpm_options.air_drag = 5.0  # Add damping for high-speed flow stability
 
     # Create MPM model and solver
     mpm_model = SolverImplicitMPM.Model(model, mpm_options)
@@ -312,7 +330,7 @@ def main():
     # Enable collision on both inside and outside of mesh surfaces
     mpm_model.setup_collider(
         body_mass=wp.zeros_like(model.body_mass),  # Static/kinematic meshes
-        collider_thicknesses=[0.04],  # 15cm collision margin for bidirectional contact
+        collider_thicknesses=[0.0],  # Removed artificial margin - let contact happen naturally
         ground_height=-1000.0  # Disable ground plane (using mesh instead)
     )
 
@@ -446,12 +464,13 @@ def main():
     print(f"  Y range: {np.max(final_positions[:, 1]) - np.min(final_positions[:, 1]):.2f} m")
 
     # Check if particles fell (Y decreased significantly)
-    initial_y_avg = (EMIT_LO[1] + EMIT_HI[1]) / 2
+    # Use INJECTION_CENTER Y coordinate as reference (where particles are spawned)
+    initial_y_avg = float(INJECTION_CENTER[1])  # Convert from wp.vec3
     final_y_avg = np.mean(final_positions[:, 1])
     y_drop = initial_y_avg - final_y_avg
 
     print(f"\nParticle movement:")
-    print(f"  Initial Y (avg): {initial_y_avg:.2f} m")
+    print(f"  Initial Y (injection): {initial_y_avg:.2f} m")
     print(f"  Final Y (avg): {final_y_avg:.2f} m")
     print(f"  Y drop: {y_drop:.2f} m")
 
