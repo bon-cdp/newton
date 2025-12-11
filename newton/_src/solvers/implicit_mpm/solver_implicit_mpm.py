@@ -2108,7 +2108,7 @@ class SolverImplicitMPM(SolverBase):
             if self.apic:
                 # Clamp velocity gradients before APIC transfer to prevent amplification
                 # For high-speed impacts, C matrix can have large eigenvalues
-                max_vel_grad = 100.0  # 100 s^-1 max gradient
+                max_vel_grad = 500.0  # Allow more rotational motion for flow over pile
                 wp.launch(
                     clamp_velocity_gradients,
                     dim=model.particle_count,
@@ -2161,8 +2161,8 @@ class SolverImplicitMPM(SolverBase):
             )
 
             # CFL-based velocity clamping for high-speed flows
-            # Clamp to 2x CFL limit to prevent extreme grid states
-            max_grid_velocity = 2.0 * self.mpm_model.voxel_size / dt
+            # Clamp to 5x CFL limit - allows ~18 m/s for proper flow over pile
+            max_grid_velocity = 500.0 * self.mpm_model.voxel_size / dt
             wp.launch(
                 clamp_grid_velocities,
                 dim=vel_node_count,

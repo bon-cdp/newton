@@ -18,7 +18,7 @@ from trimesh import repair
 DENSITY = 800.0  # kg/m³ (wheat bulk density)
 YOUNG_MODULUS = 1.0e15  # Pa (penalty parameter for incompressibility - intentionally high!)
 POISSON_RATIO = 0.3
-FRICTION_COEFF = 0.75  # Slightly higher for better pile stability
+FRICTION_COEFF = 0.2  # Lower friction for better flow
 DAMPING = 0.0
 VOXEL_SIZE = 0.06  # 60mm grid cells (voxel/radius ratio = 2.0)
 PARTICLE_RADIUS = 0.030  # 60mm diameter particles (faster testing)
@@ -32,7 +32,7 @@ SUBSTEPS = 1
 YIELD_PRESSURE = 1.0e12  # Pa - high = stay elastic (marble-like behavior)
 TENSILE_YIELD_RATIO = 0.0  # No tensile strength (cohesionless)
 YIELD_STRESS = 0.0  # No cohesive yield stress
-HARDENING = 5.0  # Moderate exponential stiffening (was 50 = too extreme)
+HARDENING = 1.0  # Low hardening for more independent particle behavior
 CRITICAL_FRACTION = 0.0  # Disabled - mesh volume calculation issues with inverted mesh
 
 # Particle streaming parameters
@@ -320,7 +320,7 @@ def main():
     mpm_options.grid_type = "sparse"
     mpm_options.max_iterations = 500  # Increased for better convergence
     mpm_options.tolerance = 1.0e-7  # Tighter convergence threshold
-    mpm_options.air_drag = 5.0  # Add damping for high-speed flow stability
+    mpm_options.air_drag = 1.0  # Default value - less damping for better flow
 
     # Create MPM model and solver
     mpm_model = SolverImplicitMPM.Model(model, mpm_options)
