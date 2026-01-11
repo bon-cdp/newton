@@ -96,6 +96,7 @@ def collision_sdf(
 
     min_sdf = ground_sdf
     sdf_grad = collider.ground_normal
+    sdf_grad_best = collider.ground_normal  # Store best normal for closest collision
     sdf_vel = wp.vec3(0.0)
     closest_point = wp.vec3(0.0)
     collider_id = int(_GROUND_COLLIDER_ID)
@@ -125,16 +126,31 @@ def collision_sdf(
             thickness = collider.material_thickness[mesh_material_id]
 
             offset = x_local - cp
-            d = wp.length(offset) * query.sign
-            sdf = d - thickness
+            d = wp.length(offset)
 
+            # Compute normal - use direction from contact to particle (always points toward particle)
+            # This makes the mesh two-sided without needing to flip
+            if d < _CLOSEST_POINT_NORMAL_EPSILON:
+                # Very close to surface - use face normal, but ensure it points toward particle
+                face_normal = wp.mesh_eval_face_normal(mesh, query.face)
+                # If face normal points away, flip it
+                if wp.dot(offset, face_normal) < 0.0:
+                    sdf_grad = -face_normal
+                else:
+                    sdf_grad = face_normal
+            else:
+                # Use direction from contact to particle (always points toward particle)
+                sdf_grad = wp.normalize(offset)
+
+            # Compute SDF using absolute value - makes mesh two-sided
+            # Use absolute value so it doesn't matter which side particle is on
+            d_oriented = wp.abs(wp.dot(offset, sdf_grad))
+            sdf = d_oriented - thickness
+
+            # Check if this is the closest collision
             if sdf < min_sdf:
                 min_sdf = sdf
-                if wp.abs(d) < _CLOSEST_POINT_NORMAL_EPSILON:
-                    sdf_grad = wp.mesh_eval_face_normal(mesh, query.face)
-                else:
-                    sdf_grad = wp.normalize(offset) * query.sign
-
+                sdf_grad_best = sdf_grad
                 sdf_vel = wp.mesh_eval_velocity(mesh, query.face, query.u, query.v)
                 closest_point = cp
                 collider_id = m
@@ -151,12 +167,15 @@ def collision_sdf(
             b_rot = wp.transform_get_rotation(body_q[body_id])
 
             sdf_vel = wp.quat_rotate(b_rot, sdf_vel)
-            sdf_grad = wp.normalize(wp.quat_rotate(b_rot, sdf_grad))
+            sdf_grad = wp.normalize(wp.quat_rotate(b_rot, sdf_grad_best))
 
             # Assumes linear/angular velocities in world frame
             b_v = wp.spatial_top(body_qd[body_id])
             b_w = wp.spatial_bottom(body_qd[body_id])
             sdf_vel = b_v + wp.cross(b_w, wp.quat_rotate(b_rot, closest_point - collider.body_com[body_id]))
+        else:
+            # Static mesh - use the oriented normal directly (already in world space)
+            sdf_grad = sdf_grad_best
 
     return min_sdf, sdf_grad, sdf_vel, collider_id, material_id
 
