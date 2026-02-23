@@ -1174,6 +1174,7 @@ class ImplicitMPMModel:
         collider_friction: list[float] | None = None,
         collider_adhesion: list[float] | None = None,
         collider_projection_threshold: list[float] | None = None,
+        collider_two_sided: list[bool] | None = None,
         ground_height: float = -_INFINITY,
         ground_normal: wp.vec3 | None = None,
         model: newton.Model | None = None,
@@ -1246,6 +1247,8 @@ class ImplicitMPMModel:
             collider_friction = [None] * collider_count
         if collider_adhesion is None:
             collider_adhesion = [None] * collider_count
+        if collider_two_sided is None:
+            collider_two_sided = [False] * collider_count
 
         assert len(collider_body_ids) == len(collider_thicknesses)
         assert len(collider_body_ids) == len(collider_projection_threshold)
@@ -1353,6 +1356,7 @@ class ImplicitMPMModel:
             self.collider.collider_body_index = wp.array(collider_body_ids, dtype=int)
             self.collider.collider_mesh = wp.array([collider.id for collider in collider_meshes], dtype=wp.uint64)
             self.collider.collider_max_thickness = wp.array(collider_max_thickness, dtype=float)
+            self.collider.collider_two_sided = wp.array([int(ts) for ts in collider_two_sided], dtype=int)
 
             self.collider.face_material_index = wp.array(np.concatenate(face_material_ids), dtype=int)
 

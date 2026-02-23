@@ -38,6 +38,11 @@ _INFINITY = wp.constant(1.0e12)
 _CLOSEST_POINT_NORMAL_EPSILON = wp.constant(1.0e-3)
 """Epsilon for closest point normal calculation"""
 
+_SDF_SIGN_FROM_AVERAGE_NORMAL = True
+"""If true, determine the sign of the sdf from the average normal of the faces around the closest point.
+Otherwise, use Warp's default sign determination strategy (raycasts).
+"""
+
 _NULL_COLLIDER_ID = -2
 _GROUND_COLLIDER_ID = -1
 _GROUND_COLLIDER_MATERIAL_INDEX = 0
@@ -71,6 +76,10 @@ class Collider:
     material_projection_threshold: wp.array(dtype=float)
     """Projection threshold for each collider material. Shape (material_count,)"""
 
+    collider_two_sided: wp.array(dtype=int)
+    """Whether each collider uses two-sided collision (1) or single-sided (0). Shape (collider_count,).
+    Two-sided treats the surface as a thin shell, repelling particles from both sides."""
+
     body_com: wp.array(dtype=wp.vec3)
     """Body center of mass of each collider. Shape (body_count,)"""
 
@@ -82,6 +91,35 @@ class Collider:
 
     ground_normal: wp.vec3
     """Normal of the ground"""
+
+
+@wp.func
+def get_average_face_normal(
+    mesh_id: wp.uint64,
+    point: wp.vec3,
+):
+    """Computes the average face normal at a point on a mesh.
+    (average of face normals within an epsilon-distance of the point)
+    """
+    face_normal = wp.vec3(0.0)
+
+    vidx = wp.mesh_get(mesh_id).indices
+    points = wp.mesh_get(mesh_id).points
+    eps_sq = _CLOSEST_POINT_NORMAL_EPSILON * _CLOSEST_POINT_NORMAL_EPSILON
+
+    epsilon = wp.vec3(_CLOSEST_POINT_NORMAL_EPSILON)
+    aabb_query = wp.mesh_query_aabb(mesh_id, point - epsilon, point + epsilon)
+    face_index = wp.int32(0)
+    while wp.mesh_query_aabb_next(aabb_query, face_index):
+        V0 = points[vidx[face_index * 3 + 0]]
+        V1 = points[vidx[face_index * 3 + 1]]
+        V2 = points[vidx[face_index * 3 + 2]]
+
+        sq_dist, _coords = fem.geometry.closest_point.project_on_tri_at_origin(point - V0, V1 - V0, V2 - V0)
+        if sq_dist < eps_sq:
+            face_normal += wp.mesh_eval_face_normal(mesh_id, face_index)
+
+    return wp.normalize(face_normal)
 
 
 @wp.func
@@ -116,24 +154,55 @@ def collision_sdf(
             x_local = x
 
         max_dist = collider.query_max_dist + thickness
-        query = wp.mesh_query_point_sign_normal(mesh, x_local, max_dist)
+        two_sided = collider.collider_two_sided[m]
+
+        if two_sided:
+            query = wp.mesh_query_point_no_sign(mesh, x_local, max_dist)
+        elif wp.static(_SDF_SIGN_FROM_AVERAGE_NORMAL):
+            query = wp.mesh_query_point_no_sign(mesh, x_local, max_dist)
+        else:
+            query = wp.mesh_query_point_sign_normal(mesh, x_local, max_dist)
 
         if query.result:
             cp = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
             mesh_material_id = collider.face_material_index[global_face_id + query.face]
-
             thickness = collider.material_thickness[mesh_material_id]
-
             offset = x_local - cp
-            d = wp.length(offset) * query.sign
-            sdf = d - thickness
+            d_unsigned = wp.length(offset)
+
+            if two_sided:
+                # Two-sided: use unsigned distance with enforced collision shell
+                # Shell thickness = max(material_thickness, query_max_dist) so that
+                # particles within ~1 voxel of the surface are in the collision zone
+                effective_thickness = wp.max(thickness, collider.query_max_dist)
+                d = d_unsigned
+                sdf = d - effective_thickness
+            else:
+                # Single-sided: use signed distance (standard behavior)
+                if wp.static(_SDF_SIGN_FROM_AVERAGE_NORMAL):
+                    face_normal = get_average_face_normal(mesh, cp)
+                    sign = wp.where(wp.dot(face_normal, offset) > 0.0, 1.0, -1.0)
+                else:
+                    sign = query.sign
+                d = d_unsigned * sign
+                sdf = d - thickness
 
             if sdf < min_sdf:
                 min_sdf = sdf
-                if wp.abs(d) < _CLOSEST_POINT_NORMAL_EPSILON:
-                    sdf_grad = wp.mesh_eval_face_normal(mesh, query.face)
+                if two_sided:
+                    # Always push away from nearest surface point
+                    if d_unsigned < _CLOSEST_POINT_NORMAL_EPSILON:
+                        sdf_grad = wp.mesh_eval_face_normal(mesh, query.face)
+                    else:
+                        sdf_grad = wp.normalize(offset)
                 else:
-                    sdf_grad = wp.normalize(offset) * query.sign
+                    if wp.abs(d) < _CLOSEST_POINT_NORMAL_EPSILON:
+                        if wp.static(_SDF_SIGN_FROM_AVERAGE_NORMAL):
+                            sdf_grad = face_normal
+                        else:
+                            sdf_grad = wp.mesh_eval_face_normal(mesh, query.face)
+                    else:
+                        sdf_grad = wp.normalize(offset) * sign
 
                 sdf_vel = wp.mesh_eval_velocity(mesh, query.face, query.u, query.v)
                 closest_point = cp

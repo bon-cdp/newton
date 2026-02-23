@@ -15,30 +15,30 @@ import datetime
 from trimesh import repair
 
 # MPM Parameters (from working granular example)
-DENSITY = 800.0  # kg/m³ (wheat bulk density)
+DENSITY = 600.0  # kg/m³ (wheat bulk density)
 YOUNG_MODULUS = 1.0e15  # Pa (penalty parameter for incompressibility - intentionally high!)
 POISSON_RATIO = 0.3
-FRICTION_COEFF = 0.2  # Lower friction for better flow
+FRICTION_COEFF = 0.3  # Lower friction for better flow
 DAMPING = 0.0
-VOXEL_SIZE = 0.06  # 60mm grid cells (voxel/radius ratio = 2.0)
+VOXEL_SIZE = 0.05  # 60mm grid cells (voxel/radius ratio = 2.0)
 PARTICLE_RADIUS = 0.030  # 60mm diameter particles (faster testing)
 
 # Simulation parameters
-DURATION = 10.0  # seconds
+DURATION = 6.0  # seconds
 FPS = 60.0
 SUBSTEPS = 1
 
 # Plasticity parameters
-YIELD_PRESSURE = 1.0e12  # Pa - high = stay elastic (marble-like behavior)
+YIELD_PRESSURE = 1.0e8  # Pa - high = stay elastic (marble-like behavior)
 TENSILE_YIELD_RATIO = 0.0  # No tensile strength (cohesionless)
 YIELD_STRESS = 0.0  # No cohesive yield stress
-HARDENING = 1.0  # Low hardening for more independent particle behavior
+HARDENING = 0.0  # Low hardening for more independent particle behavior
 CRITICAL_FRACTION = 0.0  # Disabled - mesh volume calculation issues with inverted mesh
 
 # Particle streaming parameters
 FEED_RATE_MTPH = 600.0  # Metric tons per hour
-INJECTION_CENTER = wp.vec3(18.40, 26.34, 0.75)  # Above spout entrance
-INJECTION_RADIUS = 0.7  # 0.7m radius circular injection
+INJECTION_CENTER = wp.vec3(1.6, 19.0, 1.3)  # Above spout entrance
+INJECTION_RADIUS = 0.5  # 0.7m radius circular injection
 PARTICLE_POOL_MULTIPLIER = 3.0  # Pre-allocate 3x particles for streaming
 
 # VTK Output - use current directory for output
@@ -57,13 +57,6 @@ def load_shiploader_mesh():
 
     # Fix inconsistent face orientations
     repair.fix_normals(mesh, multibody=True)
-
-    # CRITICAL FIX: Invert normals so interior channel is treated as exterior
-    # This prevents particles from disappearing when entering the spout interior
-    print(f"Mesh watertight before inversion: {mesh.is_watertight}")
-    mesh.invert()
-    print(f"Mesh inverted - interior surfaces now treated as collision exteriors")                  
-
 
     vertices = mesh.vertices
     indices = mesh.faces.flatten()
@@ -331,6 +324,7 @@ def main():
     mpm_model.setup_collider(
         body_mass=wp.zeros_like(model.body_mass),  # Static/kinematic meshes
         collider_thicknesses=[0.0],  # Removed artificial margin - let contact happen naturally
+        collider_two_sided=[True],  # Two-sided: repel particles from both sides of the surface
         ground_height=-1000.0  # Disable ground plane (using mesh instead)
     )
 
