@@ -602,19 +602,6 @@ class ImplicitMPMOptions:
     air_drag: float = 1.0
     """Numerical drag for the background air."""
 
-    # high-speed-flow safeguards (fork-local; upstream has neither)
-    max_velocity_gradient: float = 500.0
-    """Component-wise cap on the APIC velocity gradient C (1/s).  <= 0 disables it.
-
-    Note this is an absolute rate, so it does not scale with the discretisation:
-    the physical gradients in a flow are ~ velocity / voxel_size, so halving the
-    voxel size doubles them and the cap bites twice as hard.  It is applied
-    component-wise rather than to the norm, which makes it anisotropic.  Prefer
-    disabling it and fixing the underlying instability."""
-    max_grid_velocity_cfl: float = 500.0
-    """Cap on grid velocity after P2G, as a multiple of voxel_size / dt.  <= 0
-    disables it.  A value of 1.0 is one cell per step."""
-
     # experimental
     collider_normal_from_sdf_gradient: bool = False
     """Compute collider normals from sdf gradient rather than closest point"""
@@ -1187,7 +1174,7 @@ class ImplicitMPMModel:
         collider_friction: list[float] | None = None,
         collider_adhesion: list[float] | None = None,
         collider_projection_threshold: list[float] | None = None,
-        collider_two_sided: list[bool] | None = None,
+        collider_flip_normals: list[bool] | None = None,
         ground_height: float = -_INFINITY,
         ground_normal: wp.vec3 | None = None,
         model: newton.Model | None = None,
@@ -1216,6 +1203,8 @@ class ImplicitMPMModel:
             collider_adhesion: Per-mesh adhesion (Pa).
             collider_projection_threshold: Per-mesh projection threshold, i.e. how far below the surface the
               particle may be before it is projected out. (m)
+            collider_flip_normals: Per-mesh flag to flip surface normals in collision queries. When True, the inside
+              of the mesh is treated as the free side. Use for hollow/channel geometries where particles flow inside.
             ground_height: Height of the ground plane.
             ground_normal: Normal of the ground plane (default to model.up_axis).
             model: The model to read collider properties from. Default to self.model.
@@ -1260,8 +1249,8 @@ class ImplicitMPMModel:
             collider_friction = [None] * collider_count
         if collider_adhesion is None:
             collider_adhesion = [None] * collider_count
-        if collider_two_sided is None:
-            collider_two_sided = [False] * collider_count
+        if collider_flip_normals is None:
+            collider_flip_normals = [False] * collider_count
 
         assert len(collider_body_ids) == len(collider_thicknesses)
         assert len(collider_body_ids) == len(collider_projection_threshold)
@@ -1369,7 +1358,7 @@ class ImplicitMPMModel:
             self.collider.collider_body_index = wp.array(collider_body_ids, dtype=int)
             self.collider.collider_mesh = wp.array([collider.id for collider in collider_meshes], dtype=wp.uint64)
             self.collider.collider_max_thickness = wp.array(collider_max_thickness, dtype=float)
-            self.collider.collider_two_sided = wp.array([int(ts) for ts in collider_two_sided], dtype=int)
+            self.collider.collider_flip_normals = wp.array([int(ts) for ts in collider_flip_normals], dtype=int)
 
             self.collider.face_material_index = wp.array(np.concatenate(face_material_ids), dtype=int)
 
@@ -1643,8 +1632,6 @@ class SolverImplicitMPM(SolverBase):
         self.apic = options.transfer_scheme == "apic"
         self.max_active_cell_count = options.max_active_cell_count
         self.collider_normal_from_sdf_gradient = options.collider_normal_from_sdf_gradient
-        self.max_velocity_gradient = float(options.max_velocity_gradient)
-        self.max_grid_velocity_cfl = float(options.max_grid_velocity_cfl)
 
         self.temporary_store = fem.TemporaryStore()
 
@@ -2124,15 +2111,16 @@ class SolverImplicitMPM(SolverBase):
                 output_dtype=wp.vec3,
             )
 
-            if self.apic and self.max_velocity_gradient > 0.0:
+            if self.apic:
                 # Clamp velocity gradients before APIC transfer to prevent amplification
                 # For high-speed impacts, C matrix can have large eigenvalues
+                max_vel_grad = 500.0  # Allow more rotational motion for flow over pile
                 wp.launch(
                     clamp_velocity_gradients,
                     dim=model.particle_count,
                     inputs=[
                         state_in.particle_qd_grad,
-                        self.max_velocity_gradient,
+                        max_vel_grad,
                     ],
                 )
 
@@ -2179,16 +2167,16 @@ class SolverImplicitMPM(SolverBase):
             )
 
             # CFL-based velocity clamping for high-speed flows
-            if self.max_grid_velocity_cfl > 0.0:
-                max_grid_velocity = self.max_grid_velocity_cfl * self.mpm_model.voxel_size / dt
-                wp.launch(
-                    clamp_grid_velocities,
-                    dim=vel_node_count,
-                    inputs=[
-                        state_out.velocity_field.dof_values,
-                        max_grid_velocity,
-                    ],
-                )
+            # Clamp to 5x CFL limit - allows ~18 m/s for proper flow over pile
+            max_grid_velocity = 500.0 * self.mpm_model.voxel_size / dt
+            wp.launch(
+                clamp_grid_velocities,
+                dim=vel_node_count,
+                inputs=[
+                    state_out.velocity_field.dof_values,
+                    max_grid_velocity,
+                ],
+            )
 
         if has_compliant_colliders:
             with wp.ScopedTimer(

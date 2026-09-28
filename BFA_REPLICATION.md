@@ -1,0 +1,107 @@
+# Newton DEM — BulkFlowAnalyst replication
+
+Reproducing a BulkFlowAnalyst (BFA) DEM run of the 23087 quarter-scale shiploader spout
+(corn, 6 mm grains, 10 s, 8.61 kg/s) in NVIDIA Newton, to establish that Newton can match
+a commercial DEM code on a real machine — and then run cases BFA cannot afford.
+
+## Layout
+
+| path | what |
+|---|---|
+| `granular_dem.py` | **`SolverGranularDEM`** — the soft-sphere DEM. Linear spring-dashpot or Hertz–Mindlin, Coulomb friction, rolling friction, rotation, Cundall–Strack tangential history, open-shell mesh colliders. |
+| `bfa_dem.py` | the DEM runner for this machine: injection, recycling, per-part wall friction, stats, VTK. |
+| `bfa_replication_mpm.py` | the earlier MPM runner. Still imported by the DEM tooling for `COLLIDER_PARTS` and `load_part`. |
+| `compare_bfa_dem.py` | scores a run against BFA (hold-up, KE, chute, cascade, discharge, rms). |
+| `compare_bfa_mpm.py` | readers for BFA's undocumented binary `.por` / `.his` output. |
+| `bfa_params_audit.py` | re-derives every BFA input from the `.prj` / `.est` / `.lin`. |
+| `export_bfa_vtk.py` | writes the BFA reference to `bfa_reference_vtk/` in our VTK format. |
+| `angle_of_repose.py` | pours a heap and measures the angle our contact law actually produces. |
+| `test_rotation.py` | analytic checks: rolling incline `(5/7)g sinθ`, rolling resistance, static friction. |
+| `tools/` | diagnostics. `pileavg.py` is the primary visual-match criterion. |
+| `runs/` | all output, git-ignored (~33 GB): `dem/`, `mpm/`, `repose/`, `logs/`. |
+| `_backup_fork/` | upstream copies of the two MPM solver files this fork modifies. |
+
+**External input, not in git:** `23087-25sim/` (the BFA project, 1.4 GB, customer data).
+Everything reads it from there. `bfa_reference_vtk/` regenerates from it via
+`python export_bfa_vtk.py`.
+
+## Running
+
+VTK is on by default (`--no-vtk` opts out). Use `python -u` or progress looks stalled.
+
+```bash
+# BEST match — Hertz–Mindlin.  ~70 s per simulated second on a Quadro P5000.
+.venv/bin/python -u bfa_dem.py --mu 0.11 --wall-mu 0.53 --shell-thickness 0.0 \
+    --hertz --tangential-ratio 1.0 --duration 10 --out runs/dem/my_run
+
+# FASTEST correct config — linear spring-dashpot.  ~64 s/sim-s, but sits ~11 cm low
+# on settled pile height.  Not yet tuned post wall-damping-fix.
+.venv/bin/python -u bfa_dem.py --mu 0.09 --wall-mu 0.6 --shell-thickness 0.0 \
+    --duration 10 --out runs/dem/my_run
+
+# score it
+.venv/bin/python compare_bfa_dem.py runs/dem/my_run
+.venv/bin/python tools/pileavg.py runs/dem/my_run   # settled height — the visual criterion
+```
+
+## Verified configs
+
+BFA targets: hold-up 17.69 kg, KE 154.0 J, chute tube (y 0..2.5) 6.45 kg @ 4.33 m/s,
+cascade 4.59 kg @ 2.39 m/s, discharge 8.61 kg/s, settled top-of-slow −1.401 ± 0.020 m.
+BFA cost: 5796 s on 24 CPU cores.
+
+| run | μ_pp | wall μ | contact | k_t/k_n | rms | top-of-slow | s/sim-s |
+|---|---|---|---|---|---|---|---|
+| `hz_mu011_wall053mindlin` | 0.11 | 0.53 | Hertz | 1.0 | 0.054 | −1.417 ± 0.008 | 69.9 |
+| `hz_mu011_wall054mindlin` | 0.11 | 0.54 | Hertz | 1.0 | **0.049** | −1.418 ± 0.013 | 69.7 |
+| `hz_mu011_wall06mindlin` | 0.11 | 0.60 | Hertz | 1.0 | 0.044 | −1.448 ± 0.014 | 73.1 |
+| `hz_mu009` | 0.09 | 0.60 | Hertz | 0 | 0.046 | −1.519 ± 0.006 | 68.1 |
+| `lin_fix` | 0.09 | 0.60 | linear | 0 | 0.055 | −1.529 ± 0.003 | 63.6 |
+| BFA | 0.09 | 0.50 | Hertzian | — | — | −1.401 ± 0.020 | 579.6 (24 cores) |
+
+`rms` is the rms log error over 7 observables. **It ranked the wrong run first three
+times** — it scored configs well that left the pile visibly low. For the visual match use
+`tools/pileavg.py` (`top-of-slow`, `slow` fraction), and treat rms as secondary.
+
+Run directories live under `runs/dem/`. Runs made before 2026-09-11 (`ppsh0_*`, `ts00_*`,
+`dem_*`) are **not reproducible**: the wall contact damped only on approach back then, so a
+wall asked for e = 0.20 delivered 0.58.
+
+Both table entries below were re-run on 2026-09-28 (`runs/dem/verify_best`,
+`runs/dem/verify_fast`) and reproduce the originals to within **0.34 % on every physical
+observable** — cascade mass 0.21 %, chute mass 0.01 %, KE 0.04 %. Wall clock varies 1–2 %.
+
+## Fitted vs measured
+
+Measured from the BFA project and used as-is: grain 6 mm / 994.05 kg/m³, rolling friction
+0.30, restitution 0.20, cohesion 0, mass flow 8.6111 kg/s, injection 3.1321 m/s, dt
+24.316 µs, Young's 1.422e8 Pa, contact mode Hertzian.
+
+Fitted: **μ_pp 0.11** (BFA states 0.090), **wall μ 0.53** (BFA states 0.50 on all 8 pairs),
+wall rolling 0.50 (BFA states 0.30). Poisson ratio 0.30 is assumed — it is not in the `.prj`.
+
+Wall friction is independently pinned at **≈ 0.57** by chute mass (0.572), chute speed
+(0.566) and KE (0.561); 0.53 was chosen instead because it matches settled pile height.
+Height responds ~4× more to μ_pp than to wall μ, so the two decouple: set wall from the
+chute, set μ_pp from the height. `μ 0.135 / wall 0.57` is the untested best-of-both.
+
+## Open residuals
+
+1. **Cascade mass is 1.09–1.16× in every run that matches height.** Cascade mass and speed
+   lie on one line, `speed = −0.572·mass + 5.395` (r = −0.987 over 9 runs), and BFA sits
+   0.38 m/s off it. Five mechanisms were tested for whether they leave that line — μ_pp,
+   wall μ, restitution calibration, and the tangential spring twice. None does. Whatever
+   BFA has is not *more* dissipation but dissipation of a different kind. Untested
+   candidate: grain shape (BFA's material defines 7 sizes, 6 marked "Particle Type:
+   Cluster", though this run used `Min_Rad = Max_Rad`).
+2. **~0.7 kg missing from the spout above the tube window.** At wall 0.60 the chute is
+   +0.22 kg and the cascade +0.44 kg over BFA, yet total hold-up lands 0.05 kg under.
+3. **Restitution delivers ~0.33 for a requested 0.20** in both contact modes — the `fn ≥ 0`
+   clamp ends contact early and truncates the rebound, so the analytic ζ→e formula does not
+   apply. `--calibrate-restitution` corrects it numerically (accurate for Hertz, ~17% off
+   for linear). It changes results without moving off the locus, so it is default-off.
+4. **No tangential contact law can matter in this flow** — the Coulomb cap always binds
+   (6 N viscous vs 0.006 N cap) and the Mindlin spring yields in under 1/60 of a timestep.
+   It only bites where slip approaches zero, i.e. a static heap. Do not re-test it here.
+5. **The original goal (b), the quarter-grain run, is not started.** At ¼ grain size that is
+   64× the particles and ~4× the steps — roughly 28 h for 10 s.

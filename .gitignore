@@ -1,45 +1,22 @@
-# Python-generated files
+# ---------------------------------------------------------------- run outputs
+# Every run writes frame_*_particles.vtk (151 frames, ~370 MB), geometry.vtk,
+# history.csv and run.json.  They are reproducible from the command recorded in
+# run.json, so they are not tracked -- runs/ is ~33 GB.
+#   runs/dem/     SolverGranularDEM runs        runs/mpm/   the superseded MPM path
+#   runs/repose/  angle_of_repose.py heaps      runs/logs/  stdout from every run
+runs/
+
+# ---------------------------------------------------------------- external inputs
+# The BFA project (1.4 GB) is customer data and the ground truth for every comparison.
+# It is NOT committed: too large for git, and not ours to redistribute.  Keep it at
+# ./23087-25sim/ -- bfa_replication_mpm.py, bfa_dem.py and compare_bfa_mpm.py all read
+# it from there.  The decoded reference frames (368 MB) regenerate from it with
+#     python export_bfa_vtk.py
+23087-25sim/
+bfa_reference_vtk/
+.venv/
+
+# ---------------------------------------------------------------- scratch
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual Environments 
-.venv
-
-# Tool cache
-.cache/
-.thumbs/
-
-# Coverage reports
-.coverage
-.coverage.*
-coverage.xml
-htmlcov/
-
-# Test Reports
-rspec.xml
-
-# Type Checking
-.mypy_cache/
-
-# IDEs & Editors
-.vscode/
-.history/
-.idea/
-
-# Documentation
-docs/_build/
-docs/api/_generated/
-
-# Airspeed Velocity
-asv/env
-asv/results
-asv/html
-
-# Log files, settings
-MUJOCO_LOG.TXT
-imgui.ini
-newton/tests/outputs/
+*.pyc
+gasket.vtk

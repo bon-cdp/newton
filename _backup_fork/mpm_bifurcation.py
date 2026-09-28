@@ -15,31 +15,31 @@ import datetime
 from trimesh import repair
 
 # MPM Parameters (from working granular example)
-DENSITY = 650.0  # kg/m³ (wheat bulk density)
-YOUNG_MODULUS = 5.0e6  # Pa (penalty parameter for incompressibility - intentionally high!)
+DENSITY = 800.0  # kg/m³ (wheat bulk density)
+YOUNG_MODULUS = 1.0e15  # Pa (penalty parameter for incompressibility - intentionally high!)
 POISSON_RATIO = 0.3
-FRICTION_COEFF = 0.2  # Lower friction for better flow
+FRICTION_COEFF = 0.03  # Lower friction for better flow
 DAMPING = 0.0
-VOXEL_SIZE = 0.01  # 60mm grid cells (voxel/radius ratio = 2.0)
-PARTICLE_RADIUS = 0.005  # 60mm diameter particles (faster testing)
+VOXEL_SIZE = 0.4  # 60mm grid cells (voxel/radius ratio = 2.0)
+PARTICLE_RADIUS = 0.015
 
 # Simulation parameters
-DURATION = 10.0  # seconds
+DURATION = 20.0  # seconds
 FPS = 60.0
 SUBSTEPS = 1
 
 # Plasticity parameters
-YIELD_PRESSURE = 1.0e7  # Pa 
+YIELD_PRESSURE = 1.0e12  # Pa - high = stay elastic (marble-like behavior)
 TENSILE_YIELD_RATIO = 0.0  # No tensile strength (cohesionless)
 YIELD_STRESS = 0.0  # No cohesive yield stress
 HARDENING = 0.0  # Low hardening for more independent particle behavior
 CRITICAL_FRACTION = 0.0  # Disabled - mesh volume calculation issues with inverted mesh
 
 # Particle streaming parameters
-FEED_RATE_MTPH = 3000.0  # Metric tons per hour
-INJECTION_CENTER = wp.vec3(1.6, 19.0, 1.3)  # Above spout entrance
-INJECTION_RADIUS = 0.56  # 0.7m radius circular injection
-PARTICLE_POOL_MULTIPLIER = 2.0  # Pre-allocate 3x particles for streaming
+FEED_RATE_MTPH = 200.0  # Metric tons per hour
+INJECTION_CENTER = wp.vec3(7.361, 87.85, 5.5)  # Above spout entrance
+INJECTION_RADIUS = 1.7  # 0.7m radius circular injection
+PARTICLE_POOL_MULTIPLIER = 3.0  # Pre-allocate 3x particles for streaming
 
 # VTK Output - use current directory for output
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +52,7 @@ SIM_DT = FRAME_DT / SUBSTEPS
 
 def load_shiploader_mesh():
     """Load and process the shiploader STL file."""
-    stl_path = os.path.join(SCRIPT_DIR, 'ACS.stl')
+    stl_path = os.path.join(SCRIPT_DIR, 'bifurcation_test.stl')
     mesh = trimesh.load(stl_path, force='mesh')
 
     # Fix inconsistent face orientations
@@ -324,7 +324,7 @@ def main():
     mpm_model.setup_collider(
         body_mass=wp.zeros_like(model.body_mass),  # Static/kinematic meshes
         collider_thicknesses=[0.0],  # Removed artificial margin - let contact happen naturally
-        collider_two_sided=[True],  # Two-sided: repel particles from both sides of the surface
+        collider_flip_normals=[True],  # Flip normals so interior channel is the free side
         ground_height=-1000.0  # Disable ground plane (using mesh instead)
     )
 
