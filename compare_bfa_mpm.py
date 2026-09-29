@@ -100,9 +100,21 @@ def read_mpm_history(run_dir):
 
 
 def read_mpm_frame(path):
-    """Positions and velocities from one frame_XXXX_particles.vtk."""
-    with open(path) as fh:
-        lines = fh.read().split("\n")
+    """Positions and velocities from one frame_XXXX_particles.vtk (ASCII or BINARY)."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:256].find(b"\nBINARY\n") >= 0:
+        def block(tag, ncomp):
+            k = raw.index(tag)
+            n = int(raw[k:raw.index(b"\n", k)].split()[1]) if tag == b"POINTS" else npts
+            start = raw.index(b"\n", k) + 1
+            return np.frombuffer(raw, dtype=">f4", count=n * ncomp, offset=start).reshape(n, ncomp)
+        k = raw.index(b"POINTS")
+        npts = int(raw[k:raw.index(b"\n", k)].split()[1])
+        pos = block(b"POINTS", 3).astype(np.float64)
+        vel = block(b"VECTORS velocity", 3).astype(np.float64)
+        return pos, vel
+    lines = raw.decode().split("\n")
     i = next(k for k, ln in enumerate(lines) if ln.startswith("POINTS"))
     n = int(lines[i].split()[1])
     pos = np.array([[float(x) for x in ln.split()] for ln in lines[i + 1:i + 1 + n]])

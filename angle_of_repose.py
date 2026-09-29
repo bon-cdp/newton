@@ -38,6 +38,10 @@ BASE_R = 0.20      # circular base; surplus spills off the rim so the heap self-
 POUR_R = 0.035
 POOL = 4000        # live grains; spill is recycled back into it
 DROP = 0.10        # release height ABOVE the growing apex, kept small on purpose
+# Idle grains all wait at ONE point, so it must hash to a bucket no active query reads.
+# The hash grid (12 mm cells, 128 per axis) wraps every 1.536 m; active grains live at
+# y in [-0.10, ~0.5] m, cells -9..42, so y-cell 70 (y = 0.846 m) is unreachable.
+PARK = wp.vec3(0.0, 70.5 * 0.012, 0.0)
 
 
 def plate_mesh(radius: float, nseg: int = 128):
@@ -146,14 +150,10 @@ def main():
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-9.81)
     builder.add_shape_mesh(body=-1, mesh=newton.Mesh(verts, faces.flatten()),
                            cfg=newton.ModelBuilder.ShapeConfig(mu=args.plate_mu), key="plate")
-    # whole pool starts parked on a wide lattice (one grain per cell, so the hash grid
-    # never gets a hot bucket -- see the parking note in granular_dem)
-    stride, nx = 0.05, 64
-    for i in range(POOL):
-        builder.add_particle(
-            pos=wp.vec3(-3.0 + (i % nx) * stride, -3.0 + (i // (nx * nx)) * stride,
-                        -3.0 + ((i // nx) % nx) * stride),
-            vel=wp.vec3(0.0), mass=GRAIN_MASS, radius=GRAIN_RADIUS, flags=0)
+    # whole pool starts at the unreachable park point (see PARK)
+    for _i in range(POOL):
+        builder.add_particle(pos=PARK, vel=wp.vec3(0.0), mass=GRAIN_MASS,
+                             radius=GRAIN_RADIUS, flags=0)
 
     model = builder.finalize(device=dev)
     model.particle_ke, model.particle_kd, model.particle_kf = args.ke, kd_pp, args.kf
@@ -215,8 +215,7 @@ def main():
         wp.launch(recycle, dim=model.particle_count, device=dev,
                   inputs=[s0.particle_q, s0.particle_qd, model.particle_flags,
                           wp.vec3(-1.0, -0.10, -1.0), wp.vec3(1.0, 5.0, 1.0),
-                          wp.vec3(-3.0, -3.0, -3.0), 0.05, 64,
-                          free_idx, free_count, spilled])
+                          PARK, free_idx, free_count, spilled])
         if step % 2000 == 0:
             qy = s0.particle_q.numpy()
             vy = s0.particle_qd.numpy()

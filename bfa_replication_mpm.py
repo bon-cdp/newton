@@ -280,24 +280,54 @@ def write_geometry_vtk(path, parts):
         fh.writelines(f"{p}\n" for p in part_id)
 
 
-def write_particles_vtk(path, frame, pos, vel, radius):
+def write_particles_vtk(path, frame, pos, vel, radius, binary=True):
+    """Legacy-VTK point cloud (positions, radius, speed, velocity) for ParaView.
+
+    Binary by default.  The ASCII writer formatted ~100k lines through Python per frame,
+    ~0.3 s -- once the DEM got fast, that was a large share of a 10 s run.  Binary is a
+    few ms and ~3x smaller; read_mpm_frame reads either.
+    """
     n = len(pos)
-    speed = np.linalg.norm(vel, axis=1)
-    with open(path, "w") as f:
-        f.write(f"# vtk DataFile Version 3.0\nMPM particles frame {frame}\nASCII\nDATASET UNSTRUCTURED_GRID\n\n")
-        f.write(f"POINTS {n} float\n")
-        f.writelines(f"{p[0]} {p[1]} {p[2]}\n" for p in pos)
-        f.write(f"\nCELLS {n} {n * 2}\n")
-        f.writelines(f"1 {i}\n" for i in range(n))
-        f.write(f"\nCELL_TYPES {n}\n")
-        f.writelines("1\n" for _ in range(n))
-        f.write(f"\nPOINT_DATA {n}\n")
-        f.write("SCALARS radius float 1\nLOOKUP_TABLE default\n")
-        f.writelines(f"{radius}\n" for _ in range(n))
-        f.write("\nSCALARS speed float 1\nLOOKUP_TABLE default\n")
-        f.writelines(f"{s}\n" for s in speed)
-        f.write("\nVECTORS velocity float\n")
-        f.writelines(f"{v[0]} {v[1]} {v[2]}\n" for v in vel)
+    pos = np.asarray(pos, dtype=np.float32)
+    vel = np.asarray(vel, dtype=np.float32)
+    speed = np.linalg.norm(vel, axis=1).astype(np.float32)
+    if not binary:
+        with open(path, "w") as f:
+            f.write(f"# vtk DataFile Version 3.0\nMPM particles frame {frame}\nASCII\nDATASET UNSTRUCTURED_GRID\n\n")
+            f.write(f"POINTS {n} float\n")
+            f.writelines(f"{p[0]} {p[1]} {p[2]}\n" for p in pos)
+            f.write(f"\nCELLS {n} {n * 2}\n")
+            f.writelines(f"1 {i}\n" for i in range(n))
+            f.write(f"\nCELL_TYPES {n}\n")
+            f.writelines("1\n" for _ in range(n))
+            f.write(f"\nPOINT_DATA {n}\n")
+            f.write("SCALARS radius float 1\nLOOKUP_TABLE default\n")
+            f.writelines(f"{radius}\n" for _ in range(n))
+            f.write("\nSCALARS speed float 1\nLOOKUP_TABLE default\n")
+            f.writelines(f"{s}\n" for s in speed)
+            f.write("\nVECTORS velocity float\n")
+            f.writelines(f"{v[0]} {v[1]} {v[2]}\n" for v in vel)
+        return
+    be_f = np.dtype(">f4")
+    be_i = np.dtype(">i4")
+    cells = np.empty((n, 2), dtype=be_i)
+    cells[:, 0] = 1
+    cells[:, 1] = np.arange(n)
+    with open(path, "wb") as f:
+        f.write(f"# vtk DataFile Version 3.0\nMPM particles frame {frame}\nBINARY\n"
+                f"DATASET UNSTRUCTURED_GRID\nPOINTS {n} float\n".encode())
+        f.write(pos.astype(be_f).tobytes())
+        f.write(f"\nCELLS {n} {n * 2}\n".encode())
+        f.write(cells.tobytes())
+        f.write(f"\nCELL_TYPES {n}\n".encode())
+        f.write(np.ones(n, dtype=be_i).tobytes())
+        f.write(f"\nPOINT_DATA {n}\nSCALARS radius float 1\nLOOKUP_TABLE default\n".encode())
+        f.write(np.full(n, radius, dtype=be_f).tobytes())
+        f.write(b"\nSCALARS speed float 1\nLOOKUP_TABLE default\n")
+        f.write(speed.astype(be_f).tobytes())
+        f.write(b"\nVECTORS velocity float\n")
+        f.write(vel.astype(be_f).tobytes())
+        f.write(b"\n")
 
 
 # ---------------------------------------------------------------------------

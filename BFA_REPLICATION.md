@@ -9,7 +9,7 @@ a commercial DEM code on a real machine — and then run cases BFA cannot afford
 | path | what |
 |---|---|
 | `granular_dem.py` | **`SolverGranularDEM`** — the soft-sphere DEM. Linear spring-dashpot or Hertz–Mindlin, Coulomb friction, rolling friction, rotation, Cundall–Strack tangential history, open-shell mesh colliders. |
-| `bfa_dem.py` | the DEM runner for this machine: injection, recycling, per-part wall friction, stats, VTK. |
+| `bfa_dem.py` | the DEM runner for this machine: presets, injection schedule, recycling, per-part wall friction, CUDA-graph stepping, stats, VTK. |
 | `bfa_replication_mpm.py` | the earlier MPM runner. Still imported by the DEM tooling for `COLLIDER_PARTS` and `load_part`. |
 | `compare_bfa_dem.py` | scores a run against BFA (hold-up, KE, chute, cascade, discharge, rms). |
 | `compare_bfa_mpm.py` | readers for BFA's undocumented binary `.por` / `.his` output. |
@@ -17,7 +17,8 @@ a commercial DEM code on a real machine — and then run cases BFA cannot afford
 | `export_bfa_vtk.py` | writes the BFA reference to `bfa_reference_vtk/` in our VTK format. |
 | `angle_of_repose.py` | pours a heap and measures the angle our contact law actually produces. |
 | `test_rotation.py` | analytic checks: rolling incline `(5/7)g sinθ`, rolling resistance, static friction. |
-| `tools/` | diagnostics. `pileavg.py` is the primary visual-match criterion. |
+| `mesh_simplify.py` | optional collapse of sub-grain CAD detail (`--simplify-mm`); off by default — it moves the cascade. |
+| `tools/` | diagnostics. `pileavg.py` is the primary visual-match criterion; `perf_table.py` one-row scoring; `dem_bench.py` kernel profiling from a checkpoint; `wall_grid_check.py` wall-distance validation vs float64. |
 | `runs/` | all output, git-ignored (~33 GB): `dem/`, `mpm/`, `repose/`, `logs/`. |
 | `_backup_fork/` | upstream copies of the two MPM solver files this fork modifies. |
 
@@ -27,22 +28,66 @@ Everything reads it from there. `bfa_reference_vtk/` regenerates from it via
 
 ## Running
 
-VTK is on by default (`--no-vtk` opts out). Use `python -u` or progress looks stalled.
+VTK is on by default (`--no-vtk` opts out); frames are binary legacy VTK, which ParaView
+opens directly. Use `python -u` or progress looks stalled.
 
 ```bash
-# BEST match — Hertz–Mindlin.  ~70 s per simulated second on a Quadro P5000.
-.venv/bin/python -u bfa_dem.py --mu 0.11 --wall-mu 0.53 --shell-thickness 0.0 \
-    --hertz --tangential-ratio 1.0 --duration 10 --out runs/dem/my_run
+# DEFAULT: the "fast" preset.  ~6 s per simulated second on a Quadro P5000 (~97x BFA).
+.venv/bin/python -u bfa_dem.py --out runs/dem/my_run
 
-# FASTEST correct config — linear spring-dashpot.  ~64 s/sim-s, but sits ~11 cm low
-# on settled pile height.  Not yet tuned post wall-damping-fix.
-.venv/bin/python -u bfa_dem.py --mu 0.09 --wall-mu 0.6 --shell-thickness 0.0 \
-    --duration 10 --out runs/dem/my_run
+# BFA's own timestep and stiffness, same calibration.  ~32 s per simulated second.
+.venv/bin/python -u bfa_dem.py --preset reference --out runs/dem/my_run
+
+# raw BFA project inputs, nothing fitted
+.venv/bin/python -u bfa_dem.py --preset bfa --out runs/dem/my_run
 
 # score it
-.venv/bin/python compare_bfa_dem.py runs/dem/my_run
-.venv/bin/python tools/pileavg.py runs/dem/my_run   # settled height — the visual criterion
+.venv/bin/python tools/perf_table.py runs/dem/my_run    # one row: cost, observables, rms, pile
+.venv/bin/python compare_bfa_dem.py runs/dem/my_run     # full breakdown
 ```
+
+Any explicit flag overrides the preset (e.g. `--mu 0.13`).
+
+## Performance
+
+All measured on one Quadro P5000 (Pascal) against the reference config; details and
+dead ends in `granular_dem.py` comments. Profile with `tools/dem_bench.py` from a
+checkpoint (`bfa_dem.py --checkpoint-at 3 --out runs/perf/ckpt`).
+
+| stage | ms / step | s per sim-s | note |
+|---|---|---|---|
+| start (BVH walls, per-step hash grid) | 1.73 | 71 | wall contact was 73% of the step |
+| baked wall grid | 0.95 | 39 | CSR candidate lists, records inlined |
+| + idle grains parked out of reach, fused kernels | 0.71 | 29 | |
+| + Verlet neighbour list (N = 8) | 0.47 | 19 | grid rebuild ~180 µs → amortised |
+| **fast preset** (E/10, dt × 4, N = 4) | 0.52 | **6.0** | 4× fewer steps |
+
+What did *not* help: sorting the wall launch spatially, BVH builder choice (±20%), CUDA
+graphs (launches were already hidden behind device time — kept for determinism), a
+smaller hash table (less memset, more aliasing).
+
+**Accuracy along the way** (steady state, t > 3 s; BFA pile top −1.401):
+
+| run | s/sim-s | rms | pile top |
+|---|---|---|---|
+| old reference code | 71.2 | 0.053 | −1.428 |
+| reference preset | 31.6 | 0.057 | −1.403 |
+| E/10, dt × 3 | 12.0 | 0.056 | −1.427 |
+| **fast preset** | **6.0** | **0.056** | −1.440 |
+| E/100, dt × 6 | 7.3 | 0.058 | −1.472 — pile compacts |
+| fast + 2 mm mesh simplification | 4.9 | 0.067 | −1.464 — deflector rims matter |
+
+Known limits of the fast paths: a grain that has outrun its neighbour list is searched
+directly, but two grains that have *both* outrun theirs can miss each other (needs two
+grains above ~12 m/s in the fast preset; the flow tops out near 8). Grains that leave the
+domain keep querying until the once-per-frame recycle and may scan the idle-grain bucket
+meanwhile — a cost, not an error. `--no-rotation` runs the original solver path (BVH
+walls, no neighbour list, no Hertz).
+
+**Wall-contact fix found by this work:** the old BVH wall path computed Spout distances in
+float32 against 3 m sliver panels (aspect up to 337): errors up to 0.19 mm against ~50 µm
+Hertz overlaps, and 12% of Spout contacts silently dropped (zero sign normal). The grid
+path uses per-triangle frames; `tools/wall_grid_check.py` holds it to < 1 µm vs float64.
 
 ## Verified configs
 

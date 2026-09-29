@@ -2,35 +2,27 @@
 """
 DEM replication of the BulkFlowAnalyst run in 23087-25sim/, using SolverGranularDEM.
 
-Unlike the MPM route, this simulates the same objects BFA does -- 12 mm spheres with
-mass, radius and pairwise contact -- so the parameters transfer directly instead of
-needing a sub-grid calibration:
+This simulates the same objects BFA does -- 12 mm spheres with mass, radius, rotation and
+pairwise contact -- so the BFA material parameters transfer directly:
 
     grain radius / mass    6.0 mm / 0.8994 g      (prj Min_Rad, Intr Density 994.05)
     mass flow              8.6111 kg/s            (prj FlowRate 34.171652 short ton/h)
                            -> 9573 grains/s, 95,730 over the 10 s run
     injection velocity     3.1321 m/s down        (= sqrt(2*g*0.5), extrusion length)
-    wall friction          0.50                   MEASURED VALUE, no correction needed
-    cohesion / adhesion    0.0
+    friction               slide 0.09 / roll 0.30 grain-grain, 0.50 / 0.50 grain-wall
+    restitution            0.20                   (damping derived from it)
 
-The one parameter that cannot transfer: BFA calibrates corn with sliding friction 0.09
-*and* rolling friction 0.30 to reach a 23.3 deg angle of repose.  Newton particles carry
-no angular state, so there is no rolling resistance; both must fold into one effective
-sliding coefficient, which starts at tan(23.3 deg) = 0.4307.
-
-Contact stiffness is a numerical choice, not a BFA input.  BFA's 1.42e8 Pa is a softened
-Hertzian modulus; here a linear spring needs `dt < 2/sqrt(ke/m)`.  At ke = 2e4 N/m and
-BFA's own dt of 2.43e-5 s that ratio is 0.12, comfortably stable, and a grain under a
-0.5 m corn column overlaps by 0.05 mm -- under 1% of its radius.
+Presets (see PRESETS): `fast` (default, ~6 s per simulated second), `reference` (BFA's
+own timestep and stiffness, ~32 s), `bfa` (raw project inputs, nothing fitted).  The
+calibrated presets use grain-grain slide 0.11 and wall 0.53; see BFA_REPLICATION.md.
 
 Injection uses a lattice, never uniform random: two grains seeded 2 mm apart overlap by
-10 mm, which at these stiffnesses is 10 N on a 0.9 g mass.  That single mistake produces
-137 m/s projectiles that blast through any geometry, and it looks exactly like "the
-particles behave like a gas".
+10 mm, which is 10 N on a 0.9 g mass -- the classic "particles behave like a gas" failure.
 
 Usage:
-    python bfa_dem.py --duration 1.0            # short shakedown
-    python bfa_dem.py --duration 10.0           # full replication
+    python bfa_dem.py                             # fast preset, 10 s, VTK every frame
+    python bfa_dem.py --preset reference          # BFA timestep and stiffness
+    python bfa_dem.py --duration 1 --no-vtk       # quick shakedown
 """
 
 from __future__ import annotations
@@ -51,7 +43,7 @@ from bfa_replication_mpm import (
     MASS_FLOW, RHO_GRAIN, WALL_MU, injection_face_triangles, load_part,
     write_geometry_vtk, write_particles_vtk,
 )
-from granular_dem import SolverGranularDEM, build_collider, lattice_sites
+from granular_dem import SolverGranularDEM, build_collider, build_wall_grid, lattice_sites
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -75,6 +67,8 @@ def spawn_at_sites(
     particle_flags: wp.array(dtype=wp.int32),
     wall_slack: wp.array(dtype=float),
 ):
+    """Host-driven injection (one launch per event), used by angle_of_repose.py.  The BFA
+    runner uses spawn_scheduled instead, which needs no host input and is deterministic."""
     tid = wp.tid()
     prev = wp.atomic_sub(free_count, 0, 1)
     if prev <= 0:
@@ -90,6 +84,56 @@ def spawn_at_sites(
 
 
 @wp.kernel
+def spawn_scheduled(
+    sites: wp.array(dtype=wp.vec3),
+    picks: wp.array2d(dtype=wp.int32),
+    event_of_step: wp.array(dtype=wp.int32),
+    step_arr: wp.array(dtype=int),
+    step_offset: int,
+    spawn_vel: wp.vec3,
+    free_idx: wp.array(dtype=wp.int32),
+    free_count: wp.array(dtype=wp.int32),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    wall_slack: wp.array(dtype=float),
+):
+    """Inject one batch of grains at lattice sites, driven by a precomputed schedule
+    rather than the host.  Launched every step; fires only on steps the schedule marks.  Reading the step from the
+    solver's device counter is what lets injection live inside a captured CUDA graph."""
+    tid = wp.tid()
+    g = step_arr[0] - step_offset
+    if g < 0 or g >= event_of_step.shape[0]:
+        return
+    e = event_of_step[g]
+    if e < 0:
+        return
+    # Deterministic pop: thread tid takes the tid-th entry from the top.  An atomic
+    # decrement hands out indices in whatever order threads arrive, which changes which
+    # pool slot a grain gets, hence the summation order inside hash cells -- and DEM
+    # chaos turns that rounding into visibly different runs.  _consume_free lowers the
+    # count afterwards, in its own launch, so no thread here sees a partial update.
+    slot = free_count[0] - 1 - tid
+    if slot < 0:
+        return
+    idx = free_idx[slot]
+    particle_q[idx] = sites[picks[e, tid]]
+    particle_qd[idx] = spawn_vel
+    particle_flags[idx] = wp.int32(newton.ParticleFlags.ACTIVE)
+    wall_slack[idx] = 0.0
+
+
+@wp.kernel
+def _consume_free(event_of_step: wp.array(dtype=wp.int32), step_arr: wp.array(dtype=int),
+                  step_offset: int, n: int, free_count: wp.array(dtype=wp.int32)):
+    g = step_arr[0] - step_offset
+    if g < 0 or g >= event_of_step.shape[0]:
+        return
+    if event_of_step[g] >= 0:
+        free_count[0] = wp.max(free_count[0] - n, 0)
+
+
+@wp.kernel
 def recycle(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
@@ -97,8 +141,6 @@ def recycle(
     lo: wp.vec3,
     hi: wp.vec3,
     park: wp.vec3,
-    park_stride: float,
-    park_nx: int,
     free_idx: wp.array(dtype=wp.int32),
     free_count: wp.array(dtype=wp.int32),
     discharged: wp.array(dtype=wp.int32),
@@ -110,10 +152,7 @@ def recycle(
     if p[0] >= lo[0] and p[0] <= hi[0] and p[1] >= lo[1] and p[1] <= hi[1] and p[2] >= lo[2] and p[2] <= hi[2]:
         return
     particle_flags[i] = wp.int32(0)
-    # scatter to this index's own parking slot -- see the note at pool construction
-    particle_q[i] = wp.vec3(park[0] + float(i % park_nx) * park_stride,
-                            park[1] + float(i / (park_nx * park_nx)) * park_stride,
-                            park[2] + float((i / park_nx) % park_nx) * park_stride)
+    particle_q[i] = park          # see the note on parking at pool construction
     particle_qd[i] = wp.vec3(0.0)
     slot = wp.atomic_add(free_count, 0, 1)
     free_idx[slot] = i
@@ -177,8 +216,29 @@ def _clear_of_walls(sites, parts, clearance, device):
     return sites[d.numpy() >= clearance]
 
 
-def main():
+# Named configurations.  The argument defaults below are the raw BFA project inputs
+# ("bfa"); a preset overrides them, and any flag given explicitly overrides the preset.
+PRESETS = {
+    # Calibrated replication at BFA's own timestep and stiffness (runs/dem/perf_grid_ref):
+    # rms 0.057, pile top -1.403 vs BFA -1.401.  ~32 s per simulated second.
+    "reference": dict(mu=0.11, wall_mu=0.53, shell_thickness=0.0, hertz=True,
+                      tangential_ratio=1.0),
+    # Same physics, 10x softer grains at 4x the timestep, neighbour lists
+    # (runs/dem/perf_fast_nosimp): rms 0.056, pile top -1.440.  ~6 s per simulated second,
+    # ~97x faster than BFA.  Young's modulus / 10 keeps every observable within 1%;
+    # / 100 lowered the pile 7 cm, and 2 mm mesh simplification lowered it 2.4 cm.
+    "fast": dict(mu=0.11, wall_mu=0.53, shell_thickness=0.0, hertz=True,
+                 tangential_ratio=1.0, youngs=1.4220405e7, dt=9.7253e-5,
+                 neighbor_every=4, skin_speed=6.0),
+    # The BFA project's measured inputs with nothing fitted (the argument defaults).
+    "bfa": dict(),
+}
+
+
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="fast",
+                    help="named configuration (default fast); explicit flags override it")
     ap.add_argument("--duration", type=float, default=10.0)
     ap.add_argument("--fps", type=float, default=15.0)
     ap.add_argument("--dt", type=float, default=2.4316429e-5, help="BFA's own DEM timestep")
@@ -223,7 +283,8 @@ def main():
                          "RotatingMu = 0.50 for all seven components, distinct from the "
                          "particle<->particle 0.30.")
     ap.add_argument("--no-rotation", action="store_true",
-                    help="disable angular DOF (the original non-rotating behaviour)")
+                    help="disable angular DOF (the original non-rotating behaviour).  That path "
+                         "is the original solver: BVH walls, no neighbour list, no Hertz.")
     ap.add_argument("--wall-mu", type=float, default=WALL_MU,
                     help="Coulomb friction on the Spout, i.e. the long chute")
     ap.add_argument("--cascade-mu", type=float, default=None,
@@ -239,7 +300,7 @@ def main():
                          "textbook zeta gives e=0.33 when 0.20 was asked for (measured, and "
                          "dt-independent).  This bisects the damping against the solver's own "
                          "discrete contact instead of trusting the formula.")
-    ap.add_argument("--hertz", action="store_true",
+    ap.add_argument("--hertz", action=argparse.BooleanOptionalAction, default=False,
                     help="Hertz-Mindlin contact (fn = (4/3)E* sqrt(R*) d^1.5, damping ~ d^0.25) "
                          "instead of the linear spring-dashpot.  BFA's prj says Contact Mode: "
                          "Hertzian, and the linear law cannot match it in both regimes at once: "
@@ -255,10 +316,54 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--no-vtk", action="store_true")
     ap.add_argument("--no-wall-cache", action="store_true",
-                    help="query every wall every step; results must match the cached path")
-    ap.add_argument("--profile", action="store_true",
-                    help="time each kernel with device sync every 500 substeps")
-    args = ap.parse_args()
+                    help="with --bvh-walls: query every wall every step; results must match the "
+                         "cached path.  (The baked wall grid has no distance cache.)")
+    ap.add_argument("--graph-steps", type=int, default=256,
+                    help="steps captured into one CUDA graph and replayed as a single launch "
+                         "(0 = launch every kernel from Python each step)")
+    ap.add_argument("--wall-grid-cell", type=float, default=0.006,
+                    help="cell size (m) of the baked candidate-triangle grid used for wall "
+                         "contact.  Smaller = shorter lists, more memory.")
+    ap.add_argument("--bvh-walls", action="store_true",
+                    help="query the wall BVHs every step instead of the baked grid (the "
+                         "reference path; ~10x slower wall contact)")
+    ap.add_argument("--neighbor-every", type=int, default=0,
+                    help="rebuild a Verlet neighbour list every N steps instead of rebuilding "
+                         "and scanning the hash grid every step (0 = off)")
+    ap.add_argument("--skin", type=float, default=None,
+                    help="neighbour-list skin (m).  Default: two grains closing at --skin-speed "
+                         "each for N steps, 2*v*N*dt.  Grains that move more than skin/2 before "
+                         "the next rebuild fall back to a direct search; the count is reported.")
+    ap.add_argument("--skin-speed", type=float, default=10.0,
+                    help="grain speed (m/s) the default skin is sized for; the flow's measured "
+                         "maximum is ~8 m/s")
+    ap.add_argument("--simplify-mm", type=float, default=0.0,
+                    help="collapse collider edges shorter than this (mm) before baking.  2 mm "
+                         "removes CAD fillet/chamfer detail no 12 mm grain can resolve (Top "
+                         "6372 -> 2285 tris) at <= 1.35 mm surface deviation.  0 = exact STL.")
+    ap.add_argument("--simplify-tol-mm", type=float, default=None,
+                    help="with --simplify-mm: only collapse where the surface moves less than "
+                         "this (mm), preserving sharp rims")
+    ap.add_argument("--hash-dims", type=int, nargs=3, default=None,
+                    help="grain hash-grid table dims (Newton default 128 128 128)")
+    ap.add_argument("--checkpoint-at", type=float, default=None,
+                    help="save the full solver state to <out>/checkpoint.npz at this sim time; "
+                         "tools/dem_bench.py replays steps from it")
+    pre, _ = ap.parse_known_args(argv)
+    ap.set_defaults(**PRESETS[pre.preset])
+    return ap.parse_args(argv)
+
+
+def build(args, quiet=False):
+    """Everything up to the time loop: model, collider, solver, injector.  Shared by main()
+    and tools/dem_bench.py so a benchmark steps exactly the machine the run does."""
+    import builtins
+    _print = builtins.print
+    if quiet:
+        def print(*a, **k):  # noqa: A001
+            pass
+    else:
+        print = _print  # noqa: A001
 
     # derive damping from the measured restitution, separately for each reduced mass
     e = max(min(args.restitution, 0.999), 1e-4)
@@ -275,7 +380,7 @@ def main():
     substeps = max(1, int(round(frame_dt / args.dt)))
     dt = frame_dt / substeps
 
-    out_dir = args.out or os.path.join(SCRIPT_DIR, f"bfa_dem_{datetime.datetime.now():%Y%m%d_%H%M%S}")
+    out_dir = args.out or os.path.join(SCRIPT_DIR, "runs", "dem", f"bfa_dem_{datetime.datetime.now():%Y%m%d_%H%M%S}")
     os.makedirs(out_dir, exist_ok=True)
 
     omega = math.sqrt(args.ke / GRAIN_MASS)
@@ -305,6 +410,12 @@ def main():
     device = args.device
 
     parts = [(n, *load_part(n, fx, fl)) for n, ts, fx, fl in COLLIDER_PARTS]
+    if args.simplify_mm > 0:
+        from mesh_simplify import collapse_short_edges
+        parts = [(n, *collapse_short_edges(
+            v, f, args.simplify_mm * 1e-3,
+            tol=None if args.simplify_tol_mm is None else args.simplify_tol_mm * 1e-3))
+            for n, v, f in parts]
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-9.81)
     for name, v, f in parts:
         builder.add_shape_mesh(body=-1, mesh=newton.Mesh(v, f.flatten()),
@@ -332,20 +443,30 @@ def main():
     print(f"  batch                 {batch} grains every {inj_interval*1e3:.1f} ms "
           f"-> layers {layer_gap*1e3:.0f} mm apart ({layer_gap/(2*GRAIN_RADIUS):.1f} diameters)\n")
 
-    # Park inactive grains on a WIDE lattice, never at a single point.  wp.HashGrid
-    # buckets by cell, so N grains sharing one coordinate share one cell; any active
-    # grain whose cell collides with that bucket then scans all N as neighbours.
-    # Measured: 46,000 co-located parked grains took particle-particle contact from
-    # 0.095 ms to 16.9 ms per step -- a 180x penalty with no physical cause.
-    park_lo = wp.vec3(float(sites[:, 0].mean()), INJECTION_PLANE_Y + 2.0, float(sites[:, 2].mean()))
-    PARK_STRIDE = 0.05
-    PARK_NX = 128
-    for k in range(pool):
-        builder.add_particle(
-            pos=wp.vec3(park_lo[0] + (k % PARK_NX) * PARK_STRIDE,
-                        park_lo[1] + (k // (PARK_NX * PARK_NX)) * PARK_STRIDE,
-                        park_lo[2] + ((k // PARK_NX) % PARK_NX) * PARK_STRIDE),
-            vel=wp.vec3(0.0), mass=GRAIN_MASS, radius=GRAIN_RADIUS, flags=0)
+    # Where inactive grains wait.  They are still points in the hash grid, and the grid
+    # buckets cells MODULO its table size, so where they sit decides which buckets they
+    # pollute.  History: all at one point put 46,000 grains in one bucket that some active
+    # grains aliased onto (particle-particle 0.095 -> 16.9 ms, 180x); a wide lattice fixed
+    # that but still spread 30,000 grains over the table, costing 60% more contact time
+    # the moment the table shrank.  Instead, pick one point whose z-cell RESIDUE no active
+    # grain or its neighbour query can ever produce: the domain spans only
+    # (DOMAIN_HI.z - DOMAIN_LO.z)/cell + 3 residues of the table's z dimension, so the
+    # rest are unreachable.  One bucket then holds every idle grain and is never read.
+    skin = args.skin if args.skin is not None else \
+        2.0 * args.skin_speed * max(args.neighbor_every, 1) * dt
+    skin_max = max(2.0 * skin, 0.006)
+    hash_dz = args.hash_dims[2] if args.hash_dims else 128
+    # the cell size the solver will actually build its grid with
+    uses_list = bool(args.neighbor_every) and not args.no_rotation   # as in SolverGranularDEM.step
+    gcell = 2.0 * GRAIN_RADIUS + (skin_max if uses_list else 0.0)
+    z0, z1 = int(DOMAIN_LO[2] / gcell) - 1, int(DOMAIN_HI[2] / gcell) + 1
+    span = z1 - z0 + 1
+    assert span + 2 < hash_dz, f"domain spans {span} z-cells; hash z-dim {hash_dz} too small to hide idle grains"
+    void_cell = z1 + 1 + (hash_dz - span) // 2          # middle of the unreachable residues
+    park_lo = wp.vec3(float(sites[:, 0].mean()), INJECTION_PLANE_Y + 2.0, (void_cell + 0.5) * gcell)
+    for _k in range(pool):
+        builder.add_particle(pos=park_lo, vel=wp.vec3(0.0), mass=GRAIN_MASS,
+                             radius=GRAIN_RADIUS, flags=0)
 
     model = builder.finalize(device=device)
     model.particle_ke, model.particle_kd, model.particle_kf = args.ke, kd_pp, args.kf
@@ -361,7 +482,24 @@ def main():
         ke=[args.ke] * len(parts), kd=[kd_wall] * len(parts), kf=[args.kf] * len(parts),
         thickness=[args.shell_thickness if p[1] else 0.0 for p in COLLIDER_PARTS],
         max_dist=0.03, device=device)
+    if args.neighbor_every:
+        print(f"  neighbour list        rebuilt every {args.neighbor_every} steps, skin "
+              f"{skin*1e3:.2f} mm (two grains closing at {args.skin_speed:g} m/s)")
+    wall_grid = None
+    if not args.bvh_walls:
+        # reach: contact (radius + shell) plus the 1 mm band the sign test averages over
+        reach = GRAIN_RADIUS + args.shell_thickness + 1.0e-3 + 1.0e-4
+        _t = time.time()
+        wall_grid, winfo = build_wall_grid(parts, meshes, collider.lower, collider.upper,
+                                           reach, args.wall_grid_cell, device)
+        print(f"  wall grid             {winfo['dims']} cells of {args.wall_grid_cell*1e3:.0f} mm, "
+              f"{winfo['occupied']:,} occupied, lists mean {winfo['mean_list']:.1f} / max "
+              f"{winfo['max_list']}, {winfo['mbytes']:.0f} MB, baked in {time.time()-_t:.2f} s")
     solver = SolverGranularDEM(model, collider, grid_cell=2.0 * GRAIN_RADIUS, keepalive=meshes,
+                               wall_grid=wall_grid,
+                               hash_dims=tuple(args.hash_dims) if args.hash_dims else None,
+                               neighbor_every=args.neighbor_every, skin=skin,
+                               skin_max=skin_max,
                                wall_cache=not args.no_wall_cache,
                                rotation=not args.no_rotation,
                                mu_roll=args.mu_roll, mu_roll_wall=args.mu_roll_wall,
@@ -378,6 +516,20 @@ def main():
     discharged = wp.zeros(1, dtype=wp.int32, device=device)
     stats = wp.zeros(10, dtype=float, device=device)
     spawn_vel = wp.vec3(0.0, -INJECTION_SPEED, 0.0)
+    del print
+    return argparse.Namespace(**{k: v for k, v in locals().items() if k not in ("_print", "quiet")})
+
+
+def main():
+    args = parse_args()
+    S = build(args)
+    (model, solver, collider, parts, sites, batch, inj_interval, substeps, dt, frame_dt, n_pool,
+     s0, free_idx, free_count, discharged, stats, spawn_vel, park_lo,
+     out_dir, device, rate, casc_mu, kd_pp, kd_wall, e, zeta) = (
+        S.model, S.solver, S.collider, S.parts, S.sites, S.batch, S.inj_interval, S.substeps,
+        S.dt, S.frame_dt, S.n_pool, S.s0, S.free_idx, S.free_count, S.discharged,
+        S.stats, S.spawn_vel, S.park_lo, S.out_dir, S.device,
+        S.rate, S.casc_mu, S.kd_pp, S.kd_wall, S.e, S.zeta)
 
     if not args.no_vtk:
         write_geometry_vtk(os.path.join(out_dir, "geometry.vtk"), parts)
@@ -400,11 +552,80 @@ def main():
     n_frames = int(round(args.duration * args.fps))
     rng = np.random.default_rng(0)
     t0 = time.time()
-    next_inj = 0.0
     sim_t = 0.0
     nstep = 0
-    from granular_dem import eval_shell_contact_forces as _wall_kernel
-    from newton._src.solvers.semi_implicit.kernels_contact import eval_particle_contact as _pp_kernel
+    saved_ckpt = False
+    nbr_fallbacks = 0
+
+    # --- injection schedule, precomputed ------------------------------------------
+    # Replays exactly the host logic the loop used to run (float64 sim_t, the same rng
+    # calls in the same order), so the grains and sites are the ones earlier runs used.
+    # On the device it becomes a per-step table the scheduled spawn kernel reads.
+    total_steps = n_frames * substeps
+    event_of_step = np.full(total_steps, -1, dtype=np.int32)
+    picks = []
+    _t_sim, _next = 0.0, 0.0
+    for gstep in range(total_steps):
+        if _t_sim >= _next:
+            _next += inj_interval
+            event_of_step[gstep] = len(picks)
+            picks.append(rng.choice(len(sites), size=batch, replace=False))
+        _t_sim += dt
+    w_sites = wp.array(sites.astype(np.float32), dtype=wp.vec3, device=device)
+    w_picks = wp.array(np.array(picks, dtype=np.int32).reshape(-1, batch) if picks
+                       else np.zeros((1, batch), np.int32), dtype=wp.int32, device=device)
+    w_event = wp.array(event_of_step, dtype=wp.int32, device=device)
+    step_offset = solver.step_count          # device counter value at global step 0
+
+    def launch_steps(n, eager=True):
+        if eager and n:
+            solver.request_rebuild()   # graph replays do not advance the host's rebuild phase
+        for _ in range(n):
+            wp.launch(spawn_scheduled, dim=batch, device=device, inputs=[
+                w_sites, w_picks, w_event, solver.step_arr, step_offset, spawn_vel,
+                free_idx, free_count, s0.particle_q, s0.particle_qd, model.particle_flags,
+                solver.wall_slack])
+            wp.launch(_consume_free, dim=1, device=device, inputs=[
+                w_event, solver.step_arr, step_offset, batch, free_count])
+            solver.step(s0, s0, None, None, dt)     # in place -- see SolverGranularDEM.step
+
+    # --- CUDA graph ---------------------------------------------------------------
+    # A step is ~6 kernel launches; from Python each costs ~15-20 us of host time, which
+    # at this point exceeds the device time of the smaller kernels.  Capturing K steps
+    # into a graph turns K*6 launches into one.  Everything a step needs lives on the
+    # device (positions, free list, schedule, step counter), so the graph replays
+    # correctly without any host input.
+    # A frame is split into floor(substeps/K) replays of a K-step graph plus one replay of
+    # a graph for the remainder, so no step runs eagerly.  Each graph starts with a
+    # neighbour-list rebuild and rebuilds every N steps inside, so no interval between
+    # rebuilds exceeds N whatever K and the remainder are.
+    graph, graph_rem, K = None, None, max(0, min(args.graph_steps, substeps))
+    if args.neighbor_every:
+        K -= K % args.neighbor_every             # whole rebuild cycles per graph
+    if K > 0 and device.startswith("cuda"):
+        # Capture only RECORDS launches; nothing runs until capture_launch.  Buffers the
+        # hash grid would otherwise allocate on first build are reserved up front, and
+        # the kernel modules a step uses are loaded before recording starts.
+        solver.model.particle_grid.reserve(n_pool)
+        # force_module_load=True would compile every Warp module in the process, dozens
+        # of unrelated Newton ones (measured: 140 s), so load just ours
+        import granular_dem as _gd
+        import newton._src.solvers.semi_implicit.kernels_contact as _kc
+        for _mod in (_gd, _kc, __import__(__name__)):
+            wp.load_module(_mod, device=device)
+
+        def capture(n):
+            solver.request_rebuild()
+            with wp.ScopedCapture(device=device, force_module_load=False) as cap:
+                launch_steps(n, eager=False)
+            return cap.graph
+
+        graph = capture(K)
+        rem = substeps % K
+        graph_rem = capture(rem) if rem else None
+        print(f"  cuda graph            {substeps // K} x {K} steps"
+              + (f" + {rem}" if rem else "") + " per frame", flush=True)
+
     print(f"{'t (s)':>7} {'grains':>9} {'kg':>7} {'KE (J)':>9} "
           f"{'tube kg':>8} {'tube m/s':>9} {'casc kg':>8} {'casc m/s':>9} "
           f"{'out kg':>8} {'wall':>7}")
@@ -414,51 +635,38 @@ def main():
     try:
         for frame in range(n_frames + 1):
             if frame > 0:
-                for _ in range(substeps):
-                    if sim_t >= next_inj:
-                        next_inj += inj_interval
-                        pick = rng.choice(len(sites), size=batch, replace=False)
-                        wsites = wp.array(sites[pick].astype(np.float32), dtype=wp.vec3, device=device)
-                        wp.launch(spawn_at_sites, dim=batch, device=device, inputs=[
-                            wsites, spawn_vel, free_idx, free_count,
-                            s0.particle_q, s0.particle_qd, model.particle_flags,
-                            solver.wall_slack])
-                    if args.profile and (nstep % 500 == 0):
-                        import warp as _wp
-                        _t = {}
-                        _wp.synchronize_device(device)
-                        _a = time.perf_counter()
-                        s0.clear_forces()
-                        model.particle_grid.build(s0.particle_q, solver.grid_cell)
-                        _wp.synchronize_device(device); _b = time.perf_counter(); _t["grid"] = _b - _a
-                        wp.launch(_pp_kernel, dim=n_pool, device=device, inputs=[
-                            model.particle_grid.id, s0.particle_q, s0.particle_qd,
-                            model.particle_radius, model.particle_flags, model.particle_ke,
-                            model.particle_kd, model.particle_kf, model.particle_mu,
-                            model.particle_cohesion, model.particle_max_radius],
-                            outputs=[s0.particle_f])
-                        _wp.synchronize_device(device); _c = time.perf_counter(); _t["p-p"] = _c - _b
-                        wp.launch(_wall_kernel, dim=n_pool, device=device, inputs=[
-                            s0.particle_q, s0.particle_qd, model.particle_radius,
-                            model.particle_flags, collider, solver.wall_slack, dt],
-                            outputs=[s0.particle_f, solver.contact_count])
-                        _wp.synchronize_device(device); _d = time.perf_counter(); _t["wall"] = _d - _c
-                        solver.integrate_particles(model, s0, s1, dt)
-                        _wp.synchronize_device(device); _e = time.perf_counter(); _t["integ"] = _e - _d
-                        act = int((model.particle_flags.numpy() & 1).sum())
-                        print("    [prof] step %6d active %6d  grid %.3f  p-p %.3f  wall %.3f  "
-                              "integ %.3f ms" % (nstep, act, _t["grid"]*1e3, _t["p-p"]*1e3,
-                                                 _t["wall"]*1e3, _t["integ"]*1e3), flush=True)
-                    else:
-                        solver.step(s0, s1, None, None, dt)
-                    s0, s1 = s1, s0
-                    sim_t += dt
-                    nstep += 1
+                if graph is not None:
+                    for _ in range(substeps // K):
+                        wp.capture_launch(graph)
+                    if graph_rem is not None:
+                        wp.capture_launch(graph_rem)
+                else:
+                    launch_steps(substeps)
+                sim_t += substeps * dt
+                nstep += substeps
                 wp.launch(recycle, dim=n_pool, device=device, inputs=[
                     s0.particle_q, s0.particle_qd, model.particle_flags,
-                    DOMAIN_LO, DOMAIN_HI, park_lo, PARK_STRIDE, PARK_NX,
+                    DOMAIN_LO, DOMAIN_HI, park_lo,
                     free_idx, free_count, discharged])
+                # recycle appends with atomics (arbitrary order): re-sort the free list so
+                # the next spawns get the same pool slots on every run.  Once per frame.
+                _fc = int(free_count.numpy()[0])
+                _fi = free_idx.numpy()
+                _fi[:_fc] = np.sort(_fi[:_fc])[::-1]
+                free_idx.assign(_fi)
 
+            if args.neighbor_every and frame > 0:
+                # fallbacks: grain-steps that outran their list and searched exactly instead
+                # (harmless, only slower).  Overflows: a grain had more than MAX_NEIGHBORS
+                # within cutoff -- that DROPS contacts, so widen nothing and shout.
+                nfb = int(solver.nbr_fallbacks.numpy()[0])
+                no = int(solver.nbr_overflow.numpy()[0])
+                nbr_fallbacks += nfb
+                if no:
+                    print(f"  !! neighbour list overflow on {no} grain-builds: contacts dropped",
+                          flush=True)
+                    solver.nbr_overflow.zero_()
+                solver.nbr_fallbacks.zero_()
             stats.zero_()
             wp.launch(stats_kernel, dim=n_pool, device=device, inputs=[
                 s0.particle_q, s0.particle_qd, model.particle_flags, solver.particle_w,
@@ -475,6 +683,20 @@ def main():
                        f"{st[6]*GRAIN_MASS:.6f},{casc_v:.4f},{spin_all:.3f},{spin_c:.3f},"
                        f"{out_kg:.6f},{wall:.2f}\n")
             hist.flush()
+            if args.checkpoint_at is not None and not saved_ckpt and frame * frame_dt >= args.checkpoint_at:
+                saved_ckpt = True
+                np.savez(os.path.join(out_dir, "checkpoint.npz"),
+                         q=s0.particle_q.numpy(), qd=s0.particle_qd.numpy(),
+                         flags=model.particle_flags.numpy(), w=solver.particle_w.numpy(),
+                         tang_partner=solver.tang_partner.numpy(),
+                         tang_stamp=solver.tang_stamp.numpy(), tang_xi=solver.tang_xi.numpy(),
+                         wall_slack=solver.wall_slack.numpy(), free_idx=free_idx.numpy(),
+                         free_count=free_count.numpy(), discharged=discharged.numpy(),
+                         sim_t=sim_t, nstep=nstep, solver_step=solver.step_count - 1,
+                         frame=frame)
+                # No rng state: the whole injection schedule is drawn up front from
+                # seed 0, so a resume regenerates it and continues at global step nstep.
+                print(f"  checkpoint written at t = {sim_t:.4f} s", flush=True)
             print(f"{frame*frame_dt:7.3f} {int(st[0]):9,d} {st[0]*GRAIN_MASS:7.2f} {st[1]:9.2f} "
                   f"{st[4]*GRAIN_MASS:8.2f} {tube_v:9.2f} {st[6]*GRAIN_MASS:8.2f} {casc_v:9.2f} "
                   f"{out_kg:8.2f} {wall:7.0f}   spin {spin_all:6.1f}/{spin_c:6.1f} rad/s",
@@ -491,6 +713,8 @@ def main():
         print("\ninterrupted")
     finally:
         hist.close()
+    if args.neighbor_every:
+        print(f"neighbour list: {nbr_fallbacks} grain-steps fell back to an exact search")
     print(f"\nwall clock {time.time()-t0:.1f} s   (BFA DEM: 5796 s on 24 CPU cores)")
 
 
