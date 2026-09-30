@@ -345,6 +345,7 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         win = "" if p.active == [0.0, INF] else f"  active {p.active[0]:g}-{p.active[1]:g} s"
         log(f"  collider {name:<16} {len(f):6,d} tris  "
             f"{'two-sided' if p.two_sided else 'one-sided'}  mu {p.friction:g}{win}"
+            + ("  corners" if p.corners else "")
             + ("  [surface motion: not simulated yet, #11]" if p.motion else ""))
 
     # --- injection lattice: never uniform random -------------------------------------
@@ -438,7 +439,7 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         friction=[p.friction for p in sc.parts],
         ke=[m.ke] * len(parts), kd=[kd_wall] * len(parts), kf=[m.kf] * len(parts),
         thickness=[p.thickness if p.two_sided else 0.0 for p in sc.parts],
-        max_dist=0.03, device=device)
+        max_dist=0.03, device=device, corners=[p.corners for p in sc.parts])
     if s.neighbor_every:
         log(f"  neighbour list        rebuilt every {s.neighbor_every} steps, skin "
             f"{skin*1e3:.2f} mm (two grains closing at {s.skin_speed:g} m/s)")

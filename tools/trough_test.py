@@ -86,9 +86,10 @@ def write_geometry(d, angle_deg, split):
     return names + ["ends"], zmax, ymax
 
 
-def scenario(d, angle_deg, split, preset):
+def scenario(d, angle_deg, split, preset, corners=False):
     names, zmax, ymax = write_geometry(d, angle_deg, split)
-    parts = [Part(name=n, stl=f"{n}.stl", two_sided=True, friction=0.5) for n in names]
+    parts = [Part(name=n, stl=f"{n}.stl", two_sided=True, friction=0.5, corners=corners)
+             for n in names]
     mat = Material(name="corn", radius=0.006, density=994.05, youngs=1.4220405e8, poisson=0.3,
                    restitution=0.2, friction=0.11, rolling_friction=0.3,
                    wall_rolling_friction=0.5, tangential_ratio=1.0, contact="hertz")
@@ -130,11 +131,12 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(HERE), "runs", "trough"))
     args = ap.parse_args()
     rows = []
-    for split in (False, True):
-        tag = f"{args.angle:g}deg_{args.preset}_{'three-part' if split else 'one-part'}"
+    for split, corners in ((False, False), (False, True), (True, False)):
+        tag = (f"{args.angle:g}deg_{args.preset}_{'three-part' if split else 'one-part'}"
+               + ("_corners" if corners else ""))
         d = os.path.join(args.out, tag)
         os.makedirs(d, exist_ok=True)
-        sc = scenario(d, args.angle, split, args.preset)
+        sc = scenario(d, args.angle, split, args.preset, corners)
         S = dem_run.build(sc, out_dir=d, quiet=True)
         dem_run.run(S)
         ck = np.load(os.path.join(d, "checkpoint.npz"))

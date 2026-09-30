@@ -58,6 +58,12 @@ wp.set_module_options({"enable_backward": False})
 
 _EPS_NORMAL = wp.constant(1.0e-3)
 _NO_CONTACT = wp.constant(1.0e9)
+# Two face contacts of one part closer than this in direction (cos 14 deg) are the same
+# contact (a triangulated flat or gently curved surface); further apart, a concave corner.
+_CORNER_COS = wp.constant(0.97)
+# Corner search only for grains with at most this many wall candidates (see
+# eval_wall_corners_rot).
+_CORNER_MAX_LIST = wp.constant(16)
 
 
 @wp.struct
@@ -85,6 +91,9 @@ class ShellCollider:
     """Per-part AABB upper corner."""
     active: wp.array(dtype=int)
     """1 = part takes part in contact, 0 = switched off (scenario time windows)."""
+    corners: wp.array(dtype=int)
+    """1 = resolve concave creases within this part with a second contact (issue #13;
+    eval_wall_corners_rot).  Off by default: it costs ~5-10% of wall-contact time."""
     max_dist: float
     """Query radius; must exceed particle radius + thickness."""
 
@@ -459,6 +468,8 @@ class SolverGranularDEM(SolverBase):
         self.wl = wp.zeros((int(MAX_WALL_CANDIDATES), n_all) if use_wl else (1, 1), dtype=int,
                            device=model.device)
         self.wl_count = wp.zeros(n_all if use_wl else 1, dtype=int, device=model.device)
+        self.wl_corner = wp.zeros(n_all if use_wl else 1, dtype=int, device=model.device)
+        self.any_corners = bool(collider.corners.numpy().any())
         if self.neighbor_every > 0:
             self.nbr = wp.zeros((int(MAX_NEIGHBORS), n_all), dtype=int, device=model.device)
             self.nbr_count = wp.zeros(n_all, dtype=int, device=model.device)
@@ -570,8 +581,10 @@ class SolverGranularDEM(SolverBase):
                     device=model.device)
                 if self.wall_grid is not None:
                     wp.launch(build_wall_list, dim=model.particle_count, inputs=[
-                        state_in.particle_q, model.particle_flags, self.wall_grid,
-                        self.skin_arr, self.wl, self.wl_count], device=model.device)
+                        state_in.particle_q, model.particle_flags, self.collider, self.wall_grid,
+                        int(self.any_corners),
+                        self.skin_arr, self.wl, self.wl_count, self.wl_corner],
+                        device=model.device)
             self._since_build = (self._since_build + 1) % self.neighbor_every
         else:
             # Rebuild every step: eval_particle_contact returns immediately on an unbuilt
@@ -663,6 +676,26 @@ class SolverGranularDEM(SolverBase):
                 outputs=[state_in.particle_f, self.particle_t],
                 device=model.device,
             )
+            # second contacts in concave corners of one part -- see its docstring.  Only
+            # launched when some part asks for it, so the default costs nothing.
+            if self.any_corners:
+                wp.launch(
+                    kernel=eval_wall_corners_rot,
+                    dim=model.particle_count,
+                    inputs=[
+                        state_in.particle_q, state_in.particle_qd, self.particle_w,
+                        model.particle_radius, model.particle_inv_mass, model.particle_flags,
+                        self.collider, self.wall_grid,
+                        self.mu_roll_wall, self.rot_damp_wall, self.k_t,
+                        int(self.hertz), self.e_star_w, self.g_star_w, self.beta_w, self.step_arr,
+                        self.tang_partner, self.tang_stamp, self.tang_xi,
+                        dt, model.particle_grid.id,
+                        int(use_list), self.wl, self.wl_count, self.wl_corner, self.skin_arr,
+                        self.x_build,
+                    ],
+                    outputs=[state_in.particle_f, self.particle_t],
+                    device=model.device,
+                )
         else:
             self.contact_count.zero_()
             if not self.wall_cache:
@@ -705,7 +738,8 @@ def _advance_step(step_arr: wp.array(dtype=int)):
     step_arr[0] = step_arr[0] + 1
 
 
-def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, device):
+def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, device,
+                   corners=None):
     """Pack per-part meshes and materials into a :class:`ShellCollider`.
 
     ``parts`` is a list of (name, vertices, faces).  The other arguments are per-part
@@ -730,6 +764,8 @@ def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, 
     c.lower = wp.array(lo, dtype=wp.vec3, device=device)
     c.upper = wp.array(hi, dtype=wp.vec3, device=device)
     c.active = wp.ones(len(parts), dtype=int, device=device)
+    c.corners = wp.array([1 if x else 0 for x in (corners or [False] * len(parts))], dtype=int,
+                         device=device)
     c.max_dist = float(max_dist)
     # wp.Mesh objects must outlive the struct: it stores only their integer ids, so if
     # they are garbage collected the kernel reads freed BVHs.  Returned for the caller
@@ -1061,6 +1097,7 @@ def _wall_force(
     beta: float,
     step: int,
     i: int,
+    wid: int,
     tang_partner: wp.array2d(dtype=int),
     tang_stamp: wp.array2d(dtype=int),
     tang_xi: wp.array2d(dtype=wp.vec3),
@@ -1097,8 +1134,7 @@ def _wall_force(
 
     ft = wp.vec3(0.0)
     if kt_eff > 0.0:
-        # walls occupy the same history table, keyed by negative partner ids
-        wid = -(m + 2)
+        # walls occupy the same history table, keyed by negative partner ids (wid)
         slot = _history_slot(tang_partner, tang_stamp, i, wid, step)
         if slot >= 0:
             ft = _tangential_spring(tang_xi, tang_partner, tang_stamp, i, slot,
@@ -1212,7 +1248,7 @@ def eval_shell_contact_forces_rot(
             continue
 
         fw, tw = _wall_force(collider, m, n, c, radius, v, w, particle_inv_mass[i], mu_roll,
-                             rot_damp, k_t, hertz, e_star, g_star, beta, step, i,
+                             rot_damp, k_t, hertz, e_star, g_star, beta, step, i, -(m + 2),
                              tang_partner, tang_stamp, tang_xi, dt)
         f_total += fw
         t_total += tw
@@ -1284,6 +1320,9 @@ class WallGrid:
     tri_part: wp.array(dtype=int)
     rec: wp.array(dtype=WallTri)
     """entries[k]'s triangle, inlined -- what the step kernel actually reads."""
+    rec_sharp: wp.array(dtype=int)
+    """1 if entries[k]'s triangle shares an edge with a neighbour > ~14 deg away (a crease).
+    Kept out of WallTri so the main wall kernel's records stay 64 bytes."""
 
 
 @wp.func
@@ -1341,6 +1380,25 @@ def _tri_closest(v0: wp.vec3, u: wp.vec3, w: wp.vec3, n: wp.vec3, t2: wp.vec3, x
             q = qc
     dq = p - q
     return h * h + wp.dot(dq, dq), v0 + u * q[0] + w * q[1]
+
+
+@wp.func
+def _tri_inside(v0: wp.vec3, u: wp.vec3, w: wp.vec3, t2: wp.vec3, x: wp.vec3):
+    """1 if x projects inside the triangle (edge-function signs in its own frame).  Then
+    the closest point is the projection: the contact distance is just the plane distance
+    and the direction the face normal, with no edge/corner search needed."""
+    r = x - v0
+    p0 = wp.dot(r, u)
+    p1 = wp.dot(r, w)
+    b = t2[0]
+    cu = t2[1]
+    cv = t2[2]
+    e0 = b * p1
+    e1 = (cu - b) * p1 - cv * (p0 - b)
+    e2 = -cu * (p1 - cv) + cv * (p0 - cu)
+    if e0 >= 0.0 and e1 >= 0.0 and e2 >= 0.0:
+        return 1
+    return 0
 
 
 @wp.kernel
@@ -1479,6 +1537,30 @@ def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device
     g.entries = entries
     g.tri_v0, g.tri_u, g.tri_w, g.tri_n, g.tri_2d = tv0, tu, tw, tn, tt2
     g.tri_part = arr(part_ids, dt=int)
+    # crease flags: a triangle is "sharp" if it shares an edge with a neighbour whose
+    # plane differs by more than ~14 deg (|cos| < _CORNER_COS).  Fillet facets, each a few
+    # degrees apart, are not; trough and panel corners are.
+    sharp = []
+    for _n, v, f in parts:
+        f = np.asarray(f, dtype=np.int64).reshape(-1, 3)
+        v = np.asarray(v, dtype=np.float64)
+        nrm = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+        nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-30)
+        e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+        fid = np.tile(np.arange(len(f)), 3)
+        key = np.sort(e, axis=1)
+        order = np.lexsort((key[:, 1], key[:, 0]))
+        key, fid = key[order], fid[order]
+        same = np.all(key[1:] == key[:-1], axis=1)
+        a, b = fid[:-1][same], fid[1:][same]
+        crease = np.abs(np.einsum("ij,ij->i", nrm[a], nrm[b])) < float(_CORNER_COS)
+        flag = np.zeros(len(f), dtype=np.int32)
+        flag[a[crease]] = 1
+        flag[b[crease]] = 1
+        sharp.append(flag)
+    sharp = np.concatenate(sharp)
+    ent = entries.numpy()[:total] if total else np.zeros(0, dtype=np.int32)
+    g.rec_sharp = wp.array(sharp[ent] if total else np.zeros(1, np.int32), dtype=int, device=device)
     g.rec = wp.empty(max(total, 1), dtype=WallTri, device=device)
     if total:
         wp.launch(_gather_records, dim=total, inputs=[entries, tv0, tu, tw, tn, tt2, g.tri_part,
@@ -1540,10 +1622,13 @@ def _entry(mode: int, wl: wp.array2d(dtype=int), i: int, k0: int, s: int):
 def build_wall_list(
     particle_q: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
+    collider: ShellCollider,
     g: WallGrid,
+    any_corners: int,
     skin: wp.array(dtype=float),
     wl: wp.array2d(dtype=int),
     wl_count: wp.array(dtype=int),
+    wl_corner: wp.array(dtype=int),
 ):
     """Per-grain wall candidates: the records of the grain's cell list that lie within
     reach + skin/2 of the GRAIN (the cell list covers the whole cell, so it is several
@@ -1552,6 +1637,7 @@ def build_wall_list(
     -1 = too many to store; the wall kernel then walks the full cell list."""
     i = wp.tid()
     wl_count[i] = 0
+    wl_corner[i] = 0
     if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
         return
     x = particle_q[i]
@@ -1562,6 +1648,20 @@ def build_wall_list(
     rr = g.reach + 0.5 * skin[0]
     r2 = rr * rr
     c = int(0)
+    # Corner flag: two FACE-reachable CREASE candidates (rec_sharp) of one part whose planes
+    # differ by more than ~14 deg (|cos|, so the two faces of a thin plate do not count).
+    # Smooth concave fillets are excluded: their closest point moves continuously, so one
+    # contact does not chatter, and their long lists made the corner kernel cost 335 us.  Face-reachable
+    # = the grain's projection is within skin/2 of the triangle in its plane, i.e. it may
+    # project inside it before the next rebuild.  A concave corner needs two such faces; a
+    # CONVEX edge has at most one, so grains on a panel near an edge or seam are not
+    # flagged (flagging every grain with differing planes nearby ran the corner kernel
+    # for most wall grains and cost 390 us a step).  Only flagged grains run
+    # eval_wall_corners_rot.
+    hs2 = 0.25 * skin[0] * skin[0]
+    ref_part = int(-1)
+    ref_n = wp.vec3(0.0)
+    corner = int(0)
     for k in range(g.cell_start[cell], g.cell_start[cell + 1]):
         r = g.rec[k]
         h = wp.dot(x - r.v0, r.n)
@@ -1571,9 +1671,20 @@ def build_wall_list(
                 if c < MAX_WALL_CANDIDATES:
                     wl[c, i] = k
                 c += 1
+                if any_corners == 1 and sq - h * h <= hs2 and g.rec_sharp[k] == 1 \
+                        and collider.corners[r.part] == 1:
+                    if r.part != ref_part:
+                        ref_part = r.part
+                        ref_n = r.n
+                    elif wp.abs(wp.dot(r.n, ref_n)) < _CORNER_COS:
+                        corner = 1
     if c > MAX_WALL_CANDIDATES:
         c = -1
     wl_count[i] = c
+    # flag only grains the corner kernel will actually handle (see _CORNER_MAX_LIST)
+    if c < 2 or c > _CORNER_MAX_LIST:
+        corner = 0
+    wl_corner[i] = corner
 
 
 @wp.kernel
@@ -1709,7 +1820,7 @@ def eval_wall_grid_rot(
         if c < 0.0 and c >= -radius:
             fw, tw = _wall_force(collider, m, n, c, radius, v, w, particle_inv_mass[i],
                                  mu_roll, rot_damp, k_t, hertz, e_star, g_star, beta,
-                                 step, i, tang_partner, tang_stamp, tang_xi, dt)
+                                 step, i, -(m + 2), tang_partner, tang_stamp, tang_xi, dt)
             f_total += fw
             t_total += tw
             hit += 1
@@ -1872,6 +1983,181 @@ def eval_particle_contact_list(
             t += dtq
     particle_f[i] = f
     particle_t[i] = t
+
+
+@wp.kernel
+def eval_wall_corners_rot(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_w: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    collider: ShellCollider,
+    g: WallGrid,
+    mu_roll: float,
+    rot_damp: float,
+    k_t: float,
+    hertz: int,
+    e_star: float,
+    g_star: float,
+    beta: float,
+    step_arr: wp.array(dtype=int),
+    tang_partner: wp.array2d(dtype=int),
+    tang_stamp: wp.array2d(dtype=int),
+    tang_xi: wp.array2d(dtype=wp.vec3),
+    dt: float,
+    grid: wp.uint64,
+    use_wl: int,
+    wl: wp.array2d(dtype=int),
+    wl_count: wp.array(dtype=int),
+    wl_corner: wp.array(dtype=int),
+    skin: wp.array(dtype=float),
+    x_build: wp.array(dtype=wp.vec3),
+    particle_f: wp.array(dtype=wp.vec3),
+    particle_t: wp.array(dtype=wp.vec3),
+):
+    """Second contacts in concave corners of one part (issue #13).
+
+    eval_wall_grid_rot keeps one contact per part -- its closest triangle.  A grain in a
+    concave corner of ONE part touches two faces, and with one contact the push flipped
+    between them each step: settled corner grains moved 10-20x faster than with the faces
+    as separate parts.  This adds, per part in contact, the closest FACE contact (grain
+    projects inside the triangle) whose direction differs from the primary's by more than
+    ~14 deg.  Edge/corner closest points never qualify, so a grain resting on a face near
+    a CONVEX edge is not pushed twice.
+
+    A separate kernel on purpose: folded into eval_wall_grid_rot, the extra state took it
+    from 127 to 134-159 registers, over the 128 that fit two 256-thread blocks per SM on
+    this GPU, and the halved occupancy cost 30-40% of that latency-bound kernel.  Here only
+    grains flagged at wall-list build (two differing planes of one part nearby) do work;
+    without wall lists, or for grains that outran theirs, every wall grain checks.
+
+    The extra contact's friction history is keyed -(1000000 + 8 m + 1).  If the two faces
+    swap which is closer, their histories swap too (a reset, not an error)."""
+    # Launched over ALL grains in the hash grid's spatial order, not over a compact list
+    # of flagged ones: packed densely, ~250 flagged grains fill only ~8 warps, and this
+    # latency-bound work then has nothing to overlap with (137 us vs 76 us measured).
+    i = wp.hash_grid_point_id(grid, wp.tid())
+    if use_wl == 1:
+        if wl_corner[i] == 0:
+            return                    # the common case: one load and out
+    if ~particle_flags[i] & newton.ParticleFlags.ACTIVE:
+        return
+    x = particle_q[i]
+    mode = int(0)
+    k0 = int(0)
+    ncand = int(0)
+    fast = int(0)
+    if use_wl == 1:
+        hs = 0.5 * skin[0]
+        if wp.length_sq(x - x_build[i]) > hs * hs:
+            fast = 1
+    if use_wl == 1:
+        # Only flagged grains with SHORT lists: real creases between flat panels (trough
+        # bottom/wing, chute panel corners) have a handful of candidates.  Grains in dense
+        # CAD detail (lists up to ~95) keep a single contact per part -- walking those
+        # lists twice made this kernel's slowest warps cost ~290 us a step.  Grains that
+        # outran their list skip it for those few steps.
+        if fast == 1:
+            return
+        mode = 1
+        ncand = wl_count[i]
+    else:
+        cc = _cell_of(g, x)
+        if cc[0] < 0 or cc[1] < 0 or cc[2] < 0 or cc[0] >= g.nx or cc[1] >= g.ny or cc[2] >= g.nz:
+            return
+        cell = (cc[2] * g.ny + cc[1]) * g.nx + cc[0]
+        k0 = g.cell_start[cell]
+        ncand = g.cell_start[cell + 1] - k0
+        if ncand > _CORNER_MAX_LIST:
+            return
+    if ncand < 2:
+        return
+
+    step = step_arr[0]
+    radius = particle_radius[i]
+    v = particle_qd[i]
+    w = particle_w[i]
+    f_total = wp.vec3(0.0)
+    t_total = wp.vec3(0.0)
+    hit = int(0)
+
+    # walk the parts' segments: primary = closest triangle (as the main kernel found it),
+    # then the closest face contact pointing >14 deg away from it
+    cur = int(-1)
+    seg0 = int(0)
+    best_sq = float(0.0)
+    best_t = int(-1)
+    for s in range(ncand + 1):
+        t = int(-1)
+        p = int(-1)
+        if s < ncand:
+            t = _entry(mode, wl, i, k0, s)
+            p = g.rec[t].part
+        if p != cur:
+            if best_t >= 0:
+                m = cur
+                pr = g.rec[best_t]
+                _sq0, cp0 = _tri_closest(pr.v0, pr.u, pr.w, pr.n, pr.t2, x)
+                d0 = pr.n
+                if best_sq > _EPS_NORMAL * _EPS_NORMAL:
+                    d0 = (x - cp0) / wp.sqrt(best_sq)
+                rr = radius + collider.thickness[m]
+                ex_sq = rr * rr
+                ex_t = int(-1)
+                for s2 in range(seg0, s):
+                    t2 = _entry(mode, wl, i, k0, s2)
+                    r2 = g.rec[t2]
+                    h = wp.dot(x - r2.v0, r2.n)
+                    if h * h < ex_sq:
+                        d = r2.n
+                        if h < 0.0:
+                            d = -r2.n
+                        if wp.dot(d, d0) < _CORNER_COS:
+                            if _tri_inside(r2.v0, r2.u, r2.w, r2.t2, x) == 1:
+                                ex_sq = h * h
+                                ex_t = t2
+                if ex_t >= 0:
+                    er = g.rec[ex_t]
+                    _sq1, cp1 = _tri_closest(er.v0, er.u, er.w, er.n, er.t2, x)
+                    thick = collider.thickness[m]
+                    offset = x - cp1
+                    d_unsigned = wp.sqrt(ex_sq)
+                    face_n = er.n
+                    if collider.two_sided[m] == 0:
+                        face_n = _avg_normal_from_list(g, mode, wl, i, k0, seg0, s, cp1)
+                    sdf, n = _shell_sdf(collider.two_sided[m], thick, offset, d_unsigned, face_n)
+                    c = sdf - radius
+                    if c < 0.0 and c >= -radius:
+                        fw, tw = _wall_force(collider, m, n, c, radius, v, w, particle_inv_mass[i],
+                                             mu_roll, rot_damp, k_t, hertz, e_star, g_star, beta,
+                                             step, i, -(1000000 + m * 8 + 1), tang_partner,
+                                             tang_stamp, tang_xi, dt)
+                        f_total += fw
+                        t_total += tw
+                        hit += 1
+            cur = p
+            seg0 = s
+            best_t = -1
+            rr0 = radius + collider.thickness[wp.max(p, 0)]
+            best_sq = rr0 * rr0
+            if p >= 0:
+                if collider.active[p] == 0:
+                    best_sq = 0.0
+        if t >= 0:
+            r = g.rec[t]
+            h = wp.dot(x - r.v0, r.n)
+            if h * h < best_sq:
+                sq, _cand = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, x)
+                if sq < best_sq:
+                    best_sq = sq
+                    best_t = t
+
+    if hit > 0:
+        # one owner thread per grain, and the main wall kernel has finished
+        particle_f[i] = particle_f[i] + f_total
+        particle_t[i] = particle_t[i] + t_total
 
 
 @wp.kernel

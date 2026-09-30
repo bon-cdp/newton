@@ -233,9 +233,12 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
             motion = {k: belt[k] for k in ("type", "velocity")}
         parts.append(Part(name=name, stl=os.path.relpath(stl, proj_dir), two_sided=True,
                           thickness=0.0, friction=fric,
-                          active=list(windows.get(sn, [0.0, INF])), motion=motion))
+                          active=list(windows.get(sn, [0.0, INF])), motion=motion,
+                          corners=belt is not None))
     interp.append("every boundary is a zero-thickness two-sided shell (BFA boundaries are "
                   "surfaces; grains cannot cross them from either side)")
+    interp.append("concave-crease contacts (corners, #13) enabled on conveyor parts: a troughed "
+                  "belt's bottom/wing creases otherwise make settled grains chatter")
     if len(set(rolls)) > 1 or len(set(rots)) > 1 or len(set(rests)) > 1:
         warn.append(f"per-component rolling friction {sorted(set(rolls))} / rotational damping "
                     f"{sorted(set(rots))} / restitution {sorted(set(rests))} differ; the solver "

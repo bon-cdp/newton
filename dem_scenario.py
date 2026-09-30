@@ -75,6 +75,7 @@ class Part:
     friction: float = 0.5                 # grain-wall Coulomb
     active: list[float] = field(default_factory=lambda: [0.0, INF])   # [on, off) seconds
     motion: dict | None = None            # surface motion, issue #11 (not yet simulated)
+    corners: bool = False                 # second contact in concave creases of this part (#13)
 
 
 @dataclass
