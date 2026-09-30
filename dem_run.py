@@ -817,7 +817,8 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
           f"{held+out_kg+esc_kg:.2f} kg;  injection backlog max {max_backlog}, "
           f"end {int(S.backlog.numpy()[0])} grains")
     wall = time.time() - t0
-    print(f"\nwall clock {wall:.1f} s = {wall / max(out.duration, 1e-9):.1f} s per simulated second")
+    print(f"\nwall clock {wall:.1f} s = {wall / max(sim_t, 1e-9):.1f} s per simulated second"
+          f" ({sim_t:.3f} of {out.duration:g} s simulated)")
     return out_dir
 
 

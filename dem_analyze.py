@@ -302,6 +302,9 @@ def wall_loads(run, t0=None, t1=None, device="cuda:0", out_dir=None, quiet=False
                 part_id=np.concatenate([np.full(len(fc), k) for k, (_n, _v, fc) in enumerate(parts)]))
     _write_maps_vtk(os.path.join(out_dir, "wall_maps.vtk"), parts, maps,
                     title=f"wall loads, mean over {nfr} frames t={frames[0][0]:.2f}-{frames[-1][0]:.2f} s")
+    # the same maps for the operator screen (triangle order = the solver's load order)
+    np.savez(os.path.join(out_dir, "wall_maps.npz"), window=np.array([frames[0][0], frames[-1][0]]),
+             **{k: np.asarray(v, dtype=np.float32) for k, v in maps.items()})
     if not quiet:
         print(f"wall loads: {nfr} frames, t = {frames[0][0]:.2f}-{frames[-1][0]:.2f} s -> {out_dir}")
         print(f"  {'part':<22} {'mean |F| (N)':>12} {'mean Fx':>10} {'mean Fy':>10} {'mean Fz':>10}")

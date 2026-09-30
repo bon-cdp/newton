@@ -13,6 +13,7 @@ a commercial DEM code on a real machine — and then run cases BFA cannot afford
 | `dem_run.py` | the generic runner: any scenario → history.csv, run.json, VTK. Injection schedule, recycling, CUDA-graph stepping, per-part time windows. |
 | `bfa_import.py` | BFA project (.prj + .lin) → scenario, with every interpretation listed. |
 | `dem_analyze.py` | measurements from a finished run's frames: wall loads and maps, flows, regions. |
+| `dem_ui/` | the operator screen: FastAPI backend (`server.py`) and a no-build web frontend (three.js). |
 | `bfa_dem.py` | the corn replication: its flags and presets → scenario → `dem_run`. |
 | `bfa_replication_mpm.py` | the earlier MPM runner. Still imported by the DEM tooling for `COLLIDER_PARTS` and `load_part`. |
 | `compare_bfa_dem.py` | scores a run against BFA (hold-up, KE, chute, cascade, discharge, rms). |
@@ -89,6 +90,25 @@ live counters exactly; a head chute's horizontal load equals the stream's moment
 Limits: stuck contacts' tangential force uses the sliding law (the history spring is not
 in frames); corner second contacts (#13) are not yet reconstructed; impacts shorter than
 the frame interval are sampled, not integrated.
+
+## Operator screen (web UI)
+
+```bash
+.venv/bin/python -m pip install -r dem_ui/requirements.txt    # once
+.venv/bin/python -m dem_ui.server                            # http://127.0.0.1:8765
+```
+
+- **Setup:** projects (folders with a BFA `.prj` or `scenario*.json`); one-click BFA import;
+  3D view of parts, injector face, flow planes and domain; editable solver preset,
+  material, parts (sidedness, friction, active window, corners, belt speed) and injection.
+  Saving validates through the scenario schema.
+- **Run:** launches `dem_run.py` as a subprocess; live progress, mass, region and flow charts; stop.
+- **Results:** frame playback coloured by speed; post-run measurements (`dem_analyze.py`) for
+  a chosen window: part loads (table and chart), flows (rates and shares), regions; wall
+  pressure / shear / wear / contact maps on the geometry.
+- Deep links: `#scenario=<path>` or `#run=<id>&tab=results&frame=<n>&colour=pressure_Pa`.
+- Binds to localhost: the server reads and writes files in the workspace, so do not expose
+  it without authentication.  three.js is vendored (MIT) so it works offline.
 
 ## Performance
 

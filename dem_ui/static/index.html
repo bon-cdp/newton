@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newton DEM</title>
+<link rel="stylesheet" href="/static/style.css">
+<script type="importmap">
+  { "imports": { "three": "/static/vendor/three.module.js" } }
+</script>
+</head>
+<body>
+<header>
+  <div class="brand">Newton DEM <span class="sub">operator screen</span></div>
+  <nav id="tabs">
+    <button data-tab="setup" class="on">Setup</button>
+    <button data-tab="run">Run</button>
+    <button data-tab="results">Results</button>
+  </nav>
+  <div id="status-line"></div>
+</header>
+
+<main>
+  <aside id="sidebar">
+    <section>
+      <h3>Projects</h3>
+      <div id="projects"></div>
+    </section>
+    <section>
+      <h3>Runs <button id="refresh-runs" class="small" title="refresh">↻</button></h3>
+      <div id="runs"></div>
+    </section>
+  </aside>
+
+  <section id="stage">
+    <div id="viewer"></div>
+    <div id="legend" hidden></div>
+    <div id="frame-bar" hidden>
+      <button id="play" class="small">▶</button>
+      <input id="frame-slider" type="range" min="0" max="0" value="0">
+      <span id="frame-label"></span>
+    </div>
+  </section>
+
+  <section id="panel">
+    <!-- SETUP -->
+    <div class="tab" id="tab-setup">
+      <div id="setup-empty" class="empty">Select a scenario on the left, or import a BFA project.</div>
+      <div id="setup-form" hidden>
+        <h2 id="setup-title"></h2>
+        <div class="row">
+          <button id="save-scenario">Save</button>
+          <label>duration (s) <input id="run-duration" type="number" step="any" style="width:5em"></label>
+          <button id="launch" class="primary">Run</button>
+        </div>
+        <div id="setup-msg" class="msg"></div>
+
+        <details open>
+          <summary>Solver</summary>
+          <div class="grid2">
+            <label>preset
+              <select id="preset">
+                <option value="fast">fast (E/10, larger dt, lists)</option>
+                <option value="reference">reference (true E, BFA dt)</option>
+                <option value="custom">custom</option>
+              </select>
+            </label>
+            <label>output fps <input data-bind="output.fps" type="number" step="any"></label>
+            <label>duration (s) <input data-bind="output.duration" type="number" step="any"></label>
+            <label>write VTK frames <input data-bind="output.vtk" type="checkbox"></label>
+          </div>
+        </details>
+
+        <details open>
+          <summary>Material</summary>
+          <div class="grid2" id="material-fields"></div>
+        </details>
+
+        <details open>
+          <summary>Parts</summary>
+          <table id="parts-table" class="tbl">
+            <thead><tr><th>show</th><th>part</th><th>2-sided</th><th>friction</th><th>on (s)</th><th>off (s)</th><th>corners</th><th>belt m/s</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </details>
+
+        <details open>
+          <summary>Injection</summary>
+          <div class="grid2" id="injector-fields"></div>
+        </details>
+
+        <details>
+          <summary>Flow planes (portals)</summary>
+          <div id="flow-planes"></div>
+        </details>
+
+        <details>
+          <summary>Importer notes</summary>
+          <div id="notes" class="notes"></div>
+        </details>
+      </div>
+    </div>
+
+    <!-- RUN -->
+    <div class="tab" id="tab-run" hidden>
+      <div id="run-empty" class="empty">Select a run on the left, or press Run on a scenario.</div>
+      <div id="run-view" hidden>
+        <h2 id="run-title"></h2>
+        <div class="row"><span id="run-status" class="badge"></span>
+          <div class="progress"><div id="run-progress"></div></div>
+          <button id="stop-run">Stop</button></div>
+        <canvas id="chart-mass" class="chart" height="170"></canvas>
+        <canvas id="chart-regions" class="chart" height="170"></canvas>
+        <canvas id="chart-flows" class="chart" height="170"></canvas>
+        <details><summary>Log</summary><pre id="run-log"></pre></details>
+      </div>
+    </div>
+
+    <!-- RESULTS -->
+    <div class="tab" id="tab-results" hidden>
+      <div id="results-empty" class="empty">Select a finished run on the left.</div>
+      <div id="results-view" hidden>
+        <h2 id="results-title"></h2>
+        <div class="row">
+          <label>window <input id="win0" type="number" step="any" style="width:4.5em"> –
+            <input id="win1" type="number" step="any" style="width:4.5em"> s</label>
+        </div>
+        <div class="row">
+          <button data-analyze="loads">Wall loads</button>
+          <button data-analyze="flows">Flows</button>
+          <button data-analyze="regions">Regions</button>
+          <span id="analysis-msg" class="msg"></span>
+        </div>
+        <div class="row">
+          <label>colour
+            <select id="colour-by">
+              <option value="speed">particles: speed</option>
+              <option value="pressure_Pa">walls: pressure</option>
+              <option value="shear_Pa">walls: shear</option>
+              <option value="wear_rate_W_m2">walls: wear rate</option>
+              <option value="contacts_per_frame">walls: contacts</option>
+            </select>
+          </label>
+          <label><input id="show-particles" type="checkbox" checked> particles</label>
+        </div>
+        <div id="loads-out"></div>
+        <canvas id="chart-loads" class="chart" height="190" hidden></canvas>
+        <div id="flows-out"></div>
+        <canvas id="chart-aflows" class="chart" height="170" hidden></canvas>
+        <div id="regions-out"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
