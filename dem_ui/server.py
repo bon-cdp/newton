@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EMS Flo operator screen backend: a thin HTTP API over scenarios, the BFA importer, dem_run and
+EMS DEM operator screen backend: a thin HTTP API over scenarios, the BFA importer, dem_run and
 dem_analyze.  Heavy work (simulation, analysis) runs in subprocesses, so this server never
 touches the GPU and stays responsive while runs go.
 
@@ -43,7 +43,7 @@ PROJECTS = os.path.join(ROOT, "projects")
 SKIP = {"runs", ".venv", "newton", "dem_ui", "tools", "docs", ".git", "_backup_fork",
         "bfa_reference_vtk", "asv", "__pycache__"}
 
-app = FastAPI(title="EMS Flo")
+app = FastAPI(title="EMS DEM")
 JOBS: dict[str, subprocess.Popen] = {}           # run id -> simulation process
 ANALYSES: dict[str, subprocess.Popen] = {}       # run id -> analysis process
 

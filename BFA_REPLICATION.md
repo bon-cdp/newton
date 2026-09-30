@@ -91,7 +91,7 @@ Limits: stuck contacts' tangential force uses the sliding law (the history sprin
 in frames); corner second contacts (#13) are not yet reconstructed; impacts shorter than
 the frame interval are sampled, not integrated.
 
-## Operator screen: EMS Flo (web UI)
+## Operator screen: EMS DEM (web UI)
 
 ```bash
 .venv/bin/python -m pip install -r dem_ui/requirements.txt    # once
