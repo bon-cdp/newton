@@ -133,15 +133,15 @@ class FlowPlane:
 
 @dataclass
 class Solver:
-    """Defaults are the FAST settings (validated on the corn and iron-ore projects):
-    Young's modulus / 10, dt = 0.35 Rayleigh time, neighbour lists every 4 steps.  For
-    BFA's own stiffness and timestep set youngs_divisor 1 and neighbor_every 0 (the
-    importer's --preset reference)."""
+    """Defaults are the REFERENCE settings: the true Young's modulus and dt = 0.35 Rayleigh
+    time (BFA's own timestep is 0.357 of it on the iron-ore project; the importer copies
+    BFA's value exactly).  The FAST preset (validated on the corn and iron-ore projects,
+    ~3x faster) sets youngs_divisor 10 and neighbor_every 4."""
 
     dt: float | str = "auto"              # s, or "auto" = rayleigh_fraction * Rayleigh time
     rayleigh_fraction: float = 0.35
-    youngs_divisor: float = 10.0          # soften E for a larger stable dt (1 = true E)
-    neighbor_every: int = 4               # Verlet list rebuild interval (0 = off)
+    youngs_divisor: float = 1.0           # soften E for a larger stable dt (fast: 10)
+    neighbor_every: int = 0               # Verlet list rebuild interval (0 = off; fast: 4)
     skin: float | None = None             # m; default 2 * skin_speed * N * dt
     skin_speed: float = 6.0               # m/s the default skin is sized for; faster grains
                                           # fall back to a direct search (12 m/s measured slower)
@@ -152,7 +152,8 @@ class Solver:
     graph_steps: int = 256
     hash_dims: list[int] | None = None
     max_velocity: float = 30.0            # m/s safety clamp
-    expected_holdup_kg: float = 20.0      # sizes the particle pool
+    expected_holdup_kg: float | None = None  # sizes the particle pool; None = mass rate x
+                                          # residence time (dem_run.holdup_estimate)
     pool_factor: float = 2.5
     min_pool: int = 8192
     simplify_mm: float = 0.0

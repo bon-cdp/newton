@@ -61,8 +61,8 @@ domain, reporting regions, solver and output settings.
 
 ```bash
 # import a BulkFlowAnalyst project (reads .prj + .lin; writes <project>/scenario.json)
-.venv/bin/python bfa_import.py <project>               # fast preset (default)
-.venv/bin/python bfa_import.py <project> --preset reference --out <project>/scenario_ref.json
+.venv/bin/python bfa_import.py <project>               # reference preset (default): BFA's dt, true E
+.venv/bin/python bfa_import.py <project> --preset fast --out <project>/scenario_fast.json
 # run any scenario
 .venv/bin/python -u dem_run.py <project>/scenario.json --out runs/dem/<name>
 ```
@@ -104,7 +104,13 @@ the frame interval are sampled, not integrated.
   conveyor belt / rotating, direction picked on an edge in 3D, friction, active window,
   corners) and injection: an STL face, or a box on a belt or a plane (position, lateral
   offset, clearance, length, width, height; live capacity check).  Drafts save and list
-  what is missing before they can run.
+  what is missing before they can run.  A live estimate under Run gives grains per second,
+  grains held at once, GPU memory and time per simulated second (grain size and mass rate
+  set the cost: 10,000 t/h of 12 mm grains is 3 M grains/s and does not fit a 16 GB GPU).
+- **Particle pool:** sized from the mass rate x residence time (longest belt at its speed
+  + 3 s, else 5 s, at most the run's duration) unless `solver.expected_holdup_kg` is set,
+  and capped at what the GPU holds (~960 bytes per grain).  The domain is stretched to hold
+  every injection site if it does not (grains outside it are recycled at once).
 - **Run:** launches `dem_run.py` as a subprocess; live progress, mass, region and flow charts; stop.
 - **Results:** frame playback coloured by speed; post-run measurements (`dem_analyze.py`) for
   a chosen window: part loads (table and chart), flows (rates and shares), regions; wall

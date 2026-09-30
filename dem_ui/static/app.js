@@ -91,7 +91,7 @@ async function loadProjects() {
 async function importProject(name, btn) {
   btn.disabled = true; btn.textContent = "importing…";
   try {
-    const r = await api(`/api/projects/import?project=${encodeURIComponent(name)}&preset=fast`, { method: "POST" });
+    const r = await api(`/api/projects/import?project=${encodeURIComponent(name)}&preset=reference`, { method: "POST" });
     await loadProjects(); await openScenario(r.scenario);
   } catch (e) { alert("Import failed: " + e.message); }
   btn.disabled = false;
@@ -146,15 +146,14 @@ function renderSetup() {
   const sc = S.scen;
   $("#setup-empty").hidden = true; $("#setup-form").hidden = false;
   $("#setup-title").textContent = `${sc.name}  ·  ${S.scenPath}`;
-  $("#run-duration").value = sc.output?.duration ?? 10;
   document.querySelectorAll("[data-bind]").forEach(inp => {
     const v = get(sc, inp.dataset.bind);
     if (inp.type === "checkbox") inp.checked = !!v; else inp.value = num(v) ?? "";
     inp.onchange = () => set(sc, inp.dataset.bind, inp.type === "checkbox" ? inp.checked : +inp.value);
   });
   const s = sc.solver || {};
-  $("#preset").value = (s.youngs_divisor ?? 10) === 10 && (s.neighbor_every ?? 4) === 4 ? "fast"
-    : (s.youngs_divisor === 1 && !s.neighbor_every) ? "reference" : "custom";
+  $("#preset").value = (s.youngs_divisor ?? 1) === 1 && !(s.neighbor_every ?? 0) ? "reference"
+    : (s.youngs_divisor === 10 && s.neighbor_every === 4) ? "fast" : "custom";
   $("#preset").onchange = e => {
     sc.solver = sc.solver || {};
     if (e.target.value === "fast") Object.assign(sc.solver, { youngs_divisor: 10, dt: "auto", neighbor_every: 4, skin_speed: 6 });
@@ -209,6 +208,9 @@ function renderSetup() {
   viewer.setMotionArrows(sc.parts);
   // injector
   renderInjector(sc);
+  const form = $("#setup-form");
+  form.oninput = form.onchange = refreshEstimate;   // any edit may change size and cost
+  refreshEstimate();
   // flow planes
   $("#flow-planes").innerHTML = (sc.flow_planes || []).map(f =>
     `<div class="item">${f.name}: ${"xyz"[f.axis]} = ${f.value}</div>`).join("") || "<div class='msg'>none</div>";
@@ -216,6 +218,30 @@ function renderSetup() {
   const n = sc.notes || {};
   $("#notes").innerHTML = (n.interpretations || []).map(s => `<p>• ${s}</p>`).join("") +
     (n.warnings || []).map(s => `<p class="warn">⚠ ${s}</p>`).join("");
+}
+
+// ---------------------------------------------------------------- run estimate
+// Grains per second, grains held at once, memory and time, refreshed as the form changes:
+// grain size and mass rate decide the cost (10,000 t/h of 12 mm grains is 3 M grains/s).
+function dur(s) { return s < 120 ? `${fmt(s)} s` : s < 7200 ? `${fmt(s / 60)} min` : `${fmt(s / 3600)} h`; }
+function big(n) { return n >= 1e6 ? `${fmt(n / 1e6)} M` : n >= 1e3 ? `${fmt(n / 1e3)} k` : fmt(n); }
+
+function refreshEstimate() {
+  clearTimeout(refreshEstimate.t);
+  refreshEstimate.t = setTimeout(async () => {
+    const el = $("#run-estimate");
+    if (!S.scen || !el) return;
+    try {
+      const e = await api(`/api/estimate?scenario=${encodeURIComponent(S.scenPath)}`, { method: "POST", body: JSON.stringify(S.scen) });
+      if (e.error) { el.className = "msg"; el.textContent = ""; return; }
+      const slow = e.s_per_sim_s > 600;
+      el.className = "msg " + (e.too_big ? "err" : slow ? "warn" : "");
+      el.textContent = `≈ ${big(e.grains_per_s)} grains/s (${fmt(e.grain_mass * 1e3)} g each) · ~${big(e.holdup_grains)} grains held at once` +
+        ` (${e.holdup_how}) · ~${fmt(e.step_ms)} ms/step → ~${dur(e.s_per_sim_s)} per simulated second, ~${dur(e.run_s)} in all` +
+        (e.too_big ? ` · needs ~${fmt(e.memory_gb)} GB, more than the ${fmt(e.gpu_gb)} GB GPU: use larger grains or a lower mass rate` :
+         slow ? " · a long run: check grain size and mass rate" : "");
+    } catch (err) { el.textContent = ""; }
+  }, 400);
 }
 
 // ---------------------------------------------------------------- injection
@@ -424,11 +450,13 @@ $("#save-scenario").onclick = async () => {
   catch (e) { m.className = "msg err"; m.textContent = e.message; }
 };
 
+function sc_duration() { return S.scen.output?.duration ?? 10; }
+
 $("#launch").onclick = async () => {
   const m = $("#setup-msg");
   try {
     await api(`/api/scenario?path=${encodeURIComponent(S.scenPath)}`, { method: "PUT", body: JSON.stringify(S.scen) });
-    const r = await api("/api/runs", { method: "POST", body: JSON.stringify({ scenario: S.scenPath, duration: +$("#run-duration").value }) });
+    const r = await api("/api/runs", { method: "POST", body: JSON.stringify({ scenario: S.scenPath, duration: +sc_duration() }) });
     m.className = "msg ok"; m.textContent = `started ${r.id}`;
     await loadRuns(); openRun(r.id, "run");
   } catch (e) { m.className = "msg err"; m.textContent = e.message; }
@@ -511,7 +539,8 @@ $("#stop-run").onclick = async () => { try { await api(`/api/runs/${S.run}/stop`
 // ---------------------------------------------------------------- results: playback
 async function showFrame(i) {
   if (!S.frames.length) return;
-  S.frameIdx = i;
+  i = Math.min(Math.max(0, Math.round(i) || 0), S.frames.length - 1);   // e.g. a stale deep link
+  S.frameIdx = i; $("#frame-slider").value = i;
   const k = S.frames[i];
   $("#frame-label").textContent = `frame ${k}  ·  t = ${(k / S.fps).toFixed(2)} s`;
   const buf = await api(`/api/runs/${S.run}/frame/${k}`);

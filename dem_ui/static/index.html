@@ -50,9 +50,10 @@
         <h2 id="setup-title"></h2>
         <div class="row">
           <button id="save-scenario">Save</button>
-          <label>duration (s) <input id="run-duration" type="number" step="any" style="width:5em"></label>
+          <label>duration (s) <input data-bind="output.duration" type="number" step="any" style="width:5em"></label>
           <button id="launch" class="primary">Run</button>
         </div>
+        <div id="run-estimate" class="msg"></div>
         <div id="setup-msg" class="msg"></div>
         <details>
           <summary>Geometry (upload STL)</summary>
@@ -72,13 +73,12 @@
           <div class="grid2">
             <label>preset
               <select id="preset">
-                <option value="fast">fast (E/10, larger dt, lists)</option>
                 <option value="reference">reference (true E, BFA dt)</option>
+                <option value="fast">fast (E/10, larger dt, lists)</option>
                 <option value="custom">custom</option>
               </select>
             </label>
             <label>output fps <input data-bind="output.fps" type="number" step="any"></label>
-            <label>duration (s) <input data-bind="output.duration" type="number" step="any"></label>
             <label>write VTK frames <input data-bind="output.vtk" type="checkbox"></label>
           </div>
         </details>

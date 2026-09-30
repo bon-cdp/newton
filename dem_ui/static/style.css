@@ -52,6 +52,8 @@ button:disabled { opacity: .5; cursor: default; }
 .msg { color: var(--muted); font-size: 12px; }
 .msg.err { color: var(--bad); }
 .msg.ok { color: var(--ok); }
+.msg.warn { color: var(--warn); }
+#run-estimate { margin: 2px 0 6px; }
 .notes { font-size: 11px; color: var(--muted); }
 .notes .warn { color: var(--warn); }
 .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #e5e7eb; }

@@ -247,15 +247,23 @@ export class Viewer {
     if (!this.points) {
       const g = new THREE.BufferGeometry();
       this.points = new THREE.Points(g, new THREE.PointsMaterial({
-        size: 2 * this.grainRadius, sizeAttenuation: true, vertexColors: true,
+        size: this.pointSize(), sizeAttenuation: true, vertexColors: true,
         map: this.sprite, alphaTest: 0.5 }));
       this.scene.add(this.points);
     }
-    this.points.material.size = 2 * this.grainRadius;
+    this.points.material.size = this.pointSize();
     const g = this.points.geometry;
     g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
     g.setAttribute("color", new THREE.BufferAttribute(cols, 3));
     g.computeBoundingSphere();
+  }
+
+  // three.js draws an attenuated point size * (viewport height / 2) / depth pixels across,
+  // which leaves out the camera's field of view: a grain's true diameter on screen is
+  // 2r * (height / 2) / (depth * tan(fov / 2)).  The disc sprite fills 31/32 of its texture.
+  pointSize() {
+    const t = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    return 2 * this.grainRadius / t * 32 / 31;
   }
 
   showParticles(on) { if (this.points) this.points.visible = on; }

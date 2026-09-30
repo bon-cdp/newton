@@ -317,6 +317,8 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
     solver = Solver(expected_holdup_kg=round(holdup, 1), wall_grid_cell=wall_cell,
                     max_velocity=30.0)
     if preset == "fast":
+        solver.dt, solver.youngs_divisor, solver.neighbor_every = "auto", 10.0, 4
+        solver.skin_speed = 6.0
         interp.append("preset fast: Young's modulus / 10, dt = 0.35 Rayleigh time, neighbour "
                       "lists.  On the iron-ore conveyor project: 3x faster than reference; "
                       "portal split within 0.005 of BFA up to moderate deflection, over-steering "
@@ -368,7 +370,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("project", help="BFA project directory (contains the .prj, .lin and STLs)")
     ap.add_argument("--out", default=None, help="scenario JSON (default <project>/scenario.json)")
-    ap.add_argument("--preset", choices=["reference", "fast"], default="fast",
+    ap.add_argument("--preset", choices=["reference", "fast"], default="reference",
                     help="fast (default) = E/10, dt 0.35 Rayleigh time, neighbour lists, ~3x "
                          "faster; reference = BFA's own timestep and modulus")
     args = ap.parse_args()

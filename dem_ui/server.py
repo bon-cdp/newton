@@ -60,6 +60,14 @@ def _inside(path: str) -> str:
     return p
 
 
+def _existing(path: str) -> str:
+    """_inside, and 404 (not a 500) if the file is gone, e.g. its project was deleted."""
+    p = _inside(path)
+    if not os.path.isfile(p):
+        raise HTTPException(404, f"{_rel(p)} no longer exists (was its project deleted?)")
+    return p
+
+
 def _rel(path: str) -> str:
     return os.path.relpath(path, ROOT)
 
@@ -152,9 +160,9 @@ def projects():
 
 
 @app.post("/api/projects/import")
-def import_project(project: str, preset: str = "fast"):
+def import_project(project: str, preset: str = "reference"):
     p = _inside(project)
-    out = os.path.join(p, "scenario.json" if preset == "fast" else f"scenario_{preset}.json")
+    out = os.path.join(p, "scenario.json" if preset == "reference" else f"scenario_{preset}.json")
     r = subprocess.run([PY, os.path.join(ROOT, "bfa_import.py"), p, "--preset", preset,
                         "--out", out], capture_output=True, text=True, cwd=ROOT)
     if r.returncode != 0:
@@ -203,9 +211,19 @@ def _auto_domain(sc: dict, base: str, margin_frac: float = 0.15, margin_min: flo
         los.append(m.bounds[0])
         his.append(m.bounds[1])
     for i in sc.get("injectors", []):
-        m = trimesh.load(os.path.join(base, i["face_stl"]), force="mesh")
-        los.append(m.bounds[0])
-        his.append(m.bounds[1])
+        if i.get("box"):
+            try:
+                import dem_run
+                s = Scenario.from_dict(sc, base_dir=base, validate=False)
+                c = np.asarray(dem_run.injector_box_corners(s, s.injectors[0]))
+            except (ValueError, KeyError, IndexError, StopIteration):
+                continue                    # box not placeable yet; the run reports why
+            los.append(c.min(axis=0))
+            his.append(c.max(axis=0))
+        elif i.get("face_stl") and os.path.isfile(os.path.join(base, i["face_stl"])):
+            m = trimesh.load(os.path.join(base, i["face_stl"]), force="mesh")
+            los.append(m.bounds[0])
+            his.append(m.bounds[1])
     if not los:
         return
     lo, hi = np.min(los, axis=0), np.max(his, axis=0)
@@ -219,7 +237,7 @@ async def upload(request: __import__("fastapi").Request):
     scenario (path).  STLs go next to the scenario, converted to metres."""
     import trimesh
     form = await request.form()
-    scen_path = _inside(form.get("scenario") or "")
+    scen_path = _existing(form.get("scenario") or "")
     d = os.path.dirname(scen_path)
     scale = UNITS_TO_M.get(form.get("units", "m"))
     if scale is None:
@@ -265,7 +283,7 @@ async def upload(request: __import__("fastapi").Request):
 
 @app.post("/api/scenario/auto-domain")
 def auto_domain(path: str):
-    p = _inside(path)
+    p = _existing(path)
     sc = json.load(open(p))
     _auto_domain(sc, os.path.dirname(p))
     with open(p, "w") as fh:
@@ -276,25 +294,60 @@ def auto_domain(path: str):
 @app.post("/api/geometry-preview")
 def geometry_preview(scenario: str, body: dict = Body(...)):
     """Geometry for an UNSAVED scenario (live preview while editing, e.g. an injection box)."""
-    p = _inside(scenario)
+    p = _existing(scenario)
     return _geometry(Scenario.from_dict(body, base_dir=os.path.dirname(p), validate=False))
+
+
+_GPU_GB = None
+
+
+def _gpu_gb() -> float:
+    """Total memory of the first GPU, from nvidia-smi (the server itself never touches CUDA)."""
+    global _GPU_GB
+    if _GPU_GB is None:
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            _GPU_GB = float(out.split()[0]) / 1024.0
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            _GPU_GB = 16.0
+    return _GPU_GB
+
+
+@app.post("/api/estimate")
+def estimate(scenario: str, body: dict = Body(...)):
+    """Rough size and cost of an (unsaved) scenario before it runs: grains per second, grains
+    held at once, GPU memory, time per simulated second (dem_run.estimate)."""
+    import dem_run
+    p = _existing(scenario)
+    try:
+        sc = Scenario.from_dict(body, base_dir=os.path.dirname(p), validate=False)
+        if not sc.injectors:
+            return dict(error="no injector yet")
+        e = dem_run.estimate(sc)
+    except (ValueError, KeyError, TypeError, IndexError, OSError, ZeroDivisionError) as ex:
+        return dict(error=str(ex))
+    gpu = _gpu_gb()
+    e["gpu_gb"] = gpu
+    e["too_big"] = e["memory_gb"] > gpu - 1.5
+    return e
 
 
 @app.get("/api/stl-files")
 def stl_files(scenario: str):
-    d = os.path.dirname(_inside(scenario))
+    d = os.path.dirname(_existing(scenario))
     return sorted(f for f in os.listdir(d) if f.lower().endswith(".stl"))
 
 
 @app.get("/api/scenario")
 def get_scenario(path: str):
-    p = _inside(path)
+    p = _existing(path)
     return json.load(open(p))
 
 
 @app.put("/api/scenario")
 def put_scenario(path: str, body: dict = Body(...)):
-    p = _inside(path)
+    p = _existing(path)
     try:
         Scenario.from_dict(body, base_dir=os.path.dirname(p), validate=False)   # structure
     except (ValueError, TypeError, KeyError) as e:
@@ -346,7 +399,7 @@ def _geometry(sc: Scenario):
 def geometry(scenario: str):
     """Parts as the SOLVER loads them (merged vertices, same triangle order), so
     per-triangle results line up with what is drawn."""
-    p = _inside(scenario)
+    p = _existing(scenario)
     return _geometry(Scenario.from_dict(json.load(open(p)), base_dir=os.path.dirname(p),
                                         validate=False))
 
@@ -383,7 +436,7 @@ def runs():
 
 @app.post("/api/runs")
 def start_run(body: dict = Body(...)):
-    scen = _inside(body["scenario"])
+    scen = _existing(body["scenario"])
     probs = _problems(json.load(open(scen)), os.path.dirname(scen))
     if probs:
         raise HTTPException(422, "cannot run yet: " + "; ".join(probs))
@@ -440,8 +493,14 @@ def run_geometry(run_id: str):
         raise HTTPException(422, "run predates scenario files")
     known = {"name", "material", "parts", "injectors", "domain", "regions", "flow_planes",
              "output", "gravity", "units", "notes"}
-    return _geometry(Scenario.from_dict({k: v for k, v in meta.items() if k in known},
-                                        base_dir=_run_base_dir(meta, d)))
+    try:
+        sc = Scenario.from_dict({k: v for k, v in meta.items() if k in known},
+                                base_dir=_run_base_dir(meta, d))
+    except ValueError as e:
+        # runs made before they kept their own STL copy, whose project was since deleted
+        raise HTTPException(404, "this run's geometry is gone (its project was deleted): "
+                                 + "; ".join(ln.strip() for ln in str(e).splitlines()[1:3]))
+    return _geometry(sc)
 
 
 def _run_base_dir(meta: dict, d: str) -> str:
@@ -530,6 +589,17 @@ def index():
 
 
 app.mount("/static", StaticFiles(directory=os.path.join(HERE, "static")), name="static")
+
+
+@app.middleware("http")
+async def _revalidate(request, call_next):
+    """The page and its scripts are revalidated on every load (cheap: 304 if unchanged).
+    Without this a browser mixed a new index.html with a cached app.js after an update
+    and failed on an element the new page no longer has."""
+    resp = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 def main():
