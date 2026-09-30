@@ -83,7 +83,7 @@ def main():
         d = dem_run(run)
         st = d["st"]
         print("\n" + "=" * 88)
-        print(f"{run}   ({d['meta'].get('solver', '?')})")
+        print(f"{run}   ({d['meta'].get('solver_class', d['meta'].get('solver', '?'))})")
         print("=" * 88)
         m = d["meta"]
         print(f"  grain r {m['grain_radius']*1e3:.1f} mm, m {m['grain_mass']*1e3:.4f} g;  "

@@ -12,6 +12,7 @@ a commercial DEM code on a real machine — and then run cases BFA cannot afford
 | `dem_scenario.py` | the scenario schema (JSON): parts, material, injectors, domain, regions, solver, output. |
 | `dem_run.py` | the generic runner: any scenario → history.csv, run.json, VTK. Injection schedule, recycling, CUDA-graph stepping, per-part time windows. |
 | `bfa_import.py` | BFA project (.prj + .lin) → scenario, with every interpretation listed. |
+| `dem_analyze.py` | measurements from a finished run's frames: wall loads and maps, flows, regions. |
 | `bfa_dem.py` | the corn replication: its flags and presets → scenario → `dem_run`. |
 | `bfa_replication_mpm.py` | the earlier MPM runner. Still imported by the DEM tooling for `COLLIDER_PARTS` and `load_part`. |
 | `compare_bfa_dem.py` | scores a run against BFA (hold-up, KE, chute, cascade, discharge, rms). |
@@ -68,6 +69,26 @@ domain, reporting regions, solver and output settings.
 The importer lists every interpretation and every unsupported feature it met; read them.
 `bfa_dem.py` is now a thin wrapper that builds the corn scenario from its flags, verified
 bitwise-identical to the pre-scenario runner (positions, velocities, spins, contact history).
+
+## Measurements (after the run)
+
+Measurements are chosen after a run and computed from its frames (`dem_analyze.py`), so
+the solver pays nothing and any probe can be added later.  Frames carry position,
+velocity, spin and a grain id.
+
+```bash
+.venv/bin/python dem_analyze.py runs/dem/<run> loads --window 20 25   # part forces/torques + wall maps
+.venv/bin/python dem_analyze.py runs/dem/<run> flows                  # scenario flow planes, or --plane ...
+.venv/bin/python dem_analyze.py runs/dem/<run> regions
+```
+
+Outputs go to `<run>/analysis/`: `part_loads.csv`, `wall_maps.vtk` (window-mean pressure,
+shear, wear rate, contact count per triangle), `flows.csv`, `regions.csv`.  Checks: a
+settled pile's wall loads equal its weight to 0.2%; frame-based portal flows equal the
+live counters exactly; a head chute's horizontal load equals the stream's momentum flux.
+Limits: stuck contacts' tangential force uses the sliding law (the history spring is not
+in frames); corner second contacts (#13) are not yet reconstructed; impacts shorter than
+the frame interval are sampled, not integrated.
 
 ## Performance
 

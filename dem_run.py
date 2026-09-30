@@ -547,6 +547,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     if out.vtk:
         write_geometry_vtk(os.path.join(out_dir, "geometry.vtk"), S.parts)
     meta = sc.to_dict()
+    meta["base_dir"] = sc.base_dir          # where the scenario's relative paths resolve
     meta.update(extra_meta or {})
     meta["derived"] = dict(grain_radius=S.grain_radius, grain_mass=gmass, rate=S.rate, dt=dt,
                            substeps=substeps, youngs_effective=S.youngs_eff, kd_pp=S.kd_pp,
@@ -555,7 +556,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     # flat copies of the fields the analysis tools read (compare_bfa_dem, perf_table)
     meta.update(grain_radius=S.grain_radius, grain_mass=gmass, dt=dt, ke=sc.material.ke,
                 mu=sc.material.friction, youngs=S.youngs_eff if sc.material.contact == "hertz" else None,
-                wall_mu=sc.parts[0].friction, solver="SolverGranularDEM")
+                wall_mu=sc.parts[0].friction, solver_class="SolverGranularDEM")
     with open(os.path.join(out_dir, "run.json"), "w") as fh:
         json.dump(meta, fh, indent=2, default=lambda o: None)
 
@@ -795,7 +796,8 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 if len(act):
                     write_particles_vtk(os.path.join(out_dir, f"frame_{frame:04d}_particles.vtk"),
                                         frame, s0.particle_q.numpy()[act],
-                                        s0.particle_qd.numpy()[act], S.grain_radius)
+                                        s0.particle_qd.numpy()[act], S.grain_radius,
+                                        spin=solver.particle_w.numpy()[act], ids=act)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:

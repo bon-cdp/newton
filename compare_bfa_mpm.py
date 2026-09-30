@@ -99,6 +99,38 @@ def read_mpm_history(run_dir):
     )
 
 
+def read_frame(path):
+    """dict(pos, vel[, spin, radius]) from one frame_XXXX_particles.vtk (BINARY)."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:256].find(b"\nBINARY\n") < 0:
+        pos, vel = read_mpm_frame(path)
+        return dict(pos=pos, vel=vel)
+    k = raw.index(b"POINTS")
+    n = int(raw[k:raw.index(b"\n", k)].split()[1])
+
+    def block(tag, ncomp):
+        j = raw.find(tag)
+        if j < 0:
+            return None
+        start = raw.index(b"\n", j) + 1
+        if tag.startswith(b"SCALARS"):
+            start = raw.index(b"\n", start) + 1          # skip LOOKUP_TABLE line
+        return np.frombuffer(raw, dtype=">f4", count=n * ncomp, offset=start).reshape(n, ncomp).astype(np.float64)
+
+    out = dict(pos=block(b"POINTS", 3), vel=block(b"VECTORS velocity", 3))
+    spin = block(b"VECTORS spin", 3)
+    if spin is not None:
+        out["spin"] = spin
+    rad = block(b"SCALARS radius", 1)
+    if rad is not None:
+        out["radius"] = rad[:, 0]
+    ids = block(b"SCALARS id", 1)
+    if ids is not None:
+        out["id"] = ids[:, 0].astype(np.int64)
+    return out
+
+
 def read_mpm_frame(path):
     """Positions and velocities from one frame_XXXX_particles.vtk (ASCII or BINARY)."""
     with open(path, "rb") as fh:

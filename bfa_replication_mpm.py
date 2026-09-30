@@ -280,8 +280,11 @@ def write_geometry_vtk(path, parts):
         fh.writelines(f"{p}\n" for p in part_id)
 
 
-def write_particles_vtk(path, frame, pos, vel, radius, binary=True):
-    """Legacy-VTK point cloud (positions, radius, speed, velocity) for ParaView.
+def write_particles_vtk(path, frame, pos, vel, radius, binary=True, spin=None, ids=None):
+    """Legacy-VTK point cloud (positions, radius, speed, velocity[, spin]) for ParaView.
+
+    `spin` (angular velocity, rad/s) is what post-processing needs beyond position and
+    velocity: the sliding speed at a wall contact, hence wear, depends on it.
 
     Binary by default.  The ASCII writer formatted ~100k lines through Python per frame,
     ~0.3 s -- once the DEM got fast, that was a large share of a 10 s run.  Binary is a
@@ -327,6 +330,13 @@ def write_particles_vtk(path, frame, pos, vel, radius, binary=True):
         f.write(speed.astype(be_f).tobytes())
         f.write(b"\nVECTORS velocity float\n")
         f.write(vel.astype(be_f).tobytes())
+        if spin is not None:
+            f.write(b"\nVECTORS spin float\n")
+            f.write(np.asarray(spin, dtype=np.float32).astype(be_f).tobytes())
+        if ids is not None:
+            # pool index: lets post-processing follow a grain between frames (exact up to 2^24)
+            f.write(b"\nSCALARS id float 1\nLOOKUP_TABLE default\n")
+            f.write(np.asarray(ids, dtype=np.float32).astype(be_f).tobytes())
         f.write(b"\n")
 
 
