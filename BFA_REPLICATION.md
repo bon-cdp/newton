@@ -9,7 +9,10 @@ a commercial DEM code on a real machine — and then run cases BFA cannot afford
 | path | what |
 |---|---|
 | `granular_dem.py` | **`SolverGranularDEM`** — the soft-sphere DEM. Linear spring-dashpot or Hertz–Mindlin, Coulomb friction, rolling friction, rotation, Cundall–Strack tangential history, open-shell mesh colliders. |
-| `bfa_dem.py` | the DEM runner for this machine: presets, injection schedule, recycling, per-part wall friction, CUDA-graph stepping, stats, VTK. |
+| `dem_scenario.py` | the scenario schema (JSON): parts, material, injectors, domain, regions, solver, output. |
+| `dem_run.py` | the generic runner: any scenario → history.csv, run.json, VTK. Injection schedule, recycling, CUDA-graph stepping, per-part time windows. |
+| `bfa_import.py` | BFA project (.prj + .lin) → scenario, with every interpretation listed. |
+| `bfa_dem.py` | the corn replication: its flags and presets → scenario → `dem_run`. |
 | `bfa_replication_mpm.py` | the earlier MPM runner. Still imported by the DEM tooling for `COLLIDER_PARTS` and `load_part`. |
 | `compare_bfa_dem.py` | scores a run against BFA (hold-up, KE, chute, cascade, discharge, rms). |
 | `compare_bfa_mpm.py` | readers for BFA's undocumented binary `.por` / `.his` output. |
@@ -47,6 +50,23 @@ opens directly. Use `python -u` or progress looks stalled.
 ```
 
 Any explicit flag overrides the preset (e.g. `--mu 0.13`).
+
+## Scenario files (any machine)
+
+A run is defined by a JSON scenario (`dem_scenario.py` documents every field): parts
+(STL, sidedness, friction, active time window, surface motion), material, injectors,
+domain, reporting regions, solver and output settings.
+
+```bash
+# import a BulkFlowAnalyst project (reads .prj + .lin; writes <project>/scenario.json)
+.venv/bin/python bfa_import.py 20060-CM-552            # --preset fast for E/10 + lists
+# run any scenario
+.venv/bin/python -u dem_run.py 20060-CM-552/scenario.json --out runs/dem/ironore
+```
+
+The importer lists every interpretation and every unsupported feature it met; read them.
+`bfa_dem.py` is now a thin wrapper that builds the corn scenario from its flags, verified
+bitwise-identical to the pre-scenario runner (positions, velocities, spins, contact history).
 
 ## Performance
 

@@ -51,6 +51,11 @@ import newton
 from newton._src.solvers.semi_implicit.kernels_contact import eval_particle_contact
 from newton._src.solvers.solver import SolverBase
 
+# Forward kernels only.  Nothing here is differentiated, and the adjoint of the wall kernel
+# needs a parameter block over CUDA's 4 KB limit (it failed to compile once the collider
+# gained per-part active flags).  Also roughly halves compile time.
+wp.set_module_options({"enable_backward": False})
+
 _EPS_NORMAL = wp.constant(1.0e-3)
 _NO_CONTACT = wp.constant(1.0e9)
 
@@ -78,6 +83,8 @@ class ShellCollider:
     """Per-part AABB lower corner, for broad-phase culling."""
     upper: wp.array(dtype=wp.vec3)
     """Per-part AABB upper corner."""
+    active: wp.array(dtype=int)
+    """1 = part takes part in contact, 0 = switched off (scenario time windows)."""
     max_dist: float
     """Query radius; must exceed particle radius + thickness."""
 
@@ -185,6 +192,8 @@ def eval_shell_contact_forces(
     # such spurious 50 mm penetration is a 500 N kick on a 0.9 g grain.  A grain in a
     # corner genuinely touches two walls, so summing is also the physical answer.
     for m in range(collider.mesh.shape[0]):
+        if collider.active[m] == 0:
+            continue
         thick = collider.thickness[m]
         reach = radius + thick + collider.max_dist
         # Broad phase: the six cascade parts occupy a 0.34 x 0.47 x 0.20 m box at the
@@ -520,6 +529,18 @@ class SolverGranularDEM(SolverBase):
         """Device step counter, read back (syncs -- not for the hot loop)."""
         return int(self.step_arr.numpy()[0])
 
+    def set_part_active(self, flags):
+        """Switch collider parts on/off (1/0 per part).  Takes effect on the next step;
+        values live on the device, so captured graphs see them.  Turning a part ON clears
+        the BVH path's distance cache -- slack banked while the part was absent would let
+        grains coast through it."""
+        new = np.asarray(flags, dtype=np.int32)
+        old = self.collider.active.numpy()
+        if not np.array_equal(new, old):
+            self.collider.active.assign(new)
+            if np.any(new > old):
+                self.invalidate_cache()
+
     def request_rebuild(self):
         """Make the next step rebuild the neighbour list.  Call before eager steps that
         follow graph replays: replays do not advance the host's rebuild counter."""
@@ -708,6 +729,7 @@ def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, 
     hi = np.array([np.asarray(v).max(axis=0) for _n, v, _f in parts], dtype=np.float32)
     c.lower = wp.array(lo, dtype=wp.vec3, device=device)
     c.upper = wp.array(hi, dtype=wp.vec3, device=device)
+    c.active = wp.ones(len(parts), dtype=int, device=device)
     c.max_dist = float(max_dist)
     # wp.Mesh objects must outlive the struct: it stores only their integer ids, so if
     # they are garbage collected the kernel reads freed BVHs.  Returned for the caller
@@ -1156,6 +1178,8 @@ def eval_shell_contact_forces_rot(
     hit = int(0)
 
     for m in range(collider.mesh.shape[0]):
+        if collider.active[m] == 0:
+            continue
         thick = collider.thickness[m]
         reach = radius + thick + collider.max_dist
         lo = collider.lower[m]
@@ -1654,7 +1678,7 @@ def eval_wall_grid_rot(
             best_t = -1
             rr = radius + collider.thickness[wp.max(p, 0)]
             best_sq = rr * rr        # only a triangle closer than contact range matters
-        if t >= 0:
+        if t >= 0 and collider.active[p] == 1:
             # cheap reject: the plane distance alone already exceeds the best so far
             h = wp.dot(x - r.v0, r.n)
             if h * h < best_sq:
