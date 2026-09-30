@@ -268,6 +268,45 @@ def face_triangles(path, scale=1.0):
     return np.stack([v0, v0 + e1, v0 + e2], axis=1).astype(np.float64), float(area.sum())
 
 
+def surface_motion(motion, gravity):
+    """Scenario motion dict -> (type, axis, point, rate) for build_collider (issue #11).
+
+      {"type": "belt", "velocity": [vx, vy, vz]}         belt running at |v| along v
+      {"type": "rotating", "point": [..], "axis": [..], "omega": rad/s}   (or "rpm")
+
+    A belt's velocity is the running direction on its CARRYING strand; the solver turns
+    it into a width axis a = up x v/|v| (up = against gravity) and moves each contact
+    along a x n, so pulley wraps and the return strand follow the belt's path."""
+    if not motion:
+        return None
+    kind = motion.get("type")
+    if kind == "belt":
+        u = np.asarray(motion["velocity"], dtype=np.float64)
+        speed = float(np.linalg.norm(u))
+        if speed == 0.0:
+            return None
+        up = -np.asarray(gravity, dtype=np.float64)
+        up /= max(np.linalg.norm(up), 1e-12)
+        a = np.cross(up, u / speed)
+        if np.linalg.norm(a) < 1e-6:
+            raise ValueError("belt velocity is vertical: its width axis is undefined")
+        return (1, tuple(a / np.linalg.norm(a)), (0.0, 0.0, 0.0), speed)
+    if kind == "rotating":
+        ax = np.asarray(motion["axis"], dtype=np.float64)
+        ax /= np.linalg.norm(ax)
+        omega = motion["omega"] if "omega" in motion else motion["rpm"] * 2.0 * math.pi / 60.0
+        return (2, tuple(ax), tuple(motion["point"]), float(omega))
+    raise ValueError(f"unknown surface motion type {kind!r}")
+
+
+def describe_motion(motion):
+    if motion.get("type") == "belt":
+        u = np.asarray(motion["velocity"], dtype=float)
+        return f"belt {np.linalg.norm(u):g} m/s along {np.round(u / np.linalg.norm(u), 3).tolist()}"
+    om = motion.get("omega", motion.get("rpm", 0.0) * 2.0 * math.pi / 60.0)
+    return f"rotating {om:g} rad/s about {motion['axis']} through {motion['point']}"
+
+
 # ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
@@ -346,7 +385,7 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         log(f"  collider {name:<16} {len(f):6,d} tris  "
             f"{'two-sided' if p.two_sided else 'one-sided'}  mu {p.friction:g}{win}"
             + ("  corners" if p.corners else "")
-            + ("  [surface motion: not simulated yet, #11]" if p.motion else ""))
+            + (f"  {describe_motion(p.motion)}" if p.motion else ""))
 
     # --- injection lattice: never uniform random -------------------------------------
     # Two grains seeded 2 mm apart overlap by 10 mm -- tens of newtons on a gram-scale
@@ -439,7 +478,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         friction=[p.friction for p in sc.parts],
         ke=[m.ke] * len(parts), kd=[kd_wall] * len(parts), kf=[m.kf] * len(parts),
         thickness=[p.thickness if p.two_sided else 0.0 for p in sc.parts],
-        max_dist=0.03, device=device, corners=[p.corners for p in sc.parts])
+        max_dist=0.03, device=device, corners=[p.corners for p in sc.parts],
+        motions=[surface_motion(p.motion, sc.gravity) for p in sc.parts])
     if s.neighbor_every:
         log(f"  neighbour list        rebuilt every {s.neighbor_every} steps, skin "
             f"{skin*1e3:.2f} mm (two grains closing at {s.skin_speed:g} m/s)")

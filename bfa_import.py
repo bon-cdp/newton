@@ -199,7 +199,8 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
         belts[b["Conveyor GUID"]] = dict(type="belt", velocity=[float(c) for c in speed * d],
                                          speed=speed, friction=bfa_float(b["Conveyor Friction"]))
         interp.append(f"conveyor '{guid_name.get(b['Conveyor GUID'])}': {speed:.3f} m/s along "
-                      f"{np.round(d, 4).tolist()} (from its direction edge)")
+                      f"{np.round(d, 4).tolist()} (from its direction edge); the surface moves "
+                      f"along the belt's path, so the pulley wrap and return strand follow it")
 
     # ---------------------------------------------------------------- chutes (motion)
     for b in blocks(section(L, "ChuteData"), "Chute GUID"):
@@ -338,9 +339,6 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
                    friction=mu_pp, rolling_friction=roll_pp,
                    wall_rolling_friction=common(rolls, 0.5), rot_damp=rotr,
                    rot_damp_wall=common(rots, 0.2), tangential_ratio=1.0, contact="hertz")
-    if any(p.motion for p in parts):
-        warn.append("conveyor surface motion is recorded but NOT simulated until issue #11 lands "
-                    "-- the belt is a static surface in this run")
     for n, pr in portals.items():
         interp.append(f"portal '{n}' {pr['lo']} .. {pr['hi']}: a measurement plane (flow probes "
                       "are phase 1 of #12); recorded here, grains pass through it")

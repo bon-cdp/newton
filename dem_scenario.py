@@ -74,7 +74,7 @@ class Part:
     thickness: float = 0.0                # m, shell half-thickness (two-sided only)
     friction: float = 0.5                 # grain-wall Coulomb
     active: list[float] = field(default_factory=lambda: [0.0, INF])   # [on, off) seconds
-    motion: dict | None = None            # surface motion, issue #11 (not yet simulated)
+    motion: dict | None = None            # surface motion (belt / rotating), see dem_run.surface_motion
     corners: bool = False                 # second contact in concave creases of this part (#13)
 
 

@@ -91,6 +91,15 @@ class ShellCollider:
     """Per-part AABB upper corner."""
     active: wp.array(dtype=int)
     """1 = part takes part in contact, 0 = switched off (scenario time windows)."""
+    motion_type: wp.array(dtype=int)
+    """Surface motion on stationary geometry (issue #11): 0 static, 1 belt, 2 rotating."""
+    motion_axis: wp.array(dtype=wp.vec3)
+    """Belt: its width axis a (belt velocity = speed * normalize(a x n)).  Rotating: the
+    unit rotation axis."""
+    motion_point: wp.array(dtype=wp.vec3)
+    """Rotating: a point on the axis."""
+    motion_rate: wp.array(dtype=float)
+    """Belt: speed (m/s).  Rotating: angular speed (rad/s)."""
     corners: wp.array(dtype=int)
     """1 = resolve concave creases within this part with a second contact (issue #13;
     eval_wall_corners_rot).  Off by default: it costs ~5-10% of wall-contact time."""
@@ -739,7 +748,7 @@ def _advance_step(step_arr: wp.array(dtype=int)):
 
 
 def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, device,
-                   corners=None):
+                   corners=None, motions=None):
     """Pack per-part meshes and materials into a :class:`ShellCollider`.
 
     ``parts`` is a list of (name, vertices, faces).  The other arguments are per-part
@@ -766,6 +775,17 @@ def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, 
     c.active = wp.ones(len(parts), dtype=int, device=device)
     c.corners = wp.array([1 if x else 0 for x in (corners or [False] * len(parts))], dtype=int,
                          device=device)
+    mt, ma, mp, mr = [], [], [], []
+    for mo in (motions or [None] * len(parts)):
+        mo = mo or (0, (0.0, 0.0, 1.0), (0.0, 0.0, 0.0), 0.0)
+        mt.append(int(mo[0]))
+        ma.append(mo[1])
+        mp.append(mo[2])
+        mr.append(float(mo[3]))
+    c.motion_type = wp.array(mt, dtype=int, device=device)
+    c.motion_axis = wp.array(np.array(ma, dtype=np.float32), dtype=wp.vec3, device=device)
+    c.motion_point = wp.array(np.array(mp, dtype=np.float32), dtype=wp.vec3, device=device)
+    c.motion_rate = wp.array(mr, dtype=float, device=device)
     c.max_dist = float(max_dist)
     # wp.Mesh objects must outlive the struct: it stores only their integer ids, so if
     # they are garbage collected the kernel reads freed BVHs.  Returned for the caller
@@ -1079,6 +1099,32 @@ def eval_particle_contact_rot(
 
 
 @wp.func
+def _surface_velocity(collider: ShellCollider, m: int, n: wp.vec3, cp: wp.vec3):
+    """(velocity, spin) of part m's SURFACE at contact point cp, normal n (pointing from
+    the wall to the grain).  The geometry never moves; only its surface does (issue #11).
+
+    Belt: speed * normalize(a x n), a = the belt's width axis.  The grain always sits
+    outside the belt loop, so n points away from the loop and a x n is the running
+    direction wherever it touches: +x on the carrying strand, full speed on troughed
+    wings (the normalisation), downward round the head pulley, backward on the return
+    strand -- the belt's path, with no geometry analysis.  Faces whose normal is nearly
+    along a (belt edges) get no velocity.
+    Rotating: omega * axis x (cp - point), spin omega * axis (pulleys, drums, rollers)."""
+    mt = collider.motion_type[m]
+    vs = wp.vec3(0.0)
+    ws = wp.vec3(0.0)
+    if mt == 1:
+        t = wp.cross(collider.motion_axis[m], n)
+        tl = wp.length(t)
+        if tl > 0.2:
+            vs = t * (collider.motion_rate[m] / tl)
+    elif mt == 2:
+        ws = collider.motion_axis[m] * collider.motion_rate[m]
+        vs = wp.cross(ws, cp - collider.motion_point[m])
+    return vs, ws
+
+
+@wp.func
 def _wall_force(
     collider: ShellCollider,
     m: int,
@@ -1098,16 +1144,26 @@ def _wall_force(
     step: int,
     i: int,
     wid: int,
+    cp: wp.vec3,
     tang_partner: wp.array2d(dtype=int),
     tang_stamp: wp.array2d(dtype=int),
     tang_xi: wp.array2d(dtype=wp.vec3),
     dt: float,
 ):
-    """Force and torque on grain i from part m, given the outward normal n and the gap c
-    (negative = overlap).  Shared by the BVH and the baked-grid wall kernels so the two
-    paths cannot drift apart physically -- they differ only in how they FIND the wall."""
+    """Force and torque on grain i from part m, given the outward normal n, the gap c
+    (negative = overlap) and the wall's closest point cp.  Shared by every wall kernel
+    so the paths cannot drift apart physically -- they differ only in how they FIND the
+    wall.  Velocities are relative to the wall SURFACE (conveyors, pulleys: #11), so
+    friction, the history spring and rolling resistance all act on the relative motion."""
     c_arm = -n * radius
     v_rel = v + wp.cross(w, c_arm)
+    w_rel = w
+    if collider.motion_type[m] != 0:
+        # only moving surfaces touch this: keeping the static expression unchanged keeps
+        # static walls bit-identical (even "- 0" lets the compiler fuse differently)
+        v_surf, w_surf = _surface_velocity(collider, m, n, cp)
+        v_rel = v_rel - v_surf
+        w_rel = w - w_surf
     vn = wp.dot(v_rel, n)
     vt = v_rel - n * vn
 
@@ -1152,10 +1208,10 @@ def _wall_force(
     f = n * fn + ft
     t = wp.cross(c_arm, ft)
     if mu_roll > 0.0:
-        t += _rolling_torque(mu_roll, fn, radius, w)
+        t += _rolling_torque(mu_roll, fn, radius, w_rel)
     if rot_damp > 0.0:
-        # the wall does not rotate, so the relative spin is just the grain's
-        t += _rotational_damping(rot_damp, kd_eff, radius, w)
+        # relative to the surface's own spin (zero unless it is a rotating part)
+        t += _rotational_damping(rot_damp, kd_eff, radius, w_rel)
     return f, t
 
 
@@ -1248,7 +1304,7 @@ def eval_shell_contact_forces_rot(
             continue
 
         fw, tw = _wall_force(collider, m, n, c, radius, v, w, particle_inv_mass[i], mu_roll,
-                             rot_damp, k_t, hertz, e_star, g_star, beta, step, i, -(m + 2),
+                             rot_damp, k_t, hertz, e_star, g_star, beta, step, i, -(m + 2), cp,
                              tang_partner, tang_stamp, tang_xi, dt)
         f_total += fw
         t_total += tw
@@ -1820,7 +1876,8 @@ def eval_wall_grid_rot(
         if c < 0.0 and c >= -radius:
             fw, tw = _wall_force(collider, m, n, c, radius, v, w, particle_inv_mass[i],
                                  mu_roll, rot_damp, k_t, hertz, e_star, g_star, beta,
-                                 step, i, -(m + 2), tang_partner, tang_stamp, tang_xi, dt)
+                                 step, i, -(m + 2), best_cp, tang_partner, tang_stamp,
+                                 tang_xi, dt)
             f_total += fw
             t_total += tw
             hit += 1
@@ -2132,8 +2189,8 @@ def eval_wall_corners_rot(
                     if c < 0.0 and c >= -radius:
                         fw, tw = _wall_force(collider, m, n, c, radius, v, w, particle_inv_mass[i],
                                              mu_roll, rot_damp, k_t, hertz, e_star, g_star, beta,
-                                             step, i, -(1000000 + m * 8 + 1), tang_partner,
-                                             tang_stamp, tang_xi, dt)
+                                             step, i, -(1000000 + m * 8 + 1), cp1,
+                                             tang_partner, tang_stamp, tang_xi, dt)
                         f_total += fw
                         t_total += tw
                         hit += 1
