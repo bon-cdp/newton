@@ -44,58 +44,110 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # kernels
 # ---------------------------------------------------------------------------
 
+@wp.func
+def _event(event_of_step: wp.array(dtype=wp.int32), step_arr: wp.array(dtype=int), step_offset: int):
+    """Injection event index for the step about to run, or -1."""
+    g = step_arr[0] - step_offset
+    if g < 0 or g >= event_of_step.shape[0]:
+        return -1
+    return int(event_of_step[g])
+
+
 @wp.kernel
-def spawn_scheduled(
-    sites: wp.array(dtype=wp.vec3),
-    picks: wp.array2d(dtype=wp.int32),
+def mark_occupied(
     event_of_step: wp.array(dtype=wp.int32),
     step_arr: wp.array(dtype=int),
     step_offset: int,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    lat_origin: wp.vec3,
+    lat_u: wp.vec3,
+    lat_v: wp.vec3,
+    lat_n: wp.vec3,
+    lat_spacing: float,
+    lat_nu: int,
+    lat_nv: int,
+    lat_map: wp.array(dtype=int),
+    sites: wp.array(dtype=wp.vec3),
+    clear_dist: float,
+    occupied: wp.array(dtype=int),
+):
+    """On injection steps, flag every lattice site with a grain closer than clear_dist.
+    Sites form a regular grid in the injection plane, so each grain near the plane checks
+    only the 3x3 sites around its projection -- O(grains), not O(grains x sites)."""
+    i = wp.tid()
+    if _event(event_of_step, step_arr, step_offset) < 0:
+        return
+    if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
+        return
+    rel = particle_q[i] - lat_origin
+    if wp.abs(wp.dot(rel, lat_n)) >= clear_dist:
+        return
+    fu = wp.dot(rel, lat_u) / lat_spacing
+    fv = wp.dot(rel, lat_v) / lat_spacing
+    iu0 = int(wp.floor(fu + 0.5))
+    iv0 = int(wp.floor(fv + 0.5))
+    for du in range(-1, 2):
+        for dv in range(-1, 2):
+            iu = iu0 + du
+            iv = iv0 + dv
+            if iu >= 0 and iu < lat_nu and iv >= 0 and iv < lat_nv:
+                k = lat_map[iu * lat_nv + iv]
+                if k >= 0:
+                    if wp.length_sq(particle_q[i] - sites[k]) < clear_dist * clear_dist:
+                        occupied[k] = 1
+
+
+@wp.kernel
+def inject_event(
+    event_of_step: wp.array(dtype=wp.int32),
+    step_arr: wp.array(dtype=int),
+    step_offset: int,
+    cand: wp.array2d(dtype=wp.int32),
+    batch: int,
+    occupied: wp.array(dtype=int),
+    sites: wp.array(dtype=wp.vec3),
     spawn_vel: wp.vec3,
     free_idx: wp.array(dtype=wp.int32),
     free_count: wp.array(dtype=wp.int32),
+    backlog: wp.array(dtype=int),
+    starved: wp.array(dtype=int),
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
     wall_slack: wp.array(dtype=float),
+    injected: wp.array(dtype=int),
 ):
-    """Inject one batch of grains at lattice sites, driven by a precomputed schedule
-    rather than the host.  Launched every step; fires only on steps the schedule marks.
-    Reading the step from the solver's device counter is what lets injection live inside
-    a captured CUDA graph."""
-    tid = wp.tid()
-    g = step_arr[0] - step_offset
-    if g < 0 or g >= event_of_step.shape[0]:
-        return
-    e = event_of_step[g]
+    """One thread, launched every step, exits at once unless this step injects.
+
+    Takes the event's candidate sites in order, skipping occupied ones, until
+    batch + backlog grains are placed; whatever cannot be placed now is carried to the
+    next event, so the delivered mass rate catches up instead of being lost.  Selection,
+    placement and the free-list update happen in this single thread: events are rare
+    (every ~150 steps), and three separate launches per step cost ~5% of a run.
+    Deterministic, and it places exactly the plain schedule's grains whenever the picks
+    are free.  Pool slots are popped from the top of the free list in order."""
+    e = _event(event_of_step, step_arr, step_offset)
     if e < 0:
         return
-    # Deterministic pop: thread tid takes the tid-th entry from the top.  An atomic
-    # decrement hands out indices in whatever order threads arrive, which changes which
-    # pool slot a grain gets, hence the summation order inside hash cells -- and DEM
-    # chaos turns that rounding into visibly different runs.  _consume_free lowers the
-    # count afterwards, in its own launch, so no thread here sees a partial update.
-    slot = free_count[0] - 1 - tid
-    if slot < 0:
-        return
-    idx = free_idx[slot]
-    particle_q[idx] = sites[picks[e, tid]]
-    particle_qd[idx] = spawn_vel
-    particle_flags[idx] = wp.int32(newton.ParticleFlags.ACTIVE)
-    wall_slack[idx] = 0.0
-
-
-@wp.kernel
-def _consume_free(event_of_step: wp.array(dtype=wp.int32), step_arr: wp.array(dtype=int),
-                  step_offset: int, n: int, free_count: wp.array(dtype=wp.int32),
-                  starved: wp.array(dtype=int)):
-    g = step_arr[0] - step_offset
-    if g < 0 or g >= event_of_step.shape[0]:
-        return
-    if event_of_step[g] >= 0:
-        if free_count[0] < n:
-            starved[0] = starved[0] + (n - free_count[0])   # grains the pool could not supply
-        free_count[0] = wp.max(free_count[0] - n, 0)
+    want = batch + backlog[0]
+    top = int(free_count[0])
+    placed = int(0)
+    for k in range(cand.shape[1]):
+        s = int(cand[e, k])
+        if placed < want and placed < top and occupied[s] == 0:
+            idx = free_idx[top - 1 - placed]
+            particle_q[idx] = sites[s]
+            particle_qd[idx] = spawn_vel
+            particle_flags[idx] = wp.int32(newton.ParticleFlags.ACTIVE)
+            wall_slack[idx] = 0.0
+            placed += 1
+        occupied[s] = 0                 # reset for the next event
+    if top < want and placed == top:
+        starved[0] = starved[0] + (want - placed)
+    backlog[0] = want - placed
+    free_count[0] = top - placed
+    injected[0] = injected[0] + placed   # delivered, not scheduled
 
 
 @wp.kernel
@@ -109,6 +161,7 @@ def recycle(
     free_idx: wp.array(dtype=wp.int32),
     free_count: wp.array(dtype=wp.int32),
     discharged: wp.array(dtype=wp.int32),
+    escaped: wp.array(dtype=wp.int32),
 ):
     i = wp.tid()
     if ~particle_flags[i] & wp.int32(newton.ParticleFlags.ACTIVE):
@@ -123,6 +176,8 @@ def recycle(
     free_idx[slot] = i
     if p[1] < lo[1]:
         wp.atomic_add(discharged, 0, 1)
+    else:
+        wp.atomic_add(escaped, 0, 1)   # left through a side or the top: a leak, not discharge
 
 
 @wp.kernel
@@ -309,6 +364,29 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     sites = clear_of_walls(sites, parts, radius * inj.wall_clearance, device)
     if not len(sites):
         raise RuntimeError(f"injector {inj.name!r}: every lattice site is inside a wall")
+    # The lattice as a grid in the injection plane, so mark_occupied can find the sites
+    # around a grain directly (same construction as lattice_sites).
+    fpts = tris.reshape(-1, 3)
+    flo, fhi = fpts.min(axis=0), fpts.max(axis=0)
+    ax = int(np.argmin(fhi - flo))
+    au, av = [k for k in range(3) if k != ax]
+    off = np.asarray(inj.offset, dtype=np.float64)
+    o_u, o_v = flo[au] + site_spacing * 0.5 + off[au], flo[av] + site_spacing * 0.5 + off[av]
+    nu = len(np.arange(flo[au] + site_spacing * 0.5, fhi[au], site_spacing))
+    nv = len(np.arange(flo[av] + site_spacing * 0.5, fhi[av], site_spacing))
+    fu, fv = (sites[:, au] - o_u) / site_spacing, (sites[:, av] - o_v) / site_spacing
+    iu, iv = np.rint(fu).astype(int), np.rint(fv).astype(int)
+    assert np.allclose(fu, iu, atol=1e-4) and np.allclose(fv, iv, atol=1e-4) and \
+        np.ptp(sites[:, ax]) < 1e-9, "injection sites are not a planar lattice"
+    lat_map = np.full(nu * nv, -1, dtype=np.int32)
+    lat_map[iu * nv + iv] = np.arange(len(sites), dtype=np.int32)
+    e_ax = np.eye(3)
+    lat_origin = np.zeros(3)
+    lat_origin[au], lat_origin[av], lat_origin[ax] = o_u, o_v, sites[0, ax]
+    lattice = dict(origin=wp.vec3(*lat_origin), u=wp.vec3(*e_ax[au]), v=wp.vec3(*e_ax[av]),
+                   n=wp.vec3(*e_ax[ax]), spacing=float(site_spacing), nu=int(nu), nv=int(nv),
+                   map=wp.array(lat_map, dtype=int, device=device))
+
     rate = inj.mass_rate / gmass
     batch = max(1, int(len(sites) * inj.batch_fraction))
     inj_interval = batch / rate
@@ -390,7 +468,11 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     free_idx = wp.array(np.arange(n_pool, dtype=np.int32), dtype=wp.int32, device=device)
     free_count = wp.array([n_pool], dtype=wp.int32, device=device)
     discharged = wp.zeros(1, dtype=wp.int32, device=device)
+    escaped = wp.zeros(1, dtype=wp.int32, device=device)
+    injected = wp.zeros(1, dtype=int, device=device)
     starved = wp.zeros(1, dtype=int, device=device)
+    occupied = wp.zeros(len(sites), dtype=int, device=device)
+    backlog = wp.zeros(1, dtype=int, device=device)
     regs = sc.regions
     reg_lo = wp.array(np.array([r.lo for r in regs] or [[0.0] * 3], dtype=np.float32), dtype=wp.vec3,
                       device=device)
@@ -402,7 +484,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         sc=sc, model=model, solver=solver, collider=collider, meshes=meshes, parts=parts,
         sites=sites, batch=batch, inj=inj, inj_interval=inj_interval, rate=rate,
         substeps=substeps, dt=dt, frame_dt=frame_dt, n_pool=n_pool, s0=s0, s1=s1,
-        free_idx=free_idx, free_count=free_count, discharged=discharged, starved=starved,
+        free_idx=free_idx, free_count=free_count, discharged=discharged, escaped=escaped,
+        injected=injected, starved=starved, lattice=lattice, occupied=occupied, backlog=backlog,
         reg_lo=reg_lo, reg_hi=reg_hi, stats=stats, spawn_vel=spawn_vel, park_lo=park_lo,
         out_dir=out_dir, device=device, kd_pp=kd_pp, kd_wall=kd_wall, restitution=e, zeta=zeta,
         youngs_eff=youngs_eff, skin=skin, grain_mass=gmass, grain_radius=radius)
@@ -440,7 +523,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     for r in regs:
         cols += [f"{r.name}_mass_kg", f"{r.name}_speed_ms"]
     cols += ["spin_mean_rads"] + [f"spin_{r.name}_rads" for r in regs if r.spin]
-    cols += ["discharged_kg", "wallclock_s"]
+    cols += ["discharged_kg", "injected_kg", "escaped_kg", "wallclock_s"]
     hist = open(os.path.join(out_dir, "history.csv"), "w")
     hist.write(",".join(cols) + "\n")
 
@@ -450,6 +533,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     sim_t, nstep = 0.0, 0
     saved_ckpt = False
     nbr_fallbacks = 0
+    max_backlog = 0
 
     # --- injection schedule, precomputed ---------------------------------------------
     # The host logic the loop used to run (float64 sim_t, the same rng calls in the same
@@ -464,22 +548,41 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
             event_of_step[gstep] = len(picks)
             picks.append(rng.choice(len(S.sites), size=batch, replace=False))
         _t_sim += dt
+    # Candidate order per event: its random picks first (so an unobstructed event places
+    # exactly the grains the plain schedule would), then every other site in a fixed
+    # rotating order -- the reserve used when picks are occupied or a backlog is owed.
+    # The reserve order comes from its own generator so it never perturbs the picks.
+    n_sites = len(S.sites)
+    order0 = np.random.default_rng(sc.solver.seed + 7919).permutation(n_sites)
+    cand = np.empty((max(len(picks), 1), n_sites), dtype=np.int32)
+    for ev, pk in enumerate(picks):
+        mask = np.ones(n_sites, dtype=bool)
+        mask[pk] = False
+        rot = np.roll(order0, -((ev * batch) % n_sites))
+        cand[ev, :batch] = pk
+        cand[ev, batch:] = rot[mask[rot]]
+    if not picks:
+        cand[0] = order0
     w_sites = wp.array(S.sites.astype(np.float32), dtype=wp.vec3, device=device)
-    w_picks = wp.array(np.array(picks, dtype=np.int32).reshape(-1, batch) if picks
-                       else np.zeros((1, batch), np.int32), dtype=wp.int32, device=device)
+    w_cand = wp.array(cand, dtype=wp.int32, device=device)
     w_event = wp.array(event_of_step, dtype=wp.int32, device=device)
     step_offset = solver.step_count          # device counter value at global step 0
+    lat = S.lattice
+    clear_dist = 2.0 * S.grain_radius * 1.05  # a grain closer than this would overlap
 
     def launch_steps(n, eager=True):
         if eager and n:
             solver.request_rebuild()   # graph replays do not advance the host's rebuild phase
         for _ in range(n):
-            wp.launch(spawn_scheduled, dim=batch, device=device, inputs=[
-                w_sites, w_picks, w_event, solver.step_arr, step_offset, S.spawn_vel,
-                S.free_idx, S.free_count, s0.particle_q, s0.particle_qd, model.particle_flags,
-                solver.wall_slack])
-            wp.launch(_consume_free, dim=1, device=device, inputs=[
-                w_event, solver.step_arr, step_offset, batch, S.free_count, S.starved])
+            wp.launch(mark_occupied, dim=n_pool, device=device, inputs=[
+                w_event, solver.step_arr, step_offset, s0.particle_q, model.particle_flags,
+                lat["origin"], lat["u"], lat["v"], lat["n"], lat["spacing"], lat["nu"], lat["nv"],
+                lat["map"], w_sites, clear_dist, S.occupied])
+            wp.launch(inject_event, dim=1, device=device, inputs=[
+                w_event, solver.step_arr, step_offset, w_cand, batch, S.occupied, w_sites,
+                S.spawn_vel, S.free_idx, S.free_count, S.backlog, S.starved,
+                s0.particle_q, s0.particle_qd, model.particle_flags, solver.wall_slack,
+                S.injected])
             solver.step(s0, s0, None, None, dt)     # in place -- see SolverGranularDEM.step
 
     # --- CUDA graph ------------------------------------------------------------------
@@ -548,13 +651,18 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 wp.launch(recycle, dim=n_pool, device=device, inputs=[
                     s0.particle_q, s0.particle_qd, model.particle_flags,
                     wp.vec3(*sc.domain_lo), wp.vec3(*sc.domain_hi), S.park_lo,
-                    S.free_idx, S.free_count, S.discharged])
+                    S.free_idx, S.free_count, S.discharged, S.escaped])
                 # recycle appends with atomics (arbitrary order): re-sort the free list so
                 # the next spawns get the same pool slots on every run.  Once per frame.
                 _fc = int(S.free_count.numpy()[0])
                 _fi = S.free_idx.numpy()
                 _fi[:_fc] = np.sort(_fi[:_fc])[::-1]
                 S.free_idx.assign(_fi)
+                owed = int(S.backlog.numpy()[0])
+                max_backlog = max(max_backlog, owed)
+                if owed > batch:
+                    print(f"  !! injection backlog {owed} grains (> one batch): the inlet is "
+                          f"choked -- sites stay occupied", flush=True)
                 starved = int(S.starved.numpy()[0])
                 if starved:
                     print(f"  !! particle pool exhausted: {starved} grains not injected -- raise "
@@ -593,7 +701,9 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 if r.spin:
                     c = st[4 + 3 * k]
                     row.append(f"{(st[6 + 3 * k] / c if c > 0 else 0.0):.3f}")
-            row += [f"{out_kg:.6f}", f"{wall:.2f}"]
+            inj_kg = int(S.injected.numpy()[0]) * gmass
+            esc_kg = int(S.escaped.numpy()[0]) * gmass
+            row += [f"{out_kg:.6f}", f"{inj_kg:.6f}", f"{esc_kg:.6f}", f"{wall:.2f}"]
             hist.write(",".join(row) + "\n")
             hist.flush()
             if out.checkpoint_at is not None and not saved_ckpt and frame * S.frame_dt >= out.checkpoint_at:
@@ -626,6 +736,18 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
         hist.close()
     if s.neighbor_every:
         print(f"neighbour list: {nbr_fallbacks} grain-steps fell back to a direct search")
+    # mass audit: scheduled vs delivered injection, and where the mass went
+    t_end = min(sim_t, S.inj.stop) - max(S.inj.start, 0.0)
+    inj_kg = int(S.injected.numpy()[0]) * gmass
+    target = S.inj.mass_rate * max(t_end, 0.0)
+    held = int(S.stats.numpy()[0]) * gmass
+    out_kg = int(S.discharged.numpy()[0]) * gmass
+    esc_kg = int(S.escaped.numpy()[0]) * gmass
+    print(f"mass audit: injected {inj_kg:.2f} kg vs target {target:.2f} kg "
+          f"({S.inj.mass_rate:g} kg/s x {t_end:.3f} s; {100*inj_kg/max(target,1e-12):.2f}%)"
+          f";  held {held:.2f} + discharged {out_kg:.2f} + escaped {esc_kg:.2f} = "
+          f"{held+out_kg+esc_kg:.2f} kg;  injection backlog max {max_backlog}, "
+          f"end {int(S.backlog.numpy()[0])} grains")
     wall = time.time() - t0
     print(f"\nwall clock {wall:.1f} s = {wall / max(out.duration, 1e-9):.1f} s per simulated second")
     return out_dir
