@@ -54,6 +54,18 @@
           <button id="launch" class="primary">Run</button>
         </div>
         <div id="setup-msg" class="msg"></div>
+        <details>
+          <summary>Geometry (upload STL)</summary>
+          <div class="row">
+            <input id="upload-files" type="file" accept=".stl,.STL" multiple>
+          </div>
+          <div class="row">
+            <label>units <select id="upload-units"><option value="m">m</option><option value="mm">mm</option><option value="cm">cm</option><option value="in">in</option><option value="ft">ft</option></select></label>
+            <label>as <select id="upload-role"><option value="part">part (wall / conveyor)</option><option value="injection">injection face</option></select></label>
+            <button id="upload-btn">Upload</button>
+            <button id="fit-domain" title="resize the simulation box to the geometry">Fit domain</button>
+          </div>
+        </details>
 
         <details open>
           <summary>Solver</summary>
@@ -79,7 +91,7 @@
         <details open>
           <summary>Parts</summary>
           <table id="parts-table" class="tbl">
-            <thead><tr><th>show</th><th>part</th><th>2-sided</th><th>friction</th><th>on (s)</th><th>off (s)</th><th>corners</th><th>belt m/s</th></tr></thead>
+            <thead><tr><th>show</th><th>part</th><th>type</th><th>2-sided</th><th>friction</th><th>on (s)</th><th>off (s)</th><th>corners</th><th></th></tr></thead>
             <tbody></tbody>
           </table>
         </details>

@@ -21,3 +21,6 @@ __pycache__/
 *.pyc
 gasket.vtk
 20060-CM-552/
+
+# projects created in the operator screen (uploaded geometry is often customer data)
+projects/

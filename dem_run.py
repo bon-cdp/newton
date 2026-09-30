@@ -428,7 +428,12 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                    map=wp.array(lat_map, dtype=int, device=device))
 
     rate = inj.mass_rate / gmass
-    batch = max(1, int(len(sites) * inj.batch_fraction))
+    # At most batch_fraction of the sites per event, but also no more than max_interval
+    # between events: a large face with small grains at a low rate would otherwise inject
+    # in big lumps (36,663 sites -> 9,165-grain batches 0.83 s apart delivered 166% of the
+    # target in the first second).  Both validated projects already meet the interval
+    # (15 and 36 ms), so their batches are unchanged.
+    batch = max(1, min(int(len(sites) * inj.batch_fraction), math.ceil(rate * inj.max_interval)))
     inj_interval = batch / rate
     spawn_speed = float(np.linalg.norm(inj.velocity))
     log(f"\n  injection face        {face_area:.4f} m2 -> {len(sites)} of {n_raw} lattice "
@@ -451,11 +456,16 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     # contact); a wide lattice fixed that but still cost 17%.  Instead pick one point
     # whose z-cell RESIDUE no active grain or neighbour query can produce: the domain spans
     # only (hi.z - lo.z)/cell + 3 residues of the table's z dimension, the rest are unused.
-    hash_dz = s.hash_dims[2] if s.hash_dims else 128
     uses_list = bool(s.neighbor_every) and m.rotation     # as in SolverGranularDEM.step
     gcell = 2.0 * radius + (skin_max if uses_list else 0.0)
     z0, z1 = int(sc.domain_lo[2] / gcell) - 1, int(sc.domain_hi[2] / gcell) + 1
     span = z1 - z0 + 1
+    if s.hash_dims is None and span + 2 >= 128:
+        # the table's z dimension must exceed the domain's z-cell span, or there is no
+        # unreachable residue to park idle grains in: grow it (x, y stay at 128)
+        s.hash_dims = [128, 128, int(2 ** math.ceil(math.log2(span + 8)))]
+        log(f"  hash grid             z dimension {s.hash_dims[2]} (domain spans {span} z-cells)")
+    hash_dz = s.hash_dims[2] if s.hash_dims else 128
     if span + 2 >= hash_dz:
         raise ValueError(f"domain spans {span} z-cells; hash z-dim {hash_dz} is too small to "
                          f"hide idle grains -- set solver.hash_dims with a larger z")

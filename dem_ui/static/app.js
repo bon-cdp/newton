@@ -16,20 +16,28 @@ const api = async (path, opts = {}) => {
   return ct.includes("json") ? r.json() : r.arrayBuffer();
 };
 
-// Errors go on the page, not only to the console: a blank 3D view with no reason is useless.
+// Errors go on the page, not only to the console -- as a dismissible note in the corner
+// that says what failed, not a stack line over the legend.
 function showError(msg) {
   let e = document.getElementById("viewer-error");
-  if (!e) { e = document.createElement("div"); e.id = "viewer-error"; $("#stage").appendChild(e); }
-  e.textContent = msg;
+  if (!e) {
+    e = document.createElement("div"); e.id = "viewer-error";
+    e.innerHTML = '<button class="small" title="dismiss">×</button><span></span>';
+    e.querySelector("button").onclick = () => e.hidden = true;
+    $("#stage").appendChild(e);
+  }
+  e.querySelector("span").textContent = msg; e.hidden = false;
+  clearTimeout(showError.t); showError.t = setTimeout(() => e.hidden = true, 15000);
 }
-window.addEventListener("error", ev => showError(`${ev.message}\n${ev.filename || ""}:${ev.lineno || ""}`));
-window.addEventListener("unhandledrejection", ev => showError(String(ev.reason?.stack || ev.reason)));
+window.addEventListener("error", ev => showError(ev.message));
+window.addEventListener("unhandledrejection", ev => showError(ev.reason?.message || String(ev.reason)));
 let viewer;
 try { viewer = new Viewer($("#viewer")); }
 catch (e) {
   showError("3D view unavailable (WebGL could not start): " + e.message);
   viewer = new Proxy({}, { get: () => () => {} });     // keep the rest of the UI working
 }
+window.__viewer = viewer;                 // for debugging and automated UI tests
 const num = v => (typeof v === "number" && isFinite(v)) ? +v.toPrecision(6) : v;
 const S = { tab: "setup", scenPath: null, scen: null, geoKey: null, run: null, runInfo: null,
             frames: [], frameIdx: 0, playing: false, analysis: null, poll: null };
@@ -51,6 +59,15 @@ async function showTab(t) {
 async function loadProjects() {
   const ps = await api("/api/projects");
   const el = $("#projects"); el.innerHTML = "";
+  const nb = document.createElement("button"); nb.className = "small"; nb.textContent = "+ new project";
+  nb.onclick = async () => {
+    const name = prompt("Project name (letters, digits, _ . -)");
+    if (!name) return;
+    try { const r = await api("/api/projects", { method: "POST", body: JSON.stringify({ name }) });
+          await loadProjects(); await openScenario(r.scenario); }
+    catch (e) { showError("New project: " + e.message); }
+  };
+  el.appendChild(nb);
   for (const p of ps) {
     const d = document.createElement("div"); d.className = "proj";
     d.innerHTML = `<div class="name">${p.name}</div>`;
@@ -74,7 +91,7 @@ async function loadProjects() {
 async function importProject(name, btn) {
   btn.disabled = true; btn.textContent = "importing…";
   try {
-    const r = await api(`/api/projects/${encodeURIComponent(name)}/import?preset=fast`, { method: "POST" });
+    const r = await api(`/api/projects/import?project=${encodeURIComponent(name)}&preset=fast`, { method: "POST" });
     await loadProjects(); await openScenario(r.scenario);
   } catch (e) { alert("Import failed: " + e.message); }
   btn.disabled = false;
@@ -160,30 +177,40 @@ function renderSetup() {
   const tb = $("#parts-table tbody"); tb.innerHTML = "";
   sc.parts.forEach((p, k) => {
     const tr = document.createElement("tr");
-    const belt = p.motion?.type === "belt" ? Math.hypot(...p.motion.velocity) : null;
+    const kind = p.motion?.type || "wall";
     tr.innerHTML = `<td><input type="checkbox" checked></td>
       <td><span class="swatch" style="background:${PALETTE[k % PALETTE.length]}"></span>${p.name}</td>
+      <td><select><option value="wall">wall</option><option value="belt">conveyor belt</option><option value="rotating">rotating</option></select></td>
       <td><input type="checkbox" ${p.two_sided ? "checked" : ""}></td>
       <td><input type="number" step="any" value="${p.friction}"></td>
       <td><input type="number" step="any" value="${p.active[0]}"></td>
       <td><input type="number" step="any" value="${p.active[1] >= INF ? "" : p.active[1]}" placeholder="end"></td>
       <td><input type="checkbox" ${p.corners ? "checked" : ""}></td>
-      <td>${belt == null ? "" : `<input type="number" step="any" value="${+belt.toFixed(4)}">`}</td>`;
-    const [show, two, fric, on, off, corn, beltIn] = tr.querySelectorAll("input");
+      <td><button class="small" title="remove part">×</button></td>`;
+    const [show, two, fric, on, off, corn] = tr.querySelectorAll("input");
+    const type = tr.querySelector("select"), del = tr.querySelector("button");
+    type.value = kind;
     show.onchange = () => viewer.setPartVisible(p.name, show.checked);
     two.onchange = () => p.two_sided = two.checked;
     fric.onchange = () => p.friction = +fric.value;
     on.onchange = () => p.active[0] = +on.value;
     off.onchange = () => p.active[1] = off.value === "" ? INF : +off.value;
     corn.onchange = () => p.corners = corn.checked;
-    if (beltIn) beltIn.onchange = () => {
-      const s0 = Math.hypot(...p.motion.velocity) || 1;
-      p.motion.velocity = p.motion.velocity.map(c => c * (+beltIn.value) / s0);
+    type.onchange = () => {
+      if (type.value === "wall") delete p.motion;
+      if (type.value === "belt") { p.motion = { type: "belt", velocity: [1, 0, 0] }; p.corners = true; }
+      if (type.value === "rotating") p.motion = { type: "rotating", point: viewer.partCentroid(p.name), axis: [0, 0, 1], rpm: 30 };
+      renderSetup();
     };
+    del.onclick = () => { if (confirm(`Remove part ${p.name} from the scenario? (the STL file stays)`)) { sc.parts.splice(k, 1); renderSetup(); } };
     tb.appendChild(tr);
+    if (p.motion) tb.appendChild(motionRow(p));
   });
+  viewer.setMotionArrows(sc.parts);
   // injector
   const inj = sc.injectors[0]; const inf = $("#injector-fields"); inf.innerHTML = "";
+  if (!inj) { inf.innerHTML = "<div class='msg'>No injection face yet: upload an STL with role “injection face”.</div>"; }
+  else {
   const field = (label, get_, set_) => {
     const l = document.createElement("label"); l.textContent = label;
     const i = document.createElement("input"); i.type = "number"; i.step = "any"; i.value = get_();
@@ -194,6 +221,7 @@ function renderSetup() {
   ["x", "y", "z"].forEach((a, k) => field(`velocity ${a} (m/s)`, () => inj.velocity[k], v => inj.velocity[k] = v));
   field("start (s)", () => inj.start, v => inj.start = v);
   field("stop (s)", () => (inj.stop >= INF ? "" : inj.stop), v => inj.stop = v || INF);
+  }
   // flow planes
   $("#flow-planes").innerHTML = (sc.flow_planes || []).map(f =>
     `<div class="item">${f.name}: ${"xyz"[f.axis]} = ${f.value}</div>`).join("") || "<div class='msg'>none</div>";
@@ -203,10 +231,86 @@ function renderSetup() {
     (n.warnings || []).map(s => `<p class="warn">⚠ ${s}</p>`).join("");
 }
 
+// The editor row under a moving part: belt speed and running direction (picked on an edge
+// in the 3D view, as in BFA), or rotation speed and axis.
+// A picked edge gives a LINE, not a sense: keep the current running direction's sense
+// (flip reverses it deliberately), and snap to a coordinate axis within 5 deg, which is
+// nearly always what is meant; genuinely inclined edges (inclined conveyors) are kept.
+function orientPicked(dir, prev) {
+  let d = dir.slice();
+  if (prev && d[0] * prev[0] + d[1] * prev[1] + d[2] * prev[2] < 0) d = d.map(c => -c);
+  const k = d.map(Math.abs).indexOf(Math.max(...d.map(Math.abs)));
+  if (Math.abs(d[k]) > Math.cos(5 * Math.PI / 180)) d = [0, 0, 0].map((_, j) => j === k ? Math.sign(d[k]) : 0);
+  return d;
+}
+
+function motionRow(p) {
+  const tr = document.createElement("tr"); tr.className = "motion-row";
+  const td = document.createElement("td"); td.colSpan = 9; tr.appendChild(td);
+  const m = p.motion;
+  const dirText = v => { const n = Math.hypot(...v) || 1; return v.map(c => (c / n).toFixed(2)).join(", "); };
+  if (m.type === "belt") {
+    const speed = Math.hypot(...m.velocity);
+    td.innerHTML = `↳ belt speed <input type="number" step="any" value="${+speed.toFixed(4)}"> m/s
+      · direction (${dirText(m.velocity)})
+      <button class="small">pick edge</button> <button class="small">flip</button>
+      <span class="msg">direction of the CARRYING side; pulley wrap and return follow it</span>`;
+    const [spIn] = td.querySelectorAll("input");
+    const [pick, flip] = td.querySelectorAll("button");
+    spIn.onchange = () => { const n = Math.hypot(...m.velocity) || 1; m.velocity = m.velocity.map(c => c / n * +spIn.value); renderSetup(); };
+    flip.onclick = () => { m.velocity = m.velocity.map(c => -c); renderSetup(); };
+    pick.onclick = async () => {
+      pick.textContent = "click an edge on the part… (Esc cancels)";
+      const r = await viewer.pickEdge(p.name);
+      if (r) { const s = Math.hypot(...m.velocity) || 1; m.velocity = orientPicked(r.dir, m.velocity).map(c => c * s); }
+      renderSetup();
+    };
+  } else {
+    const rpm = m.rpm ?? (m.omega || 0) * 60 / (2 * Math.PI);
+    td.innerHTML = `↳ rotation <input type="number" step="any" value="${+rpm.toFixed(3)}"> rpm
+      · axis (${dirText(m.axis)}) through (${m.point.map(c => (+c).toFixed(3)).join(", ")})
+      <button class="small">pick axis edge</button> <button class="small">flip</button>`;
+    const [rIn] = td.querySelectorAll("input");
+    const [pick, flip] = td.querySelectorAll("button");
+    rIn.onchange = () => { m.rpm = +rIn.value; delete m.omega; renderSetup(); };
+    flip.onclick = () => { m.axis = m.axis.map(c => -c); renderSetup(); };
+    pick.onclick = async () => {
+      pick.textContent = "click an edge along the axis… (Esc cancels)";
+      const r = await viewer.pickEdge(p.name);
+      if (r) m.axis = orientPicked(r.dir, m.axis);
+      renderSetup();
+    };
+  }
+  return tr;
+}
+
+async function uploadStl() {
+  const files = $("#upload-files").files;
+  const msg = $("#setup-msg");
+  if (!files.length) { msg.className = "msg err"; msg.textContent = "choose STL file(s) first"; return; }
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  fd.append("units", $("#upload-units").value);
+  fd.append("role", $("#upload-role").value);
+  fd.append("scenario", S.scenPath);
+  msg.className = "msg"; msg.textContent = "uploading…";
+  const r = await fetch(`/api/projects/upload`, { method: "POST", body: fd });
+  const j = await r.json();
+  if (!r.ok) { msg.className = "msg err"; msg.textContent = j.detail || r.statusText; return; }
+  S.scen = j.scenario; S.geoKey = null;
+  await loadGeometry("scenario", S.scenPath); renderSetup();
+  msg.className = "msg ok";
+  msg.textContent = "added " + j.added.map(x => `${x.file} (${x.triangles} tris, ${x.size_m.join(" × ")} m)`).join(", ") +
+    (j.problems.length ? ` — still needed: ${j.problems.join("; ")}` : "");
+  $("#upload-files").value = "";
+}
+
 $("#save-scenario").onclick = async () => {
   const m = $("#setup-msg");
-  try { await api(`/api/scenario?path=${encodeURIComponent(S.scenPath)}`, { method: "PUT", body: JSON.stringify(S.scen) });
-        m.className = "msg ok"; m.textContent = "saved"; S.geoKey = null; await loadGeometry("scenario", S.scenPath); renderSetup(); }
+  try { const r = await api(`/api/scenario?path=${encodeURIComponent(S.scenPath)}`, { method: "PUT", body: JSON.stringify(S.scen) });
+        m.className = r.problems.length ? "msg err" : "msg ok";
+        m.textContent = r.problems.length ? "saved as draft — before it can run: " + r.problems.join("; ") : "saved";
+        S.geoKey = null; await loadGeometry("scenario", S.scenPath); renderSetup(); }
   catch (e) { m.className = "msg err"; m.textContent = e.message; }
 };
 
@@ -220,9 +324,25 @@ $("#launch").onclick = async () => {
   } catch (e) { m.className = "msg err"; m.textContent = e.message; }
 };
 
+$("#upload-btn").onclick = () => uploadStl().catch(e => showError(e.message));
+$("#fit-domain").onclick = async () => {
+  try { const r = await api(`/api/scenario/auto-domain?path=${encodeURIComponent(S.scenPath)}`, { method: "POST" });
+        S.scen.domain = r.domain; S.geoKey = null; await loadGeometry("scenario", S.scenPath); }
+  catch (e) { showError(e.message); }
+};
+
 // ---------------------------------------------------------------- run
 async function openRun(id, tab) {
   S.run = id; S.analysis = null; S.geoKey = null;
+  const info = await api(`/api/runs/${encodeURIComponent(id)}`);
+  if (!info.meta?.parts) {               // failed before start: show the log, nothing to draw
+    S.runInfo = info; await showTab("run");
+    $("#run-empty").hidden = true; $("#run-view").hidden = false;
+    $("#run-title").textContent = id;
+    const st = $("#run-status"); st.textContent = info.status; st.className = "badge " + info.status;
+    $("#run-log").textContent = info.log; $("#run-log").closest("details").open = true;
+    loadRuns(); return;
+  }
   await showTab(tab);
   await refreshRun();
   loadRuns();

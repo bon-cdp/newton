@@ -91,7 +91,8 @@ class Injector:
     stop: float = INF
     site_spacing: float = 2.2             # lattice pitch, in grain radii
     wall_clearance: float = 1.25          # drop sites closer than this many radii to a wall
-    batch_fraction: float = 0.25          # fraction of sites filled per injection event
+    batch_fraction: float = 0.25          # at most this fraction of sites filled per event
+    max_interval: float = 0.04            # s; smaller batches if events would be further apart
     set_coordinate: list[float] | None = None   # [axis, value]: place all sites on that plane
     offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # m, added to sites
 
@@ -196,7 +197,7 @@ class Scenario:
             fh.write("\n")
 
     @classmethod
-    def from_dict(cls, d: dict, base_dir: str = ".") -> "Scenario":
+    def from_dict(cls, d: dict, base_dir: str = ".", validate: bool = True) -> "Scenario":
         d = dict(d)
         dom = d.pop("domain")
         known = {f.name for f in fields(cls)}
@@ -218,7 +219,8 @@ class Scenario:
             base_dir=base_dir,
             notes=d.get("notes", {}),
         )
-        sc.validate()
+        if validate:
+            sc.validate()
         return sc
 
     @classmethod
@@ -239,6 +241,8 @@ class Scenario:
                 errs.append(f"material.{k} must be > 0")
         if not self.parts:
             errs.append("no parts")
+        if not self.injectors:
+            errs.append("no injector")
         names = [p.name for p in self.parts]
         if len(set(names)) != len(names):
             errs.append("part names must be unique")

@@ -68,7 +68,7 @@ export class Viewer {
   // frame drawn while geometry was still loading survives it.
   clear() {
     for (const o of [...this.world.children]) { this.world.remove(o); o.geometry?.dispose?.(); }
-    this.parts = [];
+    this.parts = []; this.arrows = [];
   }
 
   setGeometry(geo, grainRadius) {
@@ -127,6 +127,97 @@ export class Viewer {
     this.controls.target.copy(c);
     this.camera.position.copy(c).add(new THREE.Vector3(0.55, 0.35, 0.75).multiplyScalar(s));
     this.camera.near = s / 1000; this.camera.far = s * 20; this.camera.updateProjectionMatrix();
+  }
+
+  // ---- conveyor direction: pick an edge by clicking a part, BFA-style ----------------
+  // Resolves {dir, mid, a, b} for the triangle edge nearest the click, or null on Esc.
+  pickEdge(partName) {
+    const part = this.parts.find(p => p.name === partName);
+    if (!part) return Promise.resolve(null);
+    const canvas = this.renderer.domElement;
+    const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+    canvas.style.cursor = "crosshair";
+    const prevOpacity = part.mesh.material.opacity;
+    part.mesh.material.opacity = 0.8;
+    return new Promise(resolve => {
+      const done = r => {
+        canvas.style.cursor = ""; part.mesh.material.opacity = prevOpacity;
+        canvas.removeEventListener("pointerdown", onDown); window.removeEventListener("keydown", onKey);
+        resolve(r);
+      };
+      const onKey = e => { if (e.key === "Escape") done(null); };
+      const onDown = e => {
+        if (e.button !== 0) return;
+        const r = canvas.getBoundingClientRect();
+        ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+        ray.setFromCamera(ndc, this.camera);
+        const hit = ray.intersectObject(part.mesh, false)[0];
+        if (!hit) return;                                   // keep waiting for a hit
+        e.stopImmediatePropagation();                       // do not start an orbit drag
+        const pos = part.mesh.geometry.getAttribute("position");
+        const i0 = hit.faceIndex * 3;
+        const V = k => new THREE.Vector3().fromBufferAttribute(pos, i0 + k);
+        const tri = [V(0), V(1), V(2)];
+        let best = null;
+        for (let k = 0; k < 3; k++) {
+          const a = tri[k], b = tri[(k + 1) % 3];
+          const line = new THREE.Line3(a, b), cp = new THREE.Vector3();
+          line.closestPointToPoint(hit.point, true, cp);
+          const d = cp.distanceTo(hit.point);
+          if (!best || d < best.d) best = { d, a, b };
+        }
+        const dir = best.b.clone().sub(best.a).normalize();
+        this.flashEdge(best.a, best.b);
+        done({ dir: dir.toArray(), mid: best.a.clone().add(best.b).multiplyScalar(0.5).toArray(),
+               a: best.a.toArray(), b: best.b.toArray() });
+      };
+      canvas.addEventListener("pointerdown", onDown, true);
+      window.addEventListener("keydown", onKey);
+    });
+  }
+
+  flashEdge(a, b) {
+    const g = new THREE.BufferGeometry().setFromPoints([a, b]);
+    const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xdc2626, linewidth: 3 }));
+    this.world.add(l);
+    setTimeout(() => { this.world.remove(l); g.dispose(); }, 2500);
+  }
+
+  // Arrows showing each moving part's motion: belts along their running direction,
+  // rotating parts along their axis.
+  setMotionArrows(parts) {
+    for (const a of this.arrows || []) this.world.remove(a);
+    this.arrows = [];
+    for (const p of parts) {
+      const vp = this.parts.find(q => q.name === p.name);
+      if (!vp || !p.motion) continue;
+      const box = new THREE.Box3().setFromObject(vp.mesh);
+      const size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
+      const L = Math.max(0.3, 0.18 * size.length());
+      if (p.motion.type === "belt") {
+        const d = new THREE.Vector3(...p.motion.velocity);
+        if (d.lengthSq() === 0) continue;
+        d.normalize();
+        // three arrows along the running direction, lifted to the top of the part
+        for (const f of [-0.3, 0, 0.3]) {
+          const o = c.clone().addScaledVector(d, f * size.length() * 0.6);
+          o.y = box.max.y + 0.02 * size.length();
+          const arr = new THREE.ArrowHelper(d, o.clone().addScaledVector(d, -L / 2), L, 0xdc2626, L * 0.3, L * 0.18);
+          this.world.add(arr); this.arrows.push(arr);
+        }
+      } else if (p.motion.type === "rotating") {
+        const ax = new THREE.Vector3(...p.motion.axis).normalize();
+        const o = new THREE.Vector3(...p.motion.point);
+        const arr = new THREE.ArrowHelper(ax, o.clone().addScaledVector(ax, -L / 2), L, 0x9333ea, L * 0.3, L * 0.18);
+        this.world.add(arr); this.arrows.push(arr);
+      }
+    }
+  }
+
+  partCentroid(name) {
+    const p = this.parts.find(q => q.name === name);
+    if (!p) return [0, 0, 0];
+    return new THREE.Box3().setFromObject(p.mesh).getCenter(new THREE.Vector3()).toArray();
   }
 
   setPartVisible(name, on) {

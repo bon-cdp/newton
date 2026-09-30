@@ -38,6 +38,8 @@ from dem_scenario import INF, Scenario  # noqa: E402
 
 PY = sys.executable
 RUNS = os.path.join(ROOT, "runs", "dem")
+# Projects created here go in a git-ignored folder: uploaded geometry is often customer data.
+PROJECTS = os.path.join(ROOT, "projects")
 SKIP = {"runs", ".venv", "newton", "dem_ui", "tools", "docs", ".git", "_backup_fork",
         "bfa_reference_vtk", "asv", "__pycache__"}
 
@@ -134,21 +136,24 @@ def _status(run_id: str, d: str) -> str:
 @app.get("/api/projects")
 def projects():
     out = []
-    for d in sorted(os.listdir(ROOT)):
-        p = os.path.join(ROOT, d)
-        if d in SKIP or d.startswith(".") or not os.path.isdir(p):
+    cands = [os.path.join(ROOT, d) for d in sorted(os.listdir(ROOT))]
+    if os.path.isdir(PROJECTS):
+        cands += [os.path.join(PROJECTS, d) for d in sorted(os.listdir(PROJECTS))]
+    for p in cands:
+        d = os.path.basename(p)
+        if d in SKIP or d == "projects" or d.startswith(".") or not os.path.isdir(p):
             continue
         prj = glob.glob(os.path.join(p, "*.prj"))
         scen = sorted(glob.glob(os.path.join(p, "scenario*.json")))
         if prj or scen:
-            out.append(dict(name=d, path=_rel(p), bfa=bool(prj),
+            out.append(dict(name=_rel(p), path=_rel(p), bfa=bool(prj),
                             scenarios=[_rel(s) for s in scen]))
     return out
 
 
-@app.post("/api/projects/{name}/import")
-def import_project(name: str, preset: str = "fast"):
-    p = _inside(os.path.join(ROOT, name))
+@app.post("/api/projects/import")
+def import_project(project: str, preset: str = "fast"):
+    p = _inside(project)
     out = os.path.join(p, "scenario.json" if preset == "fast" else f"scenario_{preset}.json")
     r = subprocess.run([PY, os.path.join(ROOT, "bfa_import.py"), p, "--preset", preset,
                         "--out", out], capture_output=True, text=True, cwd=ROOT)
@@ -157,6 +162,115 @@ def import_project(name: str, preset: str = "fast"):
     report = [ln.strip() for ln in r.stdout.splitlines()
               if ln.strip().startswith(("note", "WARNING", "wrote"))]
     return dict(scenario=_rel(out), report=report)
+
+
+DEFAULT_SCENARIO = {
+    "name": "", "units": "m", "gravity": [0.0, -9.81, 0.0],
+    "material": {"name": "material", "radius": 0.006, "density": 1000.0, "youngs": 1.0e8,
+                 "poisson": 0.3, "restitution": 0.2, "friction": 0.3, "rolling_friction": 0.3,
+                 "wall_rolling_friction": 0.3, "tangential_ratio": 1.0, "contact": "hertz"},
+    "parts": [], "injectors": [], "domain": {"lo": [-1.0, -1.0, -1.0], "hi": [1.0, 1.0, 1.0]},
+    "regions": [], "flow_planes": [], "output": {"duration": 5.0, "fps": 15.0, "vtk": True},
+    "notes": {"source": "operator screen"},
+}
+
+
+@app.post("/api/projects")
+def new_project(body: dict = Body(...)):
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", (body.get("name") or "").strip())
+    if not name or name in SKIP or name.startswith("."):
+        raise HTTPException(422, "choose a project name (letters, digits, _ . -)")
+    d = os.path.join(PROJECTS, name)
+    if os.path.exists(d):
+        raise HTTPException(409, f"{name} already exists")
+    os.makedirs(d)
+    sc = json.loads(json.dumps(DEFAULT_SCENARIO))
+    sc["name"] = name
+    with open(os.path.join(d, "scenario.json"), "w") as fh:
+        json.dump(sc, fh, indent=2)
+    return dict(project=name, scenario=_rel(os.path.join(d, "scenario.json")))
+
+
+UNITS_TO_M = {"m": 1.0, "mm": 1e-3, "cm": 1e-2, "in": 0.0254, "ft": 0.3048}
+
+
+def _auto_domain(sc: dict, base: str, margin_frac: float = 0.15, margin_min: float = 0.3):
+    import trimesh
+    los, his = [], []
+    for p in sc["parts"]:
+        m = trimesh.load(os.path.join(base, p["stl"]) if not os.path.isabs(p["stl"]) else p["stl"],
+                         force="mesh")
+        los.append(m.bounds[0])
+        his.append(m.bounds[1])
+    for i in sc.get("injectors", []):
+        m = trimesh.load(os.path.join(base, i["face_stl"]), force="mesh")
+        los.append(m.bounds[0])
+        his.append(m.bounds[1])
+    if not los:
+        return
+    lo, hi = np.min(los, axis=0), np.max(his, axis=0)
+    pad = np.maximum((hi - lo) * margin_frac, margin_min)
+    sc["domain"] = {"lo": (lo - pad).round(4).tolist(), "hi": (hi + pad).round(4).tolist()}
+
+
+@app.post("/api/projects/upload")
+async def upload(request: __import__("fastapi").Request):
+    """multipart: files (STL, several), units (m/mm/cm/in/ft), role (part | injection),
+    scenario (path).  STLs go next to the scenario, converted to metres."""
+    import trimesh
+    form = await request.form()
+    scen_path = _inside(form.get("scenario") or "")
+    d = os.path.dirname(scen_path)
+    scale = UNITS_TO_M.get(form.get("units", "m"))
+    if scale is None:
+        raise HTTPException(422, "units must be one of " + ", ".join(UNITS_TO_M))
+    role = form.get("role", "part")
+    sc = json.load(open(scen_path))
+    added = []
+    for up in form.getlist("files"):
+        stem = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.splitext(up.filename)[0]) or "part"
+        raw = await up.read()
+        try:
+            mesh = trimesh.load(trimesh.util.wrap_as_stream(raw), file_type="stl", force="mesh")
+        except Exception as e:  # noqa: BLE001 -- report any parser failure to the user
+            raise HTTPException(422, f"{up.filename}: not a readable STL ({e})")
+        if len(mesh.faces) == 0:
+            raise HTTPException(422, f"{up.filename}: no triangles")
+        if scale != 1.0:
+            mesh.apply_scale(scale)
+        fname = f"{stem}.stl"
+        mesh.export(os.path.join(d, fname))
+        if role == "injection":
+            inj = (sc.get("injectors") or [None])[0] or {
+                "name": stem, "face_stl": fname, "mass_rate": 10.0, "velocity": [0.0, -1.0, 0.0]}
+            inj["face_stl"] = fname
+            sc["injectors"] = [inj]
+        else:
+            names = {p["name"] for p in sc["parts"]}
+            pname = stem
+            k = 2
+            while pname in names:
+                pname = f"{stem}_{k}"
+                k += 1
+            sc["parts"].append({"name": pname, "stl": fname, "two_sided": True, "friction": 0.5,
+                                "active": [0.0, INF]})
+        ext = mesh.bounds[1] - mesh.bounds[0]
+        added.append(dict(file=fname, triangles=int(len(mesh.faces)),
+                          size_m=[round(float(x), 4) for x in ext]))
+    _auto_domain(sc, os.path.dirname(scen_path))
+    with open(scen_path, "w") as fh:
+        json.dump(sc, fh, indent=2)
+    return dict(added=added, scenario=sc, problems=_problems(sc, os.path.dirname(scen_path)))
+
+
+@app.post("/api/scenario/auto-domain")
+def auto_domain(path: str):
+    p = _inside(path)
+    sc = json.load(open(p))
+    _auto_domain(sc, os.path.dirname(p))
+    with open(p, "w") as fh:
+        json.dump(sc, fh, indent=2)
+    return dict(domain=sc["domain"])
 
 
 @app.get("/api/scenario")
@@ -169,13 +283,22 @@ def get_scenario(path: str):
 def put_scenario(path: str, body: dict = Body(...)):
     p = _inside(path)
     try:
-        Scenario.from_dict(body, base_dir=os.path.dirname(p))      # validates
+        Scenario.from_dict(body, base_dir=os.path.dirname(p), validate=False)   # structure
     except (ValueError, TypeError, KeyError) as e:
-        raise HTTPException(422, str(e))
+        raise HTTPException(422, str(e))                  # malformed: refuse
     with open(p, "w") as fh:
         json.dump(body, fh, indent=2)
         fh.write("\n")
-    return dict(saved=_rel(p))
+    return dict(saved=_rel(p), problems=_problems(body, os.path.dirname(p)))
+
+
+def _problems(body: dict, base: str) -> list[str]:
+    """Why a (well-formed) scenario cannot run yet -- drafts are saved anyway."""
+    try:
+        Scenario.from_dict(body, base_dir=base)
+        return []
+    except (ValueError, TypeError, KeyError) as e:
+        return [ln.strip() for ln in str(e).splitlines()[1:]] or [str(e)]
 
 
 def _geometry(sc: Scenario):
@@ -203,7 +326,9 @@ def _geometry(sc: Scenario):
 def geometry(scenario: str):
     """Parts as the SOLVER loads them (merged vertices, same triangle order), so
     per-triangle results line up with what is drawn."""
-    return _geometry(Scenario.load(_inside(scenario)))
+    p = _inside(scenario)
+    return _geometry(Scenario.from_dict(json.load(open(p)), base_dir=os.path.dirname(p),
+                                        validate=False))
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +340,14 @@ def runs():
     out = []
     for d in sorted(glob.glob(os.path.join(RUNS, "*")), key=os.path.getmtime, reverse=True):
         meta_p = os.path.join(d, "run.json")
-        if not os.path.exists(meta_p):
-            continue
         rid = os.path.basename(d)
+        if not os.path.exists(meta_p):
+            if os.path.exists(os.path.join(d, "log.txt")):
+                # launched from here but died before writing run.json (setup error): show
+                # it, so the failure is visible rather than the run silently missing
+                out.append(dict(id=rid, name=rid, status=_status(rid, d), scenario_based=True,
+                                t=0.0, duration=None, frames=0, modified=os.path.getmtime(d)))
+            continue
         try:
             meta = json.load(open(meta_p))
         except json.JSONDecodeError:
@@ -234,6 +364,9 @@ def runs():
 @app.post("/api/runs")
 def start_run(body: dict = Body(...)):
     scen = _inside(body["scenario"])
+    probs = _problems(json.load(open(scen)), os.path.dirname(scen))
+    if probs:
+        raise HTTPException(422, "cannot run yet: " + "; ".join(probs))
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", body.get("name") or
                   f"{os.path.basename(os.path.dirname(scen))}_{time.strftime('%Y%m%d_%H%M%S')}")
     d = os.path.join(RUNS, name)
@@ -263,7 +396,8 @@ def stop_run(run_id: str):
 @app.get("/api/runs/{run_id}")
 def run_info(run_id: str):
     d = _run_dir(run_id)
-    meta = json.load(open(os.path.join(d, "run.json")))
+    mp = os.path.join(d, "run.json")
+    meta = json.load(open(mp)) if os.path.exists(mp) else {}
     log = os.path.join(d, "log.txt")
     tail = open(log, errors="replace").read()[-3000:] if os.path.exists(log) else ""
     frames = sorted(int(re.search(r"frame_(\d+)_", f).group(1))
@@ -283,9 +417,20 @@ def run_geometry(run_id: str):
         raise HTTPException(422, "run predates scenario files")
     known = {"name", "material", "parts", "injectors", "domain", "regions", "flow_planes",
              "output", "gravity", "units", "notes"}
-    sc = Scenario.from_dict({k: v for k, v in meta.items() if k in known},
-                            base_dir=meta.get("base_dir", d))
-    return _geometry(sc)
+    return _geometry(Scenario.from_dict({k: v for k, v in meta.items() if k in known},
+                                        base_dir=_run_base_dir(meta, d)))
+
+
+def _run_base_dir(meta: dict, d: str) -> str:
+    """Where a run's relative STL paths resolve.  Runs made before run.json recorded it
+    ("base_dir") were imported scenarios named after their project folder."""
+    if meta.get("base_dir"):
+        return meta["base_dir"]
+    for cand in (os.path.join(ROOT, meta.get("name", "")), d):
+        if all(os.path.exists(os.path.join(cand, p["stl"])) or os.path.isabs(p["stl"])
+               for p in meta.get("parts", [])):
+            return cand
+    return d
 
 
 @app.get("/api/runs/{run_id}/frame/{k}")

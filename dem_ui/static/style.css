@@ -46,7 +46,7 @@ button:disabled { opacity: .5; cursor: default; }
 .tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
 .tbl th { text-align: left; font-weight: 500; color: var(--muted); border-bottom: 1px solid var(--line); padding: 3px 4px; }
 .tbl td { border-bottom: 1px solid #f0f2f5; padding: 3px 4px; }
-.tbl input[type=number] { width: 4.2em; font: inherit; padding: 1px 3px; border: 1px solid var(--line); border-radius: 3px; }
+.tbl input[type=number] { width: 3.6em; font: inherit; padding: 1px 3px; border: 1px solid var(--line); border-radius: 3px; }
 .tbl td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
 .msg { color: var(--muted); font-size: 12px; }
@@ -62,4 +62,11 @@ button:disabled { opacity: .5; cursor: default; }
 .progress div { height: 100%; background: var(--accent); width: 0; transition: width .5s; }
 .chart { width: 100%; border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; background: #fff; }
 pre { font-size: 11px; background: #f7f8fa; padding: 8px; border-radius: 6px; max-height: 240px; overflow: auto; white-space: pre-wrap; }
-#viewer-error { position: absolute; left: 16px; top: 16px; right: 16px; background: #fff4f4; border: 1px solid #f3c2c2; color: #991b1b; padding: 10px 12px; border-radius: 8px; font-size: 12px; white-space: pre-wrap; }
+#viewer-error { position: absolute; left: 16px; bottom: 64px; max-width: 60%; background: #fff4f4; border: 1px solid #f3c2c2; color: #991b1b; padding: 10px 12px; border-radius: 8px; font-size: 12px; white-space: pre-wrap; }
+#viewer-error button { float: right; margin-left: 8px; }
+.motion-row td { background: #f7f9fc; font-size: 12px; padding: 6px 8px; white-space: normal; }
+#parts-table { table-layout: auto; }
+#parts-table td:nth-child(2) { min-width: 7.5em; overflow-wrap: normal; }
+#parts-table select { max-width: 6.2em; }
+.motion-row input[type=number] { width: 5em; }
+.tbl select { font: inherit; font-size: 12px; padding: 1px 2px; }
