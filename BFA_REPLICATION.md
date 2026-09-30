@@ -59,9 +59,10 @@ domain, reporting regions, solver and output settings.
 
 ```bash
 # import a BulkFlowAnalyst project (reads .prj + .lin; writes <project>/scenario.json)
-.venv/bin/python bfa_import.py 20060-CM-552            # --preset fast for E/10 + lists
+.venv/bin/python bfa_import.py <project>               # fast preset (default)
+.venv/bin/python bfa_import.py <project> --preset reference --out <project>/scenario_ref.json
 # run any scenario
-.venv/bin/python -u dem_run.py 20060-CM-552/scenario.json --out runs/dem/ironore
+.venv/bin/python -u dem_run.py <project>/scenario.json --out runs/dem/<name>
 ```
 
 The importer lists every interpretation and every unsupported feature it met; read them.

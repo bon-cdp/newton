@@ -123,12 +123,18 @@ class FlowPlane:
 
 @dataclass
 class Solver:
+    """Defaults are the FAST settings (validated on the corn and iron-ore projects):
+    Young's modulus / 10, dt = 0.35 Rayleigh time, neighbour lists every 4 steps.  For
+    BFA's own stiffness and timestep set youngs_divisor 1 and neighbor_every 0 (the
+    importer's --preset reference)."""
+
     dt: float | str = "auto"              # s, or "auto" = rayleigh_fraction * Rayleigh time
     rayleigh_fraction: float = 0.35
-    youngs_divisor: float = 1.0           # soften E for a larger stable dt (fast preset: 10)
-    neighbor_every: int = 0               # Verlet list rebuild interval (0 = off)
+    youngs_divisor: float = 10.0          # soften E for a larger stable dt (1 = true E)
+    neighbor_every: int = 4               # Verlet list rebuild interval (0 = off)
     skin: float | None = None             # m; default 2 * skin_speed * N * dt
-    skin_speed: float = 10.0              # m/s the default skin is sized for
+    skin_speed: float = 6.0               # m/s the default skin is sized for; faster grains
+                                          # fall back to a direct search (12 m/s measured slower)
     wall_grid_cell: float = 0.006         # m
     bvh_walls: bool = False               # per-step BVH wall queries (reference path)
     wall_cache: bool = True               # BVH path only

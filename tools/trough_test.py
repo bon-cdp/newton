@@ -93,7 +93,7 @@ def scenario(d, angle_deg, split, preset, corners=False):
     mat = Material(name="corn", radius=0.006, density=994.05, youngs=1.4220405e8, poisson=0.3,
                    restitution=0.2, friction=0.11, rolling_friction=0.3,
                    wall_rolling_friction=0.5, tangential_ratio=1.0, contact="hertz")
-    solver = Solver(dt=2.4316429e-5, expected_holdup_kg=6.0)
+    solver = Solver(dt=2.4316429e-5, youngs_divisor=1.0, neighbor_every=0, expected_holdup_kg=6.0)
     if preset == "fast":
         solver = Solver(dt="auto", youngs_divisor=10.0, neighbor_every=4, skin_speed=6.0,
                         expected_holdup_kg=6.0)

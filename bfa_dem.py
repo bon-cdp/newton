@@ -241,7 +241,7 @@ def scenario_from_args(args) -> Scenario:
     regions = [Region("tube", lo=[-INF, TUBE_LO, -INF], hi=[INF, TUBE_HI, INF]),
                Region("cascade", hi=[INF, CASCADE_HI, INF], spin=True)]
     solver = Solver(
-        dt=args.dt, neighbor_every=args.neighbor_every, skin=args.skin,
+        dt=args.dt, youngs_divisor=1.0, neighbor_every=args.neighbor_every, skin=args.skin,
         skin_speed=args.skin_speed, wall_grid_cell=args.wall_grid_cell,
         bvh_walls=args.bvh_walls, wall_cache=not args.no_wall_cache,
         graph_steps=args.graph_steps, hash_dims=args.hash_dims,
