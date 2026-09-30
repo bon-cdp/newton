@@ -26,8 +26,8 @@ import sys
 import numpy as np
 import trimesh
 
-from dem_scenario import (INF, Injector, Material, Output, Part, Region, Scenario, Solver,
-                          rayleigh_time)
+from dem_scenario import (INF, FlowPlane, Injector, Material, Output, Part, Region, Scenario,
+                          Solver, rayleigh_time)
 
 IN = 0.0254                 # m per inch
 LB_FT3 = 16.018463          # kg/m3 per lb/ft3
@@ -339,14 +339,20 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
                    friction=mu_pp, rolling_friction=roll_pp,
                    wall_rolling_friction=common(rolls, 0.5), rot_damp=rotr,
                    rot_damp_wall=common(rots, 0.2), tangential_ratio=1.0, contact="hertz")
+    flow_planes = []
     for n, pr in portals.items():
-        interp.append(f"portal '{n}' {pr['lo']} .. {pr['hi']}: a measurement plane (flow probes "
-                      "are phase 1 of #12); recorded here, grains pass through it")
+        lo_p, hi_p = np.array(pr["lo"]), np.array(pr["hi"])
+        ax = int(np.argmin(hi_p - lo_p))
+        flow_planes.append(FlowPlane(name=safe_name(n), axis=ax, value=float(lo_p[ax]),
+                                     lo=lo_p.tolist(), hi=hi_p.tolist()))
+        interp.append(f"portal '{n}' {pr['lo']} .. {pr['hi']} -> flow plane "
+                      f"flow_{safe_name(n)}_kg (grains pass through it, as in BFA)")
 
     sc = Scenario(
         name=os.path.basename(os.path.normpath(proj_dir)), material=mat, parts=parts,
         injectors=[injector], domain_lo=lo.round(3).tolist(), domain_hi=hi.round(3).tolist(),
-        regions=regions, solver=solver, output=Output(duration=duration, fps=fps),
+        regions=regions, flow_planes=flow_planes, solver=solver,
+        output=Output(duration=duration, fps=fps),
         base_dir=proj_dir,
         notes={"source": os.path.basename(prj[0]), "importer": "bfa_import.py",
                "preset": preset, "bfa_timestep": dt_bfa, "portals": portals,

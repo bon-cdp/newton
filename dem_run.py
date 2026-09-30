@@ -564,7 +564,13 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     for r in regs:
         cols += [f"{r.name}_mass_kg", f"{r.name}_speed_ms"]
     cols += ["spin_mean_rads"] + [f"spin_{r.name}_rads" for r in regs if r.spin]
-    cols += ["discharged_kg", "injected_kg", "escaped_kg", "wallclock_s"]
+    cols += ["discharged_kg", "injected_kg", "escaped_kg"]
+    cols += [f"flow_{fp.name}_kg" for fp in sc.flow_planes]
+    cols += ["wallclock_s"]
+    # flow planes: crossings between consecutive frames, from positions read on the host.
+    # A grain moves well under a metre per frame, so none can cross and leave unseen.
+    flow_kg = np.zeros(len(sc.flow_planes))
+    prev_q = None
     hist = open(os.path.join(out_dir, "history.csv"), "w")
     hist.write(",".join(cols) + "\n")
 
@@ -689,6 +695,21 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                     launch_steps(substeps)
                 sim_t += substeps * dt
                 nstep += substeps
+                if sc.flow_planes:
+                    cur_q = s0.particle_q.numpy()
+                    if prev_q is not None:
+                        for k, fp in enumerate(sc.flow_planes):
+                            a = fp.axis
+                            p0, p1 = prev_q[:, a] - fp.value, cur_q[:, a] - fp.value
+                            cross = (p0 * p1 < 0.0)
+                            if cross.any():
+                                fr = (p0[cross] / (p0[cross] - p1[cross]))[:, None]
+                                pt = prev_q[cross] + fr * (cur_q[cross] - prev_q[cross])
+                                inside = np.ones(len(pt), dtype=bool)
+                                for b in range(3):
+                                    if b != a:
+                                        inside &= (pt[:, b] >= fp.lo[b]) & (pt[:, b] <= fp.hi[b])
+                                flow_kg[k] += inside.sum() * gmass
                 wp.launch(recycle, dim=n_pool, device=device, inputs=[
                     s0.particle_q, s0.particle_qd, model.particle_flags,
                     wp.vec3(*sc.domain_lo), wp.vec3(*sc.domain_hi), S.park_lo,
@@ -699,6 +720,8 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 _fi = S.free_idx.numpy()
                 _fi[:_fc] = np.sort(_fi[:_fc])[::-1]
                 S.free_idx.assign(_fi)
+                if sc.flow_planes:
+                    prev_q = s0.particle_q.numpy()      # after recycling: parked grains moved
                 owed = int(S.backlog.numpy()[0])
                 max_backlog = max(max_backlog, owed)
                 if owed > batch:
@@ -744,7 +767,9 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                     row.append(f"{(st[6 + 3 * k] / c if c > 0 else 0.0):.3f}")
             inj_kg = int(S.injected.numpy()[0]) * gmass
             esc_kg = int(S.escaped.numpy()[0]) * gmass
-            row += [f"{out_kg:.6f}", f"{inj_kg:.6f}", f"{esc_kg:.6f}", f"{wall:.2f}"]
+            row += [f"{out_kg:.6f}", f"{inj_kg:.6f}", f"{esc_kg:.6f}"]
+            row += [f"{kg:.6f}" for kg in flow_kg]
+            row += [f"{wall:.2f}"]
             hist.write(",".join(row) + "\n")
             hist.flush()
             if out.checkpoint_at is not None and not saved_ckpt and frame * S.frame_dt >= out.checkpoint_at:

@@ -15,6 +15,7 @@ new file, not new code.  `bfa_import.py` writes one from a BulkFlowAnalyst proje
       "injectors": [{...}],              # Injector
       "domain": {"lo": [...], "hi": [...]},   # grains leaving it are recycled
       "regions": [{...}],                # Region: named boxes reported in history.csv
+      "flow_planes": [{...}],            # FlowPlane: mass crossing a rectangle (portals)
       "solver": {...},                   # Solver
       "output": {...}                    # Output
     }
@@ -106,6 +107,21 @@ class Region:
 
 
 @dataclass
+class FlowPlane:
+    """Mass crossing a rectangle in an axis-aligned plane (BFA's "portals").
+
+    axis: 0/1/2 = the plane's normal (x/y/z); value: its coordinate; lo/hi: the rectangle
+    in the other two coordinates (the axis component is ignored).  Crossings in either
+    direction are counted; history.csv gets the cumulative mass as flow_<name>_kg."""
+
+    name: str
+    axis: int
+    value: float
+    lo: list[float] = field(default_factory=lambda: [-INF, -INF, -INF])
+    hi: list[float] = field(default_factory=lambda: [INF, INF, INF])
+
+
+@dataclass
 class Solver:
     dt: float | str = "auto"              # s, or "auto" = rayleigh_fraction * Rayleigh time
     rayleigh_fraction: float = 0.35
@@ -145,6 +161,7 @@ class Scenario:
     domain_lo: list[float]
     domain_hi: list[float]
     regions: list[Region] = field(default_factory=list)
+    flow_planes: list[FlowPlane] = field(default_factory=list)
     solver: Solver = field(default_factory=Solver)
     output: Output = field(default_factory=Output)
     gravity: list[float] = field(default_factory=lambda: [0.0, -9.81, 0.0])
@@ -187,6 +204,7 @@ class Scenario:
             injectors=[_mk(Injector, i) for i in d.get("injectors", [])],
             domain_lo=list(dom["lo"]), domain_hi=list(dom["hi"]),
             regions=[_mk(Region, r) for r in d.get("regions", [])],
+            flow_planes=[_mk(FlowPlane, f) for f in d.get("flow_planes", [])],
             solver=_mk(Solver, d.get("solver", {})),
             output=_mk(Output, d.get("output", {})),
             gravity=list(d.get("gravity", [0.0, -9.81, 0.0])),
