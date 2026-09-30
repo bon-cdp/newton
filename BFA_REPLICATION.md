@@ -91,17 +91,20 @@ Limits: stuck contacts' tangential force uses the sliding law (the history sprin
 in frames); corner second contacts (#13) are not yet reconstructed; impacts shorter than
 the frame interval are sampled, not integrated.
 
-## Operator screen (web UI)
+## Operator screen: EMS Flo (web UI)
 
 ```bash
 .venv/bin/python -m pip install -r dem_ui/requirements.txt    # once
 .venv/bin/python -m dem_ui.server                            # http://127.0.0.1:8765
 ```
 
-- **Setup:** projects (folders with a BFA `.prj` or `scenario*.json`); one-click BFA import;
-  3D view of parts, injector face, flow planes and domain; editable solver preset,
-  material, parts (sidedness, friction, active window, corners, belt speed) and injection.
-  Saving validates through the scenario schema.
+- **Setup:** projects (BFA folders, `scenario*.json`, or new ones in the git-ignored
+  `projects/`); one-click BFA import; STL upload with unit conversion; 3D view of parts,
+  injection, flow planes and domain; editable solver preset, material, parts (type wall /
+  conveyor belt / rotating, direction picked on an edge in 3D, friction, active window,
+  corners) and injection: an STL face, or a box on a belt or a plane (position, lateral
+  offset, clearance, length, width, height; live capacity check).  Drafts save and list
+  what is missing before they can run.
 - **Run:** launches `dem_run.py` as a subprocess; live progress, mass, region and flow charts; stop.
 - **Results:** frame playback coloured by speed; post-run measurements (`dem_analyze.py`) for
   a chosen window: part loads (table and chart), flows (rates and shares), regions; wall

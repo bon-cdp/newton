@@ -224,9 +224,10 @@ def _collider_for(run, device):
         device=device, corners=[p.corners for p in sc.parts],
         motions=[dem_run.surface_motion(p.motion, sc.gravity) for p in sc.parts])
     max_thick = max([p.thickness if p.two_sided else 0.0 for p in sc.parts] + [0.0])
-    grid, _info = G.build_wall_grid(parts, meshes, collider.lower, collider.upper,
-                                    m.radius + max_thick + 1.0e-3 + 1.0e-4,
-                                    sc.solver.wall_grid_cell, device)
+    reach = m.radius + max_thick + 1.0e-3 + 1.0e-4
+    cell, _note = dem_run.wall_grid_cell(parts, m.radius, reach, sc.solver.wall_grid_cell)
+    grid, _info = G.build_wall_grid(parts, meshes, collider.lower, collider.upper, reach, cell,
+                                    device)
     return parts, collider, meshes, grid
 
 

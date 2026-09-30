@@ -81,11 +81,19 @@ class Part:
 
 @dataclass
 class Injector:
-    """Grains spawned on a non-overlapping lattice over a planar STL face."""
+    """Grains spawned on a non-overlapping lattice: over a planar STL face, or filling a
+    box placed relative to a belt or a horizontal plane (box, see dem_run.injector_box):
+
+      {"reference": "belt", "part": "<belt part>", "position": m from its upstream end,
+       "lateral": m from its centreline, "clearance": m above its surface,
+       "length": m, "width": m, "height": m, "match_belt": true}
+      {"reference": "plane", "plane_height": m, "center": [x, y, z], "direction": [..],
+       "clearance": m, "length": m, "width": m, "height": m}
+    """
 
     name: str
-    face_stl: str
-    mass_rate: float                      # kg/s
+    face_stl: str = ""
+    mass_rate: float = 10.0               # kg/s
     velocity: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     start: float = 0.0
     stop: float = INF
@@ -95,6 +103,7 @@ class Injector:
     max_interval: float = 0.04            # s; smaller batches if events would be further apart
     set_coordinate: list[float] | None = None   # [axis, value]: place all sites on that plane
     offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # m, added to sites
+    box: dict | None = None               # box injector instead of face_stl (see above)
 
 
 @dataclass
@@ -136,7 +145,8 @@ class Solver:
     skin: float | None = None             # m; default 2 * skin_speed * N * dt
     skin_speed: float = 6.0               # m/s the default skin is sized for; faster grains
                                           # fall back to a direct search (12 m/s measured slower)
-    wall_grid_cell: float = 0.006         # m
+    wall_grid_cell: float | None = None   # m; None = the grain radius (>= 6 mm), enlarged
+                                          # if needed to keep the grid within its memory budget
     bvh_walls: bool = False               # per-step BVH wall queries (reference path)
     wall_cache: bool = True               # BVH path only
     graph_steps: int = 256
@@ -251,7 +261,25 @@ class Scenario:
                 errs.append(f"part {p.name!r}: STL not found: {self.path(p.stl)}")
             if len(p.active) != 2 or p.active[0] >= p.active[1]:
                 errs.append(f"part {p.name!r}: active must be [on, off) with on < off")
+        part_files = {os.path.normpath(self.path(p.stl)) for p in self.parts}
         for inj in self.injectors:
+            if inj.box:
+                bx = inj.box
+                for k in ("length", "width", "height"):
+                    if float(bx.get(k, 0)) <= 0:
+                        errs.append(f"injector {inj.name!r}: box {k} must be > 0")
+                if bx.get("reference") == "belt":
+                    p = next((p for p in self.parts if p.name == bx.get("part")), None)
+                    if p is None or not p.motion or p.motion.get("type") != "belt":
+                        errs.append(f"injector {inj.name!r}: box reference {bx.get('part')!r} is "
+                                    f"not a conveyor belt part")
+                continue
+            if not inj.face_stl:
+                errs.append(f"injector {inj.name!r}: needs a face STL or a box")
+                continue
+            if os.path.normpath(self.path(inj.face_stl)) in part_files:
+                errs.append(f"injector {inj.name!r}: its face {inj.face_stl} is also a collider part "
+                            f"(a wall exactly where grains spawn) -- remove that part")
             if not os.path.exists(self.path(inj.face_stl)):
                 errs.append(f"injector {inj.name!r}: face STL not found: {self.path(inj.face_stl)}")
             if inj.mass_rate <= 0:

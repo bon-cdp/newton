@@ -97,9 +97,12 @@ export class Viewer {
       triOffset += p.n_tri;
     });
     for (const inj of geo.injectors || []) {
-      const t = b64(inj.triangles, Float32Array);
-      const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(t, 3));
-      this.world.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.5 })));
+      if (inj.triangles) {
+        const t = b64(inj.triangles, Float32Array);
+        const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(t, 3));
+        this.world.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.5 })));
+      }
+      if (inj.box_corners) this.world.add(...this.injectorBox(inj.box_corners));
     }
     for (const fp of geo.flow_planes || []) this.world.add(this.plane(fp));
     const d = geo.domain;
@@ -109,6 +112,19 @@ export class Viewer {
       this.world.add(bx);
     }
     this.fit(box);
+  }
+
+  // corners indexed i*4 + j*2 + k over (along, across, up)
+  injectorBox(c) {
+    const P = c.map(p => new THREE.Vector3(...p));
+    const edges = [[0, 4], [2, 6], [1, 5], [3, 7], [0, 2], [4, 6], [1, 3], [5, 7], [0, 1], [2, 3], [4, 5], [6, 7]];
+    const lg = new THREE.BufferGeometry().setFromPoints(edges.flatMap(([a, b]) => [P[a], P[b]]));
+    const lines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x16a34a }));
+    const faces = [[0, 4, 6, 2], [1, 3, 7, 5], [0, 1, 5, 4], [2, 6, 7, 3], [0, 2, 3, 1], [4, 5, 7, 6]];
+    const pos = faces.flatMap(([a, b, c2, d]) => [P[a], P[b], P[c2], P[a], P[c2], P[d]]);
+    const fg = new THREE.BufferGeometry().setFromPoints(pos);
+    const mesh = new THREE.Mesh(fg, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.15, depthWrite: false }));
+    return [lines, mesh];
   }
 
   plane(fp) {

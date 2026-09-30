@@ -67,35 +67,40 @@ def mark_occupied(
     lat_spacing: float,
     lat_nu: int,
     lat_nv: int,
+    lat_nw: int,
     lat_map: wp.array(dtype=int),
     sites: wp.array(dtype=wp.vec3),
     clear_dist: float,
     occupied: wp.array(dtype=int),
 ):
     """On injection steps, flag every lattice site with a grain closer than clear_dist.
-    Sites form a regular grid in the injection plane, so each grain near the plane checks
-    only the 3x3 sites around its projection -- O(grains), not O(grains x sites)."""
+    Sites form a regular grid (one layer for a face, several for a box), so each grain
+    near it checks only the 3x3x3 sites around it -- O(grains), not O(grains x sites)."""
     i = wp.tid()
     if _event(event_of_step, step_arr, step_offset) < 0:
         return
     if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
         return
     rel = particle_q[i] - lat_origin
-    if wp.abs(wp.dot(rel, lat_n)) >= clear_dist:
+    wn = wp.dot(rel, lat_n)
+    if wn <= -clear_dist or wn >= float(lat_nw - 1) * lat_spacing + clear_dist:
         return
     fu = wp.dot(rel, lat_u) / lat_spacing
     fv = wp.dot(rel, lat_v) / lat_spacing
     iu0 = int(wp.floor(fu + 0.5))
     iv0 = int(wp.floor(fv + 0.5))
+    iw0 = int(wp.floor(wn / lat_spacing + 0.5))
     for du in range(-1, 2):
         for dv in range(-1, 2):
-            iu = iu0 + du
-            iv = iv0 + dv
-            if iu >= 0 and iu < lat_nu and iv >= 0 and iv < lat_nv:
-                k = lat_map[iu * lat_nv + iv]
-                if k >= 0:
-                    if wp.length_sq(particle_q[i] - sites[k]) < clear_dist * clear_dist:
-                        occupied[k] = 1
+            for dw in range(-1, 2):
+                iu = iu0 + du
+                iv = iv0 + dv
+                iw = iw0 + dw
+                if iu >= 0 and iu < lat_nu and iv >= 0 and iv < lat_nv and iw >= 0 and iw < lat_nw:
+                    k = lat_map[(iu * lat_nv + iv) * lat_nw + iw]
+                    if k >= 0:
+                        if wp.length_sq(particle_q[i] - sites[k]) < clear_dist * clear_dist:
+                            occupied[k] = 1
 
 
 @wp.kernel
@@ -224,8 +229,9 @@ def _min_wall_distance(mesh: wp.uint64, pts: wp.array(dtype=wp.vec3), max_dist: 
         wp.atomic_min(out, i, d)
 
 
-def clear_of_walls(sites, parts, clearance, device):
-    """Keep only injection sites at least ``clearance`` from every collider surface."""
+def clear_of_walls(sites, parts, clearance, device, mask=False):
+    """Injection sites at least ``clearance`` from every collider surface (or, with
+    mask=True, the boolean mask selecting them)."""
     p = wp.array(sites.astype(np.float32), dtype=wp.vec3, device=device)
     d = wp.full(len(sites), 1.0e9, dtype=float, device=device)
     for _name, v, f in parts:
@@ -233,7 +239,8 @@ def clear_of_walls(sites, parts, clearance, device):
                     wp.array(np.asarray(f, dtype=np.int32).flatten(), dtype=int, device=device))
         wp.launch(_min_wall_distance, dim=len(sites), inputs=[m.id, p, clearance * 6.0, d],
                   device=device)
-    return sites[d.numpy() >= clearance]
+    keep = d.numpy() >= clearance
+    return keep if mask else sites[keep]
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +317,126 @@ def describe_motion(motion):
 # ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
+
+def injector_box(sc, inj, parts):
+    """Frame and size of a box injector (Injector.box), BFA's "injection volume from belt
+    reference".  Axes: e1 along the belt's running direction (its horizontal part) or the
+    given direction, e2 across (up x e1), e3 up (against gravity).
+
+      belt:  "part" names a belt; "position" is from the belt's upstream end to the box's
+             upstream face, "lateral" from the belt's centreline; the belt's surface height
+             is found by a ray cast down at the box's centre (troughs, inclines);
+             "clearance" is the gap from that surface to the box's bottom.
+      plane: a horizontal plane at "plane_height"; "center" [x, y, z] (y ignored) is the
+             box centre; "clearance" above the plane.
+    Returns dict(origin, e1, e2, e3, length, width, height, velocity or None, describe)."""
+    bx = inj.box
+    up = -np.asarray(sc.gravity, dtype=np.float64)
+    up /= np.linalg.norm(up)
+    L, W, H = float(bx["length"]), float(bx["width"]), float(bx["height"])
+    clearance = float(bx.get("clearance", 0.0))
+    ref = bx.get("reference", "plane")
+    velocity = None
+
+    def horiz(d):
+        d = np.asarray(d, dtype=np.float64)
+        d = d - up * d.dot(up)
+        n = np.linalg.norm(d)
+        if n < 1e-9:
+            raise ValueError(f"injector {inj.name!r}: box direction is vertical")
+        return d / n
+
+    if ref == "belt":
+        part = next((p for p in sc.parts if p.name == bx.get("part")), None)
+        if part is None or not part.motion or part.motion.get("type") != "belt":
+            raise ValueError(f"injector {inj.name!r}: box reference {bx.get('part')!r} is not a "
+                             f"part with belt motion")
+        vel = np.asarray(part.motion["velocity"], dtype=np.float64)
+        e1 = horiz(vel)
+        e2 = np.cross(up, e1)
+        k = [p.name for p in sc.parts].index(part.name)
+        v, f = parts[k][1], np.asarray(parts[k][2]).reshape(-1, 3)
+        s_up = float((v @ e1).min())
+        c_lat = float(0.5 * ((v @ e2).min() + (v @ e2).max()))
+        s0 = s_up + float(bx.get("position", 0.0))
+        l0 = c_lat + float(bx.get("lateral", 0.0))
+        top = float((v @ up).max()) + 1.0
+        centre = e1 * (s0 + L / 2) + e2 * l0 + up * top
+        hits = _ray_hits(centre, -up, v, f)
+        if not len(hits):
+            raise ValueError(f"injector {inj.name!r}: no belt surface under the box centre -- "
+                             f"check position/lateral against the belt's length and width")
+        h_ref = float((hits @ up).max())             # the belt's upper surface there
+        origin = e1 * s0 + e2 * (l0 - W / 2) + up * (h_ref + clearance)
+        if bx.get("match_belt", True):
+            velocity = vel.tolist()
+        describe = (f"on belt {part.name!r}, {bx.get('position', 0.0):g} m from its upstream end, "
+                    f"{clearance:g} m above its surface")
+    else:
+        e1 = horiz(bx.get("direction", [1.0, 0.0, 0.0]))
+        e2 = np.cross(up, e1)
+        c = np.asarray(bx.get("center", [0.0, 0.0, 0.0]), dtype=np.float64)
+        c = c - up * c.dot(up) + up * float(bx.get("plane_height", 0.0))
+        origin = c - e1 * L / 2 - e2 * W / 2 + up * clearance
+        describe = f"above the plane at height {bx.get('plane_height', 0.0):g} m"
+    return dict(origin=origin, e1=e1, e2=e2, e3=up, length=L, width=W, height=H,
+                velocity=velocity, describe=describe)
+
+
+def _ray_hits(o, d, v, f):
+    """Points where the ray o + t d (t > 0) crosses the triangles (Moller-Trumbore, numpy;
+    one ray against a part, so no acceleration structure or extra dependency is needed)."""
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    e1, e2 = b - a, c - a
+    p = np.cross(d, e2)
+    det = (e1 * p).sum(1)
+    ok = np.abs(det) > 1e-12
+    inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+    s = o - a
+    u = (s * p).sum(1) * inv
+    q = np.cross(s, e1)
+    w = (q @ d) * inv
+    t = (q * e2).sum(1) * inv
+    hit = ok & (u >= 0) & (w >= 0) & (u + w <= 1) & (t > 0)
+    return o + np.outer(t[hit], d)
+
+
+def box_lattice(fr, spacing):
+    """Lattice sites filling an injector box: (sites, (iu, iv, iw) per site, lattice origin,
+    (u, v, n) axes, (nu, nv, nw))."""
+    n = [max(1, int(fr[k] // spacing)) for k in ("length", "width", "height")]
+    iu, iv, iw = np.meshgrid(*[np.arange(k) for k in n], indexing="ij")
+    idx = np.stack([iu.ravel(), iv.ravel(), iw.ravel()], axis=1)
+    # centre the lattice in the box along each axis
+    pad = [(fr[k] - (m - 1) * spacing) / 2 for k, m in zip(("length", "width", "height"), n)]
+    origin = fr["origin"] + fr["e1"] * pad[0] + fr["e2"] * pad[1] + fr["e3"] * pad[2]
+    sites = (origin + np.outer(idx[:, 0] * spacing, fr["e1"]) + np.outer(idx[:, 1] * spacing, fr["e2"])
+             + np.outer(idx[:, 2] * spacing, fr["e3"]))
+    return sites, idx, origin, (fr["e1"], fr["e2"], fr["e3"]), tuple(n)
+
+
+def injector_box_corners(sc, inj):
+    """8 corners of a box injector, for drawing (loads the parts as build() does)."""
+    parts = [(p.name, *load_stl(sc.path(p.stl), p.fix_normals, p.flip, sc.unit_scale))
+             for p in sc.parts]
+    fr = injector_box(sc, inj, parts)
+    o, a, b, c = fr["origin"], fr["e1"] * fr["length"], fr["e2"] * fr["width"], fr["e3"] * fr["height"]
+    return [(o + i * a + j * b + k * c).tolist() for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+
+
+def wall_grid_cell(parts, radius, reach, requested=None, budget=64.0e6):
+    """(cell size, note).  The requested size, else the grain radius (>= 6 mm), enlarged
+    if the dense cell table would exceed `budget` cells: a 20 m project at 6 mm asked for
+    8 billion cells and failed to allocate; larger cells only mean longer candidate lists."""
+    cell = requested if requested else max(0.006, radius)
+    allv = np.vstack([np.asarray(v) for _n, v, _f in parts])
+    ext = allv.max(axis=0) - allv.min(axis=0) + 2.0 * (reach + cell)
+    if np.prod(ext / cell) <= budget:
+        return float(cell), ""
+    new = float((np.prod(ext) / budget) ** (1.0 / 3.0))
+    return new, (f"cell {cell*1e3:.0f} mm -> {new*1e3:.0f} mm to stay within "
+                 f"{budget/1e6:.0f} M cells ({ext.round(1).tolist()} m geometry)")
+
 
 def resolve_dt(sc: Scenario):
     """(dt, substeps, effective Young's modulus).  dt divides the frame interval."""
@@ -394,38 +521,56 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     if len(sc.injectors) != 1:
         raise NotImplementedError("exactly one injector for now")
     inj = sc.injectors[0]
-    tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
     site_spacing = radius * inj.site_spacing
-    sites = lattice_sites(tris, site_spacing)
-    if inj.set_coordinate is not None:
-        sites[:, int(inj.set_coordinate[0])] = inj.set_coordinate[1]
-    sites += np.asarray(inj.offset, dtype=np.float64)
+    spawn_velocity = [float(c) for c in inj.velocity]
+    if inj.box:
+        # a box of lattice sites above a belt or plane (BFA's "injection volume from belt
+        # reference"); see injector_box
+        fr = injector_box(sc, inj, parts)
+        sites, idx, lat_origin, axes, dims = box_lattice(fr, site_spacing)
+        face_area = fr["length"] * fr["width"]
+        if fr["velocity"] is not None:
+            spawn_velocity = fr["velocity"]
+        what = (f"injection box {fr['length']:g} x {fr['width']:g} x {fr['height']:g} m "
+                f"{fr['describe']}")
+    else:
+        tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
+        sites = lattice_sites(tris, site_spacing)
+        if inj.set_coordinate is not None:
+            sites[:, int(inj.set_coordinate[0])] = inj.set_coordinate[1]
+        sites += np.asarray(inj.offset, dtype=np.float64)
+        # The lattice as a grid in the injection plane, so mark_occupied can find the sites
+        # around a grain directly (same construction as lattice_sites).
+        fpts = tris.reshape(-1, 3)
+        flo, fhi = fpts.min(axis=0), fpts.max(axis=0)
+        ax = int(np.argmin(fhi - flo))
+        au, av = [k for k in range(3) if k != ax]
+        off = np.asarray(inj.offset, dtype=np.float64)
+        o_u, o_v = flo[au] + site_spacing * 0.5 + off[au], flo[av] + site_spacing * 0.5 + off[av]
+        nu = len(np.arange(flo[au] + site_spacing * 0.5, fhi[au], site_spacing))
+        nv = len(np.arange(flo[av] + site_spacing * 0.5, fhi[av], site_spacing))
+        fu, fv = (sites[:, au] - o_u) / site_spacing, (sites[:, av] - o_v) / site_spacing
+        iu, iv = np.rint(fu).astype(int), np.rint(fv).astype(int)
+        assert np.allclose(fu, iu, atol=1e-4) and np.allclose(fv, iv, atol=1e-4) and \
+            np.ptp(sites[:, ax]) < 1e-9, "injection sites are not a planar lattice"
+        idx = np.stack([iu, iv, np.zeros_like(iu)], axis=1)
+        e_ax = np.eye(3)
+        lat_origin = np.zeros(3)
+        lat_origin[au], lat_origin[av], lat_origin[ax] = o_u, o_v, sites[0, ax]
+        axes = (e_ax[au], e_ax[av], e_ax[ax])
+        dims = (nu, nv, 1)
+        what = f"injection face        {face_area:.4f} m2"
     n_raw = len(sites)
-    sites = clear_of_walls(sites, parts, radius * inj.wall_clearance, device)
+    keep = clear_of_walls(sites, parts, radius * inj.wall_clearance, device, mask=True)
+    sites, idx = sites[keep], idx[keep]
     if not len(sites):
         raise RuntimeError(f"injector {inj.name!r}: every lattice site is inside a wall")
-    # The lattice as a grid in the injection plane, so mark_occupied can find the sites
-    # around a grain directly (same construction as lattice_sites).
-    fpts = tris.reshape(-1, 3)
-    flo, fhi = fpts.min(axis=0), fpts.max(axis=0)
-    ax = int(np.argmin(fhi - flo))
-    au, av = [k for k in range(3) if k != ax]
-    off = np.asarray(inj.offset, dtype=np.float64)
-    o_u, o_v = flo[au] + site_spacing * 0.5 + off[au], flo[av] + site_spacing * 0.5 + off[av]
-    nu = len(np.arange(flo[au] + site_spacing * 0.5, fhi[au], site_spacing))
-    nv = len(np.arange(flo[av] + site_spacing * 0.5, fhi[av], site_spacing))
-    fu, fv = (sites[:, au] - o_u) / site_spacing, (sites[:, av] - o_v) / site_spacing
-    iu, iv = np.rint(fu).astype(int), np.rint(fv).astype(int)
-    assert np.allclose(fu, iu, atol=1e-4) and np.allclose(fv, iv, atol=1e-4) and \
-        np.ptp(sites[:, ax]) < 1e-9, "injection sites are not a planar lattice"
-    lat_map = np.full(nu * nv, -1, dtype=np.int32)
-    lat_map[iu * nv + iv] = np.arange(len(sites), dtype=np.int32)
-    e_ax = np.eye(3)
-    lat_origin = np.zeros(3)
-    lat_origin[au], lat_origin[av], lat_origin[ax] = o_u, o_v, sites[0, ax]
-    lattice = dict(origin=wp.vec3(*lat_origin), u=wp.vec3(*e_ax[au]), v=wp.vec3(*e_ax[av]),
-                   n=wp.vec3(*e_ax[ax]), spacing=float(site_spacing), nu=int(nu), nv=int(nv),
-                   map=wp.array(lat_map, dtype=int, device=device))
+    nu, nv, nw = dims
+    lat_map = np.full(nu * nv * nw, -1, dtype=np.int32)
+    lat_map[(idx[:, 0] * nv + idx[:, 1]) * nw + idx[:, 2]] = np.arange(len(sites), dtype=np.int32)
+    lattice = dict(origin=wp.vec3(*lat_origin), u=wp.vec3(*axes[0]), v=wp.vec3(*axes[1]),
+                   n=wp.vec3(*axes[2]), spacing=float(site_spacing), nu=int(nu), nv=int(nv),
+                   nw=int(nw), map=wp.array(lat_map, dtype=int, device=device))
 
     rate = inj.mass_rate / gmass
     # At most batch_fraction of the sites per event, but also no more than max_interval
@@ -435,8 +580,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     # (15 and 36 ms), so their batches are unchanged.
     batch = max(1, min(int(len(sites) * inj.batch_fraction), math.ceil(rate * inj.max_interval)))
     inj_interval = batch / rate
-    spawn_speed = float(np.linalg.norm(inj.velocity))
-    log(f"\n  injection face        {face_area:.4f} m2 -> {len(sites)} of {n_raw} lattice "
+    spawn_speed = float(np.linalg.norm(spawn_velocity))
+    log(f"\n  {what} -> {len(sites)} of {n_raw} lattice "
         f"sites at {site_spacing*1e3:.1f} mm ({n_raw-len(sites)} dropped for wall clearance)")
     log(f"  batch                 {batch} grains every {inj_interval*1e3:.1f} ms -> consecutive "
         f"batches {spawn_speed*inj_interval*1e3:.0f} mm apart "
@@ -498,9 +643,16 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         # reach: contact (radius + shell) plus the 1 mm band the sign test averages over
         max_thick = max([p.thickness if p.two_sided else 0.0 for p in sc.parts] + [0.0])
         reach = radius + max_thick + 1.0e-3 + 1.0e-4
+        # cell: the requested size, else the grain radius (>= 6 mm); enlarged if the dense
+        # cell table would exceed its budget.  A 20 m project at 6 mm asked for 8 billion
+        # cells and failed to allocate; larger cells only mean longer candidate lists.
+        cell, note = wall_grid_cell(parts, radius, reach, s.wall_grid_cell)
+        if note:
+            log("  wall grid             " + note)
+        s.wall_grid_cell = cell
         _t = time.time()
         wall_grid, winfo = build_wall_grid(parts, meshes, collider.lower, collider.upper,
-                                           reach, s.wall_grid_cell, device)
+                                           reach, cell, device)
         log(f"  wall grid             {winfo['dims']} cells of {s.wall_grid_cell*1e3:.0f} mm, "
             f"{winfo['occupied']:,} occupied, lists mean {winfo['mean_list']:.1f} / max "
             f"{winfo['max_list']}, {winfo['mbytes']:.0f} MB, baked in {time.time()-_t:.2f} s")
@@ -530,7 +682,7 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     reg_hi = wp.array(np.array([r.hi for r in regs] or [[0.0] * 3], dtype=np.float32), dtype=wp.vec3,
                       device=device)
     stats = wp.zeros(4 + 3 * max(len(regs), 1), dtype=float, device=device)
-    spawn_vel = wp.vec3(*[float(c) for c in inj.velocity])
+    spawn_vel = wp.vec3(*[float(c) for c in spawn_velocity])
     return argparse.Namespace(
         sc=sc, model=model, solver=solver, collider=collider, meshes=meshes, parts=parts,
         sites=sites, batch=batch, inj=inj, inj_interval=inj_interval, rate=rate,
@@ -635,7 +787,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
             wp.launch(mark_occupied, dim=n_pool, device=device, inputs=[
                 w_event, solver.step_arr, step_offset, s0.particle_q, model.particle_flags,
                 lat["origin"], lat["u"], lat["v"], lat["n"], lat["spacing"], lat["nu"], lat["nv"],
-                lat["map"], w_sites, clear_dist, S.occupied])
+                lat["nw"], lat["map"], w_sites, clear_dist, S.occupied])
             wp.launch(inject_event, dim=1, device=device, inputs=[
                 w_event, solver.step_arr, step_offset, w_cand, batch, S.occupied, w_sites,
                 S.spawn_vel, S.free_idx, S.free_count, S.backlog, S.starved,

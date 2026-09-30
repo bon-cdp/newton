@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Operator screen backend: a thin HTTP API over scenarios, the BFA importer, dem_run and
+EMS Flo operator screen backend: a thin HTTP API over scenarios, the BFA importer, dem_run and
 dem_analyze.  Heavy work (simulation, analysis) runs in subprocesses, so this server never
 touches the GPU and stays responsive while runs go.
 
@@ -43,7 +43,7 @@ PROJECTS = os.path.join(ROOT, "projects")
 SKIP = {"runs", ".venv", "newton", "dem_ui", "tools", "docs", ".git", "_backup_fork",
         "bfa_reference_vtk", "asv", "__pycache__"}
 
-app = FastAPI(title="Newton DEM operator screen")
+app = FastAPI(title="EMS Flo")
 JOBS: dict[str, subprocess.Popen] = {}           # run id -> simulation process
 ANALYSES: dict[str, subprocess.Popen] = {}       # run id -> analysis process
 
@@ -273,6 +273,19 @@ def auto_domain(path: str):
     return dict(domain=sc["domain"])
 
 
+@app.post("/api/geometry-preview")
+def geometry_preview(scenario: str, body: dict = Body(...)):
+    """Geometry for an UNSAVED scenario (live preview while editing, e.g. an injection box)."""
+    p = _inside(scenario)
+    return _geometry(Scenario.from_dict(body, base_dir=os.path.dirname(p), validate=False))
+
+
+@app.get("/api/stl-files")
+def stl_files(scenario: str):
+    d = os.path.dirname(_inside(scenario))
+    return sorted(f for f in os.listdir(d) if f.lower().endswith(".stl"))
+
+
 @app.get("/api/scenario")
 def get_scenario(path: str):
     p = _inside(path)
@@ -313,9 +326,16 @@ def _geometry(sc: Scenario):
                           n_tri=int(len(f))))
     inj = []
     for i in sc.injectors:
-        tris, area = dem_run.face_triangles(sc.path(i.face_stl), sc.unit_scale)
-        inj.append(dict(name=i.name, triangles=_b64(tris.reshape(-1), np.float32),
-                        mass_rate=i.mass_rate, velocity=i.velocity, area=area))
+        entry = dict(name=i.name, mass_rate=i.mass_rate, velocity=i.velocity)
+        try:
+            if i.box:
+                entry["box_corners"] = dem_run.injector_box_corners(sc, i)
+            elif i.face_stl and os.path.exists(sc.path(i.face_stl)):
+                tris, area = dem_run.face_triangles(sc.path(i.face_stl), sc.unit_scale)
+                entry.update(triangles=_b64(tris.reshape(-1), np.float32), area=area)
+        except (ValueError, KeyError, IndexError) as e:
+            entry["error"] = str(e)                # shown in the UI, e.g. no belt under the box
+        inj.append(entry)
     return dict(parts=parts, injectors=inj, domain=dict(lo=sc.domain_lo, hi=sc.domain_hi),
                 flow_planes=[dict(name=f.name, axis=f.axis, value=f.value, lo=f.lo, hi=f.hi)
                              for f in sc.flow_planes],
@@ -412,7 +432,10 @@ def run_info(run_id: str):
 @app.get("/api/runs/{run_id}/geometry")
 def run_geometry(run_id: str):
     d = _run_dir(run_id)
-    meta = json.load(open(os.path.join(d, "run.json")))
+    mp = os.path.join(d, "run.json")
+    if not os.path.exists(mp):
+        raise HTTPException(404, "this run stopped before it started (see its log)")
+    meta = json.load(open(mp))
     if "parts" not in meta:
         raise HTTPException(422, "run predates scenario files")
     known = {"name", "material", "parts", "injectors", "domain", "regions", "flow_planes",

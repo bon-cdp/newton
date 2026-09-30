@@ -50,7 +50,7 @@ async function showTab(t) {
   for (const x of ["setup", "run", "results"]) $(`#tab-${x}`).hidden = x !== t;
   $("#frame-bar").hidden = t !== "results" || !S.frames.length;
   if (t === "setup" && S.scen) await loadGeometry("scenario", S.scenPath);
-  if ((t === "run" || t === "results") && S.run) await loadGeometry("run", S.run);
+  if ((t === "run" || t === "results") && S.run && S.runInfo?.meta?.parts) await loadGeometry("run", S.run);
   if (t !== "results") { viewer.showParticles(false); viewer.clearWallMap(); $("#legend").hidden = true; }
   else refreshColouring();
 }
@@ -208,20 +208,7 @@ function renderSetup() {
   });
   viewer.setMotionArrows(sc.parts);
   // injector
-  const inj = sc.injectors[0]; const inf = $("#injector-fields"); inf.innerHTML = "";
-  if (!inj) { inf.innerHTML = "<div class='msg'>No injection face yet: upload an STL with role “injection face”.</div>"; }
-  else {
-  const field = (label, get_, set_) => {
-    const l = document.createElement("label"); l.textContent = label;
-    const i = document.createElement("input"); i.type = "number"; i.step = "any"; i.value = get_();
-    i.onchange = () => set_(+i.value); l.appendChild(i); inf.appendChild(l);
-  };
-  field("mass rate (kg/s)", () => +inj.mass_rate.toFixed(4), v => inj.mass_rate = v);
-  field("mass rate (t/h)", () => +(inj.mass_rate * 3.6).toFixed(2), v => inj.mass_rate = v / 3.6);
-  ["x", "y", "z"].forEach((a, k) => field(`velocity ${a} (m/s)`, () => inj.velocity[k], v => inj.velocity[k] = v));
-  field("start (s)", () => inj.start, v => inj.start = v);
-  field("stop (s)", () => (inj.stop >= INF ? "" : inj.stop), v => inj.stop = v || INF);
-  }
+  renderInjector(sc);
   // flow planes
   $("#flow-planes").innerHTML = (sc.flow_planes || []).map(f =>
     `<div class="item">${f.name}: ${"xyz"[f.axis]} = ${f.value}</div>`).join("") || "<div class='msg'>none</div>";
@@ -229,6 +216,127 @@ function renderSetup() {
   const n = sc.notes || {};
   $("#notes").innerHTML = (n.interpretations || []).map(s => `<p>• ${s}</p>`).join("") +
     (n.warnings || []).map(s => `<p class="warn">⚠ ${s}</p>`).join("");
+}
+
+// ---------------------------------------------------------------- injection
+// Source: an STL face, or a box placed relative to a belt or a horizontal plane (BFA's
+// "injection volume from belt reference").  A box can pass at most
+// width x height x packing x density x speed; the lattice packing is (4/3 pi r^3)/(2.2 r)^3.
+const LATTICE_PACKING = (4 / 3) * Math.PI / Math.pow(2.2, 3);
+
+async function renderInjector(sc) {
+  const inf = $("#injector-fields"); inf.innerHTML = "";
+  let inj = sc.injectors[0];
+  const src = document.createElement("label"); src.textContent = "source";
+  const sel = document.createElement("select");
+  for (const [v, t] of [["none", "— none —"], ["face", "STL face"], ["belt", "box on belt"], ["plane", "box on plane"]]) sel.add(new Option(t, v));
+  sel.value = !inj ? "none" : inj.box ? inj.box.reference : "face";
+  src.appendChild(sel); inf.appendChild(src);
+  sel.onchange = () => {
+    const base = inj || { name: "injection", face_stl: "", mass_rate: 10, velocity: [0, -1, 0] };
+    const belts = sc.parts.filter(p => p.motion?.type === "belt");
+    if (sel.value === "none") sc.injectors = [];
+    if (sel.value === "face") { delete base.box; sc.injectors = [base]; }
+    if (sel.value === "belt") {
+      if (!belts.length) { showError("Make a part a conveyor belt first (Parts: type)."); sel.value = inj?.box?.reference || (inj ? "face" : "none"); return; }
+      base.face_stl = ""; base.box = { reference: "belt", part: belts[0].name, position: 0.5, lateral: 0, clearance: 0.05, length: 2, width: 1, height: 0.5, match_belt: true };
+      sc.injectors = [base];
+    }
+    if (sel.value === "plane") {
+      base.face_stl = ""; base.box = { reference: "plane", plane_height: 0, center: [0, 0, 0], direction: [1, 0, 0], clearance: 0, length: 1, width: 1, height: 0.5 };
+      sc.injectors = [base];
+    }
+    renderInjector(sc); refreshInjectorPreview();
+  };
+  if (!inj) { const d = document.createElement("div"); d.className = "msg"; d.textContent = "No injection yet: choose a source, or upload an STL as “injection face”."; inf.appendChild(d); return; }
+  const field = (label, get_, set_, opts = {}) => {
+    const l = document.createElement("label"); l.textContent = label;
+    const i = document.createElement("input"); i.type = "number"; i.step = "any"; i.value = get_();
+    i.onchange = () => { set_(+i.value); updateCapacity(); if (opts.preview) refreshInjectorPreview(); };
+    l.appendChild(i); inf.appendChild(l); return i;
+  };
+  // one quantity, two units: typing in either updates the other at once
+  const kgs = field("mass rate (kg/s)", () => +inj.mass_rate.toFixed(4), v => inj.mass_rate = v);
+  const tph = field("mass rate (t/h)", () => +(inj.mass_rate * 3.6).toFixed(2), v => inj.mass_rate = v / 3.6);
+  kgs.oninput = () => { inj.mass_rate = +kgs.value; tph.value = +(inj.mass_rate * 3.6).toFixed(2); updateCapacity(); };
+  tph.oninput = () => { inj.mass_rate = +tph.value / 3.6; kgs.value = +inj.mass_rate.toFixed(4); updateCapacity(); };
+  const bx = inj.box;
+  if (!bx) {
+    const l = document.createElement("label"); l.textContent = "face STL";
+    const fs = document.createElement("select");
+    const files = await api(`/api/stl-files?scenario=${encodeURIComponent(S.scenPath)}`);
+    fs.add(new Option("— choose —", ""));
+    for (const f of files) fs.add(new Option(f, f));
+    fs.value = inj.face_stl || "";
+    fs.onchange = () => { inj.face_stl = fs.value; refreshInjectorPreview(); };
+    l.appendChild(fs); inf.appendChild(l);
+  } else if (bx.reference === "belt") {
+    const l = document.createElement("label"); l.textContent = "belt";
+    const bs = document.createElement("select");
+    for (const p of sc.parts.filter(p => p.motion?.type === "belt")) bs.add(new Option(p.name, p.name));
+    bs.value = bx.part; bs.onchange = () => { bx.part = bs.value; refreshInjectorPreview(); updateCapacity(); };
+    l.appendChild(bs); inf.appendChild(l);
+    field("position from belt tail (m)", () => bx.position, v => bx.position = v, { preview: true });
+    field("lateral offset (m)", () => bx.lateral, v => bx.lateral = v, { preview: true });
+    field("clearance above belt (m)", () => bx.clearance, v => bx.clearance = v, { preview: true });
+  } else {
+    field("plane height (m)", () => bx.plane_height, v => bx.plane_height = v, { preview: true });
+    field("centre x (m)", () => bx.center[0], v => bx.center[0] = v, { preview: true });
+    field("centre z (m)", () => bx.center[2], v => bx.center[2] = v, { preview: true });
+    const l = document.createElement("label"); l.textContent = "length along";
+    const ds = document.createElement("select");
+    for (const [v, t] of [["1,0,0", "+x"], ["-1,0,0", "−x"], ["0,0,1", "+z"], ["0,0,-1", "−z"]]) ds.add(new Option(t, v));
+    ds.value = bx.direction.join(","); ds.onchange = () => { bx.direction = ds.value.split(",").map(Number); refreshInjectorPreview(); };
+    l.appendChild(ds); inf.appendChild(l);
+    field("clearance above plane (m)", () => bx.clearance, v => bx.clearance = v, { preview: true });
+  }
+  if (bx) {
+    field("box length (m)", () => bx.length, v => bx.length = v, { preview: true });
+    field("box width (m)", () => bx.width, v => bx.width = v, { preview: true });
+    field("box height (m)", () => bx.height, v => bx.height = v, { preview: true });
+  }
+  if (bx?.reference === "belt") {
+    const l = document.createElement("label"); l.textContent = "move at belt velocity";
+    const c = document.createElement("input"); c.type = "checkbox"; c.checked = bx.match_belt !== false;
+    c.onchange = () => { bx.match_belt = c.checked; renderInjector(sc); };
+    l.appendChild(c); inf.appendChild(l);
+  }
+  if (!(bx?.reference === "belt" && bx.match_belt !== false))
+    ["x", "y", "z"].forEach((ax, k) => field(`velocity ${ax} (m/s)`, () => inj.velocity[k], v => inj.velocity[k] = v));
+  field("start (s)", () => inj.start ?? 0, v => inj.start = v);
+  field("stop (s)", () => ((inj.stop ?? INF) >= INF ? "" : inj.stop), v => inj.stop = v || INF);
+  const cap = document.createElement("div"); cap.id = "inj-capacity"; cap.className = "msg"; cap.style.gridColumn = "1 / -1";
+  inf.appendChild(cap);
+  updateCapacity();
+}
+
+function updateCapacity() {
+  const el = $("#inj-capacity"), sc = S.scen, inj = sc?.injectors?.[0];
+  if (!el || !inj?.box) { if (el) el.textContent = ""; return; }
+  const bx = inj.box;
+  let speed = Math.hypot(...inj.velocity);
+  if (bx.reference === "belt" && bx.match_belt !== false) {
+    const p = sc.parts.find(q => q.name === bx.part);
+    speed = p?.motion ? Math.hypot(...p.motion.velocity) : 0;
+  }
+  const cap = bx.width * bx.height * LATTICE_PACKING * sc.material.density * speed;
+  const ok = cap >= inj.mass_rate * 1.1;
+  el.className = "msg " + (ok ? "ok" : "err");
+  el.textContent = `box can pass ≈ ${fmt(cap)} kg/s (${fmt(cap * 3.6)} t/h) at ${fmt(speed)} m/s — ` +
+    (ok ? "enough for the mass rate" : "LESS than the mass rate: enlarge width × height (or speed), or the inlet will choke");
+}
+
+async function refreshInjectorPreview() {
+  // save-free preview: geometry is recomputed from the current (unsaved) scenario
+  clearTimeout(refreshInjectorPreview.t);
+  refreshInjectorPreview.t = setTimeout(async () => {
+    try {
+      const geo = await api(`/api/geometry-preview?scenario=${encodeURIComponent(S.scenPath)}`, { method: "POST", body: JSON.stringify(S.scen) });
+      const err = geo.injectors?.find(i => i.error);
+      if (err) showError("Injection: " + err.error);
+      viewer.setGeometry(geo, S.scen.material.radius); viewer.setMotionArrows(S.scen.parts);
+    } catch (e) { showError(e.message); }
+  }, 300);
 }
 
 // The editor row under a moving part: belt speed and running direction (picked on an edge
@@ -294,6 +402,8 @@ async function uploadStl() {
   fd.append("role", $("#upload-role").value);
   fd.append("scenario", S.scenPath);
   msg.className = "msg"; msg.textContent = "uploading…";
+  // save unsaved edits first (e.g. a removed part): the server adds to the file on disk
+  await api(`/api/scenario?path=${encodeURIComponent(S.scenPath)}`, { method: "PUT", body: JSON.stringify(S.scen) });
   const r = await fetch(`/api/projects/upload`, { method: "POST", body: fd });
   const j = await r.json();
   if (!r.ok) { msg.className = "msg err"; msg.textContent = j.detail || r.statusText; return; }
@@ -335,8 +445,9 @@ $("#fit-domain").onclick = async () => {
 async function openRun(id, tab) {
   S.run = id; S.analysis = null; S.geoKey = null;
   const info = await api(`/api/runs/${encodeURIComponent(id)}`);
+  S.runInfo = info;
   if (!info.meta?.parts) {               // failed before start: show the log, nothing to draw
-    S.runInfo = info; await showTab("run");
+    await showTab("run");
     $("#run-empty").hidden = true; $("#run-view").hidden = false;
     $("#run-title").textContent = id;
     const st = $("#run-status"); st.textContent = info.status; st.className = "badge " + info.status;
