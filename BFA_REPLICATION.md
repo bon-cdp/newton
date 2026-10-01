@@ -112,6 +112,9 @@ factor measured for the material.  6 s of the iron-ore conveyor at 1.9 M cells: 
 
 ## Operator screen: EMS DEM (web UI)
 
+Step-by-step user guide: [`dem_ui/docs/`](dem_ui/docs/README.md) (starting the app, Setup,
+Run, Results, command line).
+
 ```bash
 .venv/bin/python -m pip install -r dem_ui/requirements.txt    # once
 .venv/bin/python -m dem_ui.server                            # http://127.0.0.1:8765
