@@ -340,6 +340,15 @@ def project(axis: int, vel: wp.array3d(dtype=float), phi: wp.array3d(dtype=float
 # dust kernels
 # ---------------------------------------------------------------------------
 
+@wp.func
+def _part_at(solid_part: wp.array3d(dtype=wp.int32), c: wp.vec3i):
+    """1 + part index of cell c, 0 for open air or outside the box."""
+    if c[0] < 0 or c[1] < 0 or c[2] < 0 or c[0] >= solid_part.shape[0] or \
+            c[1] >= solid_part.shape[1] or c[2] >= solid_part.shape[2]:
+        return 0
+    return solid_part[c[0], c[1], c[2]]
+
+
 @wp.kernel
 def move_dust(x: wp.array(dtype=wp.vec3), vp: wp.array(dtype=wp.vec3),
               state: wp.array(dtype=wp.int32), diam: wp.array(dtype=float), rho_p: float,
@@ -349,8 +358,8 @@ def move_dust(x: wp.array(dtype=wp.vec3), vp: wp.array(dtype=wp.vec3),
               seed: int):
     """state: 0 airborne, 1 + part index deposited, -1 - face escaped (faces as FACES).
     A parcel deposits only when it settles onto a surface from above (it enters a solid
-    cell moving down the gravity axis); against a side or an underside it stays where it
-    was and moves on with the air (fine dust does not stick to every wall it brushes)."""
+    cell moving down the gravity axis); against a side or an underside it slides along the
+    wall and moves on with the air (fine dust does not stick to every wall it brushes)."""
     t = wp.tid()
     if state[t] != 0:
         return
@@ -388,9 +397,18 @@ def move_dust(x: wp.array(dtype=wp.vec3), vp: wp.array(dtype=wp.vec3),
         if sp > 0:
             if (c[down_axis] - c0[down_axis]) * down_sign > 0:
                 state[t] = sp                      # settled onto part sp - 1
-            else:
-                vp[t] = ua                         # bounced: stay, carried on by the air
-            return
+                return
+            # against a side or an underside: slide -- drop the motion along each axis whose
+            # own step enters a part (staying put would freeze a parcel the air presses on)
+            for ax in range(3):
+                q = wp.vec3(p[0], p[1], p[2])
+                q[ax] = pn[ax]
+                if _part_at(solid_part, _cell_of(origin, h, q)) > 0:
+                    pn[ax] = p[ax]
+                    vn[ax] = 0.0
+            if _part_at(solid_part, _cell_of(origin, h, pn)) > 0:
+                vp[t] = ua                         # a corner: stay, carried on by the air
+                return
     vp[t] = vn
     x[t] = pn
 
@@ -538,6 +556,8 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
     n_dust = 0
     rng = np.random.default_rng(seed)
     released_J = 0.0
+    pending_J = 0.0       # dissipated since the last release (a frame can draw no parcels)
+    dweight = np.zeros(cap)   # J each parcel stands for: fates are energy-weighted
     dust_frames = []      # per frame: (positions of airborne parcels, their size class)
     sizes = np.asarray(sizes_um, dtype=np.float64) * 1e-6
     face_flow = np.zeros((6, 2))      # m3 in, m3 out through each side (after spin-up)
@@ -574,9 +594,10 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
             diss = 0.5 * m.mass * ((v0 ** 2).sum(1) - (v1 ** 2).sum(1)) + m.mass * ((p1 - p0) @ gvec)
             diss = np.where(diss > 1e-3 * m.mass * 9.81, diss, 0.0)   # below ~1 mm of fall: noise
             tot = diss.sum()
+            released_J += tot
+            pending_J += tot
             n_new = min(int(rng.poisson(parcels_per_s * fdt)) if tot > 0 else 0, cap - n_dust)
             if n_new > 0:
-                released_J += tot
                 src = rng.choice(len(diss), size=n_new, p=diss / tot)
                 d = rng.normal(size=(n_new, 3))
                 d /= np.linalg.norm(d, axis=1, keepdims=True)
@@ -587,6 +608,8 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
                 dv[sl].assign(v1[src].astype(np.float32))
                 ddiam[sl].assign(sizes[cls].astype(np.float32))
                 dstate[sl].assign(np.zeros(n_new, dtype=np.int32))
+                dweight[sl] = pending_J / n_new
+                pending_J = 0.0
                 n_dust += n_new
         if has_ids:
             prev = (fr["pos"], fr["vel"], fr["id"].astype(np.int64))
@@ -658,15 +681,16 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
     st = dstate.numpy()[:n_dust]
     cls = np.arange(n_dust) % len(sizes)
     fate = {}
-    g_per_parcel = emission_g_per_kJ * released_J / 1e3 / max(n_dust, 1)
+    g_per_parcel = emission_g_per_kJ * released_J / 1e3 / max(n_dust, 1)    # mean
+    wt = dweight[:n_dust]
     for c, d in enumerate(sizes_um):
-        sc_ = st[cls == c]
-        n = max(len(sc_), 1)
+        sc_, w_ = st[cls == c], wt[cls == c]
+        n = max(float(w_.sum()), 1e-30)
         fate[f"{d:g}um"] = dict(
-            parcels=int(len(sc_)), airborne=round(float((sc_ == 0).sum()) / n, 4),
-            deposited={sc.parts[k].name: round(float((sc_ == k + 1).sum()) / n, 4)
+            parcels=int(len(sc_)), airborne=round(float(w_[sc_ == 0].sum()) / n, 4),
+            deposited={sc.parts[k].name: round(float(w_[sc_ == k + 1].sum()) / n, 4)
                        for k in range(len(parts)) if (sc_ == k + 1).any()},
-            escaped={FACES[k]: round(float((sc_ == -1 - k).sum()) / n, 4)
+            escaped={FACES[k]: round(float(w_[sc_ == -1 - k].sum()) / n, 4)
                      for k in range(6) if (sc_ == -1 - k).any()})
     summary = dict(
         window_s=[frames[0][0], frames[-1][0]], mean_from_s=t_spin, cell_m=h,
