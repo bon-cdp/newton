@@ -91,6 +91,25 @@ Limits: stuck contacts' tangential force uses the sliding law (the history sprin
 in frames); corner second contacts (#13) are not yet reconstructed; impacts shorter than
 the frame interval are sampled, not integrated.
 
+### Dust and air (prototype, issue #15)
+
+```bash
+.venv/bin/python dem_analyze.py runs/dem/<run> dust --window 8 16   # or dem_air.py for all options
+```
+
+One-way coupling: the grains in each frame drive an incompressible air flow on a 10 cm
+staggered grid around them (implicit single-sphere drag, eddy viscosity, pressure
+projection; parts voxelised as walls, switching with their active windows; belts move the
+air next to them; the box sides are open).  Dust parcels (10, 30 and 75 um by default)
+are released where grains dissipate energy -- impacts and sliding, from id-matched frames
+-- then follow the air with their settling velocity and a turbulent random walk; they
+deposit when they settle onto a part and escape through the box sides.  Outputs:
+`air_dust.json` (air drawn in and out through each side, dust fate per size),
+`air_dust.npz` (time-mean air field and dust per frame, for the operator screen) and
+`air_mean.vtk`.  Air flows are an upper bound (no shielding inside the stream, no
+back-coupling) and dust shares are comparative: absolute dust mass needs an emission
+factor measured for the material.  6 s of the iron-ore conveyor at 1.9 M cells: ~40 s.
+
 ## Operator screen: EMS DEM (web UI)
 
 ```bash
@@ -114,7 +133,9 @@ the frame interval are sampled, not integrated.
 - **Run:** launches `dem_run.py` as a subprocess; live progress, mass, region and flow charts; stop.
 - **Results:** frame playback coloured by speed; post-run measurements (`dem_analyze.py`) for
   a chosen window: part loads (table and chart), flows (rates and shares), regions; wall
-  pressure / shear / wear / contact maps on the geometry.
+  pressure / shear / wear / contact maps on the geometry; dust & air (air drawn in per box
+  side, dust fate per size, a movable slice of the air speed with flow arrows, dust parcels
+  played with the frames).
 - Deep links: `#scenario=<path>` or `#run=<id>&tab=results&frame=<n>&colour=pressure_Pa`.
 - Binds to localhost: the server reads and writes files in the workspace, so do not expose
   it without authentication.  three.js is vendored (MIT) so it works offline.

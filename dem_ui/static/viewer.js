@@ -289,4 +289,67 @@ export class Viewer {
       p.mesh.material.opacity = 0.45; p.mesh.material.depthWrite = false;
     }
   }
+
+  // Air: one slice of the time-mean air field, coloured by speed, with arrows for the
+  // in-plane flow.  s: {corner, du, dv, nu, nv, speed, vu, vv, solid} from /air-slice.
+  setAirSlice(s, hi) {
+    this.clearAirSlice();
+    const g = new THREE.Group();
+    const rgba = new Uint8Array(s.nu * s.nv * 4);
+    for (let j = 0; j < s.nv; j++) for (let i = 0; i < s.nu; i++) {
+      const k = j * s.nu + i, c = colormap(s.speed[k] / (hi || 1));
+      rgba.set([c[0] * 255, c[1] * 255, c[2] * 255, s.solid[k] ? 0 : 190], k * 4);
+    }
+    const tex = new THREE.DataTexture(rgba, s.nu, s.nv, THREE.RGBAFormat);
+    tex.magFilter = THREE.LinearFilter; tex.needsUpdate = true;
+    const C = new THREE.Vector3(...s.corner), U = new THREE.Vector3(...s.du), V = new THREE.Vector3(...s.dv);
+    const pts = [C, C.clone().add(U), C.clone().add(U).add(V), C.clone().add(V)];
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    geo.setIndex([0, 1, 2, 0, 2, 3]);
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+    g.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true,
+      side: THREE.DoubleSide, depthWrite: false })));
+    // arrows: every `step` cells, length = speed * scale, as line segments with a small head
+    const step = Math.max(1, Math.round(Math.max(s.nu, s.nv) / 45));
+    const cu = U.clone().divideScalar(s.nu), cv = V.clone().divideScalar(s.nv);
+    const eu = U.clone().normalize(), ev = V.clone().normalize();
+    const scale = step * cu.length() * 0.9 / (hi || 1), seg = [];
+    for (let j = step >> 1; j < s.nv; j += step) for (let i = step >> 1; i < s.nu; i += step) {
+      const k = j * s.nu + i;
+      if (s.solid[k] || s.speed[k] < 0.05 * hi) continue;
+      const o = C.clone().addScaledVector(cu, i + 0.5).addScaledVector(cv, j + 0.5);
+      const d = eu.clone().multiplyScalar(s.vu[k]).addScaledVector(ev, s.vv[k]).multiplyScalar(scale);
+      const e = o.clone().add(d), n = d.clone().normalize(), side = new THREE.Vector3().crossVectors(n, U.clone().cross(V).normalize()).multiplyScalar(d.length() * 0.25);
+      const back = e.clone().addScaledVector(d, -0.3);
+      seg.push(o, e, e, back.clone().add(side), e, back.clone().sub(side));
+    }
+    const lg = new THREE.BufferGeometry().setFromPoints(seg);
+    g.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x1d2330 })));
+    this.airSlice = g; this.scene.add(g);
+  }
+
+  clearAirSlice() {
+    if (!this.airSlice) return;
+    this.scene.remove(this.airSlice);
+    this.airSlice.traverse(o => { o.geometry?.dispose?.(); o.material?.map?.dispose?.(); o.material?.dispose?.(); });
+    this.airSlice = null;
+  }
+
+  // Dust parcels: small fixed-size points, one colour per size class.
+  setDust(pos, cls, colors) {
+    if (!this.dust) {
+      this.dust = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({
+        size: 3, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: 0.85, depthWrite: false }));
+      this.scene.add(this.dust);
+    }
+    const col = new Float32Array(cls.length * 3);
+    for (let i = 0; i < cls.length; i++) col.set(colors[cls[i]] || [0.5, 0.5, 0.5], i * 3);
+    const g = this.dust.geometry;
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    g.computeBoundingSphere();
+    this.dust.visible = true;
+  }
+
+  clearDust() { if (this.dust) this.dust.visible = false; }
 }

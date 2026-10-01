@@ -540,8 +540,8 @@ def analyze(run_id: str, body: dict = Body(...)):
     if p is not None and p.poll() is None:
         raise HTTPException(409, "an analysis is already running for this run")
     what = body.get("what", "loads")
-    if what not in ("loads", "flows", "regions"):
-        raise HTTPException(422, "what must be loads, flows or regions")
+    if what not in ("loads", "flows", "regions", "dust"):
+        raise HTTPException(422, "what must be loads, flows, regions or dust")
     cmd = [PY, os.path.join(ROOT, "dem_analyze.py"), d, what]
     if body.get("window"):
         cmd += ["--window", str(float(body["window"][0])), str(float(body["window"][1]))]
@@ -576,7 +576,68 @@ def analysis(run_id: str):
         z = np.load(maps)
         out["wall_maps"] = {k: _b64(z[k], np.float32) for k in z.files if k != "window"}
         out["wall_maps_window"] = z["window"].tolist() if "window" in z.files else None
+    ad = os.path.join(a, "air_dust.json")
+    if os.path.exists(ad):
+        out["air_dust"] = json.load(open(ad))
     return out
+
+
+_AIR = {}
+
+
+def _air(run_id: str):
+    """The run's air_dust.npz, loaded once per file version."""
+    f = os.path.join(_run_dir(run_id), "analysis", "air_dust.npz")
+    if not os.path.exists(f):
+        raise HTTPException(404, "run Dust & air first")
+    key = (f, os.path.getmtime(f))
+    if _AIR.get(run_id, (None,))[0] != key:
+        z = np.load(f)
+        _AIR[run_id] = (key, {k: z[k] for k in z.files})
+    return _AIR[run_id][1]
+
+
+@app.get("/api/runs/{run_id}/dust/{k}")
+def dust_frame(run_id: str, k: int):
+    """Binary: uint32 n, n*3 float32 positions, n uint8 size classes (airborne parcels at
+    frame k; empty outside the analysed window)."""
+    z = _air(run_id)
+    hit = np.flatnonzero(z["frame_ids"] == k)
+    if not len(hit):
+        pos, cls = np.zeros((0, 3), np.float32), np.zeros(0, np.uint8)
+    else:
+        a, b = z["dust_off"][hit[0]], z["dust_off"][hit[0] + 1]
+        pos, cls = z["dust_pos"][a:b], z["dust_cls"][a:b]
+    return Response(np.array([len(pos)], dtype=np.uint32).tobytes() + pos.astype(np.float32).tobytes()
+                    + cls.astype(np.uint8).tobytes(), media_type="application/octet-stream")
+
+
+@app.get("/api/runs/{run_id}/air-slice")
+def air_slice(run_id: str, axis: int = 2, frac: float = 0.5):
+    """One plane of the time-mean air field normal to `axis` at fraction `frac` of the box:
+    speed, the two in-plane components and the solid mask, row-major with u fastest."""
+    if axis not in (0, 1, 2):
+        raise HTTPException(422, "axis must be 0, 1 or 2")
+    z = _air(run_id)
+    air, solid, o, h = z["air"].astype(np.float32), z["solid"], z["origin"], float(z["cell"])
+    n = air.shape[:3]
+    idx = int(min(max(frac, 0.0), 1.0) * (n[axis] - 1))
+    au, av = [a for a in range(3) if a != axis]
+    sl = [slice(None)] * 3
+    sl[axis] = idx
+    a2, s2 = air[tuple(sl)], solid[tuple(sl)]            # shape (n[au], n[av], 3)
+    # rows over v, u fastest
+    a2, s2 = np.swapaxes(a2, 0, 1), np.swapaxes(s2, 0, 1)
+    corner = o.astype(np.float64).copy()
+    corner[axis] += (idx + 0.5) * h
+    du, dv = np.zeros(3), np.zeros(3)
+    du[au], dv[av] = n[au] * h, n[av] * h
+    sp = np.linalg.norm(a2, axis=-1)
+    return dict(axis=axis, index=idx, count=int(n[axis]), position=float(corner[axis]),
+                nu=int(n[au]), nv=int(n[av]), corner=corner.tolist(), du=du.tolist(), dv=dv.tolist(),
+                speed=_b64(sp.ravel(), np.float32), vu=_b64(a2[..., au].ravel(), np.float32),
+                vv=_b64(a2[..., av].ravel(), np.float32), solid=_b64(s2.ravel(), np.uint8),
+                max_speed=float(sp.max()), p98=float(np.percentile(sp[s2 == 0], 98)) if (s2 == 0).any() else 1.0)
 
 
 # ---------------------------------------------------------------------------

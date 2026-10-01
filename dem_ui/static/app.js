@@ -51,7 +51,7 @@ async function showTab(t) {
   $("#frame-bar").hidden = t !== "results" || !S.frames.length;
   if (t === "setup" && S.scen) await loadGeometry("scenario", S.scenPath);
   if ((t === "run" || t === "results") && S.run && S.runInfo?.meta?.parts) await loadGeometry("run", S.run);
-  if (t !== "results") { viewer.showParticles(false); viewer.clearWallMap(); $("#legend").hidden = true; }
+  if (t !== "results") { viewer.showParticles(false); viewer.clearWallMap(); viewer.clearAirSlice(); viewer.clearDust(); $("#legend").hidden = true; }
   else refreshColouring();
 }
 
@@ -472,6 +472,7 @@ $("#fit-domain").onclick = async () => {
 // ---------------------------------------------------------------- run
 async function openRun(id, tab) {
   S.run = id; S.analysis = null; S.geoKey = null;
+  viewer.clearAirSlice(); viewer.clearDust(); $("#air-out").innerHTML = "";
   const info = await api(`/api/runs/${encodeURIComponent(id)}`);
   S.runInfo = info;
   if (!info.meta?.parts) {               // failed before start: show the log, nothing to draw
@@ -551,6 +552,60 @@ async function showFrame(i) {
   viewer.setParticles(pos, spd, 0, hi);
   viewer.showParticles($("#show-particles").checked);
   if ($("#colour-by").value === "speed") legend("speed (m/s)", 0, hi);
+  showDust(k);
+}
+
+// ---------------------------------------------------------------- dust & air
+const DUST_COLOURS = [[0.86, 0.15, 0.15], [0.92, 0.55, 0.05], [0.45, 0.3, 0.15], [0.5, 0.2, 0.6]];
+
+async function showDust(k) {
+  if (!S.analysis?.air_dust || !$("#show-dust").checked) { viewer.clearDust(); return; }
+  try {
+    const buf = await api(`/api/runs/${S.run}/dust/${k}`);
+    const n = new Uint32Array(buf, 0, 1)[0];
+    viewer.setDust(new Float32Array(buf, 4, n * 3), new Uint8Array(buf, 4 + 12 * n, n), DUST_COLOURS);
+  } catch (_) { viewer.clearDust(); }
+}
+$("#show-dust").onchange = () => showDust(S.frames[S.frameIdx]);
+
+async function showAirSlice() {
+  const axis = $("#air-axis").value, frac = $("#air-pos").value;
+  const s = await api(`/api/runs/${S.run}/air-slice?axis=${axis}&frac=${frac}`);
+  const dec = (b, T) => { const bin = atob(b), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new T(u.buffer); };
+  Object.assign(s, { speed: dec(s.speed, Float32Array), vu: dec(s.vu, Float32Array), vv: dec(s.vv, Float32Array), solid: dec(s.solid, Uint8Array) });
+  viewer.setAirSlice(s, s.p98);
+  $("#air-pos-label").textContent = `${"xyz"[axis]} = ${s.position.toFixed(2)} m`;
+  const w = S.analysis?.air_dust;
+  legend(`air speed (m/s), time mean ${w ? `${fmt(w.mean_from_s)}–${fmt(w.window_s[1])} s` : ""}`, 0, s.p98);
+}
+$("#air-axis").onchange = $("#air-pos").oninput = () => {
+  clearTimeout(showAirSlice.t); showAirSlice.t = setTimeout(() => showAirSlice().catch(e => showError(e.message)), 120);
+};
+
+function renderAirDust(d) {
+  const faces = ["-x", "+x", "-y", "+y", "-z", "+z"];
+  const tin = faces.reduce((s, f) => s + d.air_in_m3_s[f], 0);
+  const sizes = Object.keys(d.dust_fate);
+  const pct = x => `${(100 * x).toFixed(1)}%`;
+  // parts that caught at least 0.5% of some size; the rest are summed as "other parts"
+  const parts = [...new Set(sizes.flatMap(k => Object.entries(d.dust_fate[k].deposited).filter(([, x]) => x >= 0.005).map(([p]) => p)))];
+  sizes.forEach(k => { const dep = d.dust_fate[k].deposited;
+    dep["other parts"] = Object.entries(dep).filter(([p]) => p !== "other parts" && !parts.includes(p)).reduce((s, [, x]) => s + x, 0); });
+  if (sizes.some(k => d.dust_fate[k].deposited["other parts"] > 0)) parts.push("other parts");
+  const escF = [...new Set(sizes.flatMap(k => Object.keys(d.dust_fate[k].escaped)))];
+  $("#air-out").innerHTML = `<h3>Dust &amp; air — ${fmt(d.window_s[0])}–${fmt(d.window_s[1])} s (air mean from ${fmt(d.mean_from_s)} s)</h3>
+    <p class="msg">Air drawn in by the grains: <b>${fmt(tin)} m³/s</b> (${fmt(tin * 3600)} m³/h); fastest mean air ${fmt(d.max_mean_air_speed_m_s)} m/s.
+      ${d.cell_m * 100 | 0} cm air cells over ${d.box_size_m.map(fmt).join(" × ")} m.</p>
+    <table class="tbl"><tr><th>box side</th><th>air in (m³/s)</th><th>air out (m³/s)</th></tr>` +
+    faces.map(f => `<tr><td>${f}</td><td class="num">${fmt(d.air_in_m3_s[f])}</td><td class="num">${fmt(d.air_out_m3_s[f])}</td></tr>`).join("") +
+    `</table><div style="overflow-x:auto"><table class="tbl" style="margin-top:8px"><tr><th>dust size</th><th>airborne</th>` +
+    parts.map(p => `<th>on ${p}</th>`).join("") + escF.map(f => `<th>out ${f}</th>`).join("") + "</tr>" +
+    sizes.map((k, c) => { const f = d.dust_fate[k];
+      return `<tr><td><span class="swatch" style="background:rgb(${DUST_COLOURS[c].map(x => x * 255 | 0)})"></span>${k.replace("um", " µm")}</td><td class="num">${pct(f.airborne)}</td>` +
+        parts.map(p => `<td class="num">${pct(f.deposited[p] || 0)}</td>`).join("") +
+        escF.map(e => `<td class="num">${pct(f.escaped[e] || 0)}</td>`).join("") + "</tr>"; }).join("") +
+    `</table></div><p class="msg">Dust released where grains lose energy (impacts, sliding): ${fmt(d.dissipated_kJ)} kJ over the window.
+      Shares are the result; masses would need a measured emission factor. ${d.caveats.map(c => "• " + c).join(" ")}</p>`;
 }
 
 function percentile(a, q) { if (!a.length) return 0; const s = Float32Array.from(a).sort(); return s[Math.floor(q * (s.length - 1))]; }
@@ -578,7 +633,10 @@ document.querySelectorAll("[data-analyze]").forEach(b => b.onclick = async () =>
     const wait = async () => {
       const a = await api(`/api/runs/${S.run}/analysis`);
       if (a.running) return setTimeout(wait, 1000);
-      msg.textContent = "done"; S.analysis = a; renderAnalysis();
+      const log = a.logs?.[`${b.dataset.analyze}.log`] || "";
+      if (/Traceback|Error/.test(log)) { msg.className = "msg err"; msg.textContent = "failed: " + log.trim().split("\n").at(-1); }
+      else { msg.className = "msg ok"; msg.textContent = "done"; }
+      S.analysis = a; renderAnalysis();
     };
     wait();
   } catch (e) { msg.className = "msg err"; msg.textContent = e.message; }
@@ -627,13 +685,23 @@ function renderAnalysis() {
     $("#regions-out").innerHTML = `<h3>Regions — mean over ${fmt(rows[0][0])}–${fmt(rows.at(-1)[0])} s</h3><table class="tbl"><tr><th>region</th><th>mass (kg)</th><th>speed (m/s)</th></tr>` +
       Array.from({ length: (h.length - 1) / 2 }, (_, k) => `<tr><td>${h[1 + 2 * k].replace(/_kg$/, "")}</td><td class="num">${fmt(mean(1 + 2 * k))}</td><td class="num">${fmt(mean(2 + 2 * k))}</td></tr>`).join("") + "</table>";
   }
+  if (a.air_dust) renderAirDust(a.air_dust); else $("#air-out").innerHTML = "";
   refreshColouring();
+  if (S.frames?.length) showDust(S.frames[S.frameIdx]);
 }
 
 $("#colour-by").onchange = refreshColouring;
 function refreshColouring() {
   const key = $("#colour-by").value;
   if (S.tab !== "results") return;
+  $("#air-controls").hidden = key !== "air";
+  if (key !== "air") viewer.clearAirSlice();
+  if (key === "air") {
+    viewer.clearWallMap();
+    if (!S.analysis?.air_dust) { $("#legend").hidden = false; $("#legend").innerHTML = "Run <b>Dust &amp; air</b> first."; return; }
+    showAirSlice().catch(e => showError(e.message));
+    return;
+  }
   if (key === "speed") {
     viewer.clearWallMap();
     if (S.lastSpeed) legend("speed (m/s)", 0, S.speedMax || 1);

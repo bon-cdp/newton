@@ -22,6 +22,7 @@ loads    Wall loads recomputed from each frame: every grain's contact with every
          impact loads are sampled, not integrated.
 flows    Mass through planes (the scenario's flow planes, or --plane), per frame.
 regions  Mass and mean speed in the scenario's regions, per frame.
+dust     Air drawn along by the grains and dust carried by it (dem_air.py).
 
 Frames written since spin was added to the output carry it; older frames analyse with
 zero spin (affects sliding speed, i.e. wear, only).
@@ -426,7 +427,7 @@ def regions(run, t0=None, t1=None, out_dir=None, quiet=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run")
-    ap.add_argument("what", choices=["loads", "flows", "regions"])
+    ap.add_argument("what", choices=["loads", "flows", "regions", "dust"])
     ap.add_argument("--window", type=float, nargs=2, default=None)
     ap.add_argument("--scenario", default=None, help="scenario JSON if run.json lacks one")
     ap.add_argument("--plane", nargs=9, action="append", default=None,
@@ -442,6 +443,9 @@ def main():
             planes = [FlowPlane(p[0], int(p[1]), float(p[2]), [float(x) for x in p[3:6]],
                                 [float(x) for x in p[6:9]]) for p in args.plane]
         flows(run, planes, t0, t1)
+    elif args.what == "dust":
+        from dem_air import air_dust          # air entrainment and dust (one-way)
+        air_dust(run, t0, t1)
     else:
         regions(run, t0, t1)
 
