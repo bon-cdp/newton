@@ -30,7 +30,7 @@ while true; do
   $PY calibration/soybean_bucket/calibrate.py --tag $tag --runs $runs --jobs 1 --set $sets 2>&1 | grep -v -i deprecat
   for r in $runs; do
     for d in runs/calib/$tag/*/$r; do
-      if [ -d $d/out ] && ls $d/out/frame_0000_particles.vtk > /dev/null 2>&1 && [ ! -f $d/frames.json ]; then
+      if [ -d $d/out ] && ls $d/out/frame_*_particles.vtk > /dev/null 2>&1 && [ ! -f $d/frames.json ]; then
         (cd calibration/soybean_bucket && $CV render.py $VID ../../$d --video | tail -1)
       fi
     done
