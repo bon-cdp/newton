@@ -64,6 +64,43 @@ project venv has neither, so they run in the throwaway venv `runs/perf/vtkcheck`
 The first second after opening is not a fair comparison: the towel takes ~1 s to clear
 (the band occupancy ramps up), while the simulated plug vanishes at once.
 
+## Results (2026-10-02/03, reference preset)
+
+1. **`rot_damp` must be 0 for small grains.** The default 0.2 (BFA corn's RotatingR) is about
+   1400× the rolling-friction torque for a 5 mm grain rolling at 0.5 m/s. Grains could not
+   roll at all, so rolling friction did nothing and beans stopped dead on the belt.
+2. **Spheres cannot fit two fill levels.**
+   - The real residual barely depends on the fill: 604 / 642 / 588 g.
+   - Spheres need grain rolling friction ≈ 0.2 for run 1 (916 g) but ≈ 0.14 for run 4
+     (1326 g).
+   - Spheres also creep out of the crater after the real flow has stopped.
+3. **2-sphere clumps (`soy2`) fit both fill levels with one parameter set.**
+   - Settings: grain rolling friction 0.02, wall rolling friction 0.02, restitution 0.7,
+     sliding friction 0.35.
+   - The flow stops like the real one does.
+
+| grain | run | residual g (meas) | t90 s (meas) | curve rms g | notes |
+|---|---|---|---|---|---|
+| sphere μr 0.17 | 1 fit | 577 (604) | 3.9 (4.3) | 26 | creeps |
+| sphere μr 0.17 | 4 fit | 632 (588) | 11.8 (7.0) | 67 | creeps |
+| **soy2 μr 0.02** | 1 fit | **603 (604)** | 4.1 (4.3) | 21 | |
+| **soy2 μr 0.02** | 4 fit | **599 (588)** | 8.2 (7.0) | 27 | |
+| **soy2 μr 0.02** | 3 test | 594 (642) | 8.3 (9.2) | 52 | pile 60 vs 60 mm |
+| **soy2 μr 0.02** | 2 test | 921 (850) | – | – | chokes at ~6.0 s vs 5.6 s; 630 vs 710 g out |
+
+The real residuals scatter ±4% between nominally similar runs, and run 3 is the high one.
+
+**Open items:**
+
+- **Belt carpet is too narrow.** r50 is 120–160 mm against 220–300 mm in the video.
+- **The heap is taller than in the video** in runs 1 and 4.
+- **The opening is too fast.** The simulated plug vanishes at once, but the towel takes
+  ~1 s to clear, so the first second runs fast.
+
+Clumps: `granular_clumps.py` (solver), `dem_clumps.py` (fill-once runner) and
+`test_clumps.py` at the repository root. `make_bucket.py` `CLUMPS` holds the shapes, which are
+selected with `--set clump=soy2`.
+
 ## Running
 
 ```bash
