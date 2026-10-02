@@ -140,11 +140,12 @@ def pile(ckpt, h, radius):
     z = np.load(ckpt)
     act = (z["flags"] & 1).astype(bool)
     q = z["q"][act]
+    still = np.linalg.norm(z["qd"][act][:, :3], axis=1) < 0.05   # not grains still falling
     hole = json.load(open(os.path.join(HERE, "hole_contour.json")))
     c = np.asarray(hole["contour_mm"]).mean(axis=0) * 1e-3
     on_belt = q[:, 1] < h - 4.0 * radius          # not grains hanging in the hole
     rr = np.hypot(q[:, 0] - c[0], q[:, 2] - c[1])
-    core = on_belt & (rr < 0.02)
+    core = on_belt & still & (rr < 0.02)
     apex = float(q[core, 1].max() + radius) if core.any() else 0.0
     return dict(pile_apex_mm=round(apex * 1e3, 1),
                 pile_r90_mm=round(float(np.percentile(rr[on_belt], 90)) * 1e3, 1)
@@ -175,7 +176,26 @@ if __name__ == "__main__":
     ap.add_argument("--set", nargs="*", help="fixed key=value overrides")
     ap.add_argument("--grid", nargs="*", help="key=v1,v2,... (full factorial)")
     ap.add_argument("--jobs", type=int, default=3)
+    ap.add_argument("--summary", action="store_true",
+                    help="re-score every saved run under runs/calib/<tag> with the current metrics")
     a = ap.parse_args()
+    if a.summary:
+        import glob
+        for f in sorted(glob.glob(os.path.join(ROOT, "runs", "calib", a.tag, "*", "run*", "result.json"))):
+            res = json.load(open(f))
+            d = os.path.dirname(f)
+            r = load_runs()["runs"][res["run"]]
+            sc = json.load(open(os.path.join(d, "scenario.json")))
+            p = sc["notes"]["params"]
+            gm = 4.0 / 3.0 * np.pi * p["radius"] ** 3 * p["density"]
+            obs = observables(os.path.join(d, "out", "history.csv"), p["t_open"], gm)
+            obs.update(compare_curve(obs, res["run"]))
+            obs.update(pile(os.path.join(d, "out", "checkpoint.npz"), r["drop_mm"] * 1e-3, p["radius"]))
+            res["sim"], res["meas"] = obs, measured(r, res["run"])
+            json.dump(res, open(f, "w"))
+            print(summary_line(res) + f"  pile {obs.get('pile_apex_mm', 0):.0f} mm r90 "
+                  f"{obs.get('pile_r90_mm', 0):.0f} mm")
+        sys.exit(0)
     fixed = parse_set(a.set)
     axes = [(g.split("=")[0], [parse_set([f"x={v}"])["x"] for v in g.split("=")[1].split(",")])
             for g in (a.grid or [])]
