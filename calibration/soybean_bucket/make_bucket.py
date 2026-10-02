@@ -48,6 +48,19 @@ DEFAULTS = dict(
 )
 MATERIAL_KEYS = {f for f in Material.__dataclass_fields__}
 
+# Multi-sphere soybean shapes (dem_clumps.py / granular_clumps.py, issue #10), selected with
+# the "clump" parameter.  Soybeans are near-ellipsoids ~6 x 5.3 x 4.8 mm for this size;
+# the video measured 5.0-5.4 mm projected.  Offsets and radii in mm.
+CLUMPS = {
+    # two spheres along the long axis: 6.1 x 4.9 x 4.9 mm (aspect 1.24)
+    "soy2": {"offsets_mm": [[-0.6, 0, 0], [0.6, 0, 0]], "radii_mm": [2.45, 2.45]},
+    # flatter, longer: 6.4 x 4.6 x 4.6 mm (aspect 1.39)
+    "soy2b": {"offsets_mm": [[-0.9, 0, 0], [0.9, 0, 0]], "radii_mm": [2.3, 2.3]},
+    # triaxial: 4 spheres in a flat rhombus, ~6.2 x 5.4 x 4.6 mm
+    "soy4": {"offsets_mm": [[-0.8, 0, 0], [0.8, 0, 0], [0, 0.4, 0], [0, -0.4, 0]],
+             "radii_mm": [2.3, 2.3, 2.3, 2.3]},
+}
+
 
 def load_runs():
     return json.load(open(os.path.join(HERE, "runs.json")))
@@ -159,6 +172,12 @@ def make(run_id, out_dir, params=None):
         output=Output(duration=p["t_open"] + p["discharge_s"], fps=p["fps"], vtk=bool(p["vtk"])),
         notes=dict(run=run_id, params=p, measured=r),
     )
+    if p.get("clump"):
+        # dem_clumps.py: the fill is placed at t = 0 as a lattice of clumps in the bucket
+        sc.notes["clump"] = CLUMPS[p["clump"]]
+        sc.notes["fill"] = {"shape": "cylinder", "center": [0.0, 0.0], "radius": R_BUCKET,
+                            "y0": h, "mass": m0, "clearance": 0.0015}
+        sc.domain_lo = [-0.8, -0.15, -0.8]     # bodies falling off the belt are retired here
     path = os.path.join(out_dir, "scenario.json")
     sc.save(path)
     return path

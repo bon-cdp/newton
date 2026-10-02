@@ -1,0 +1,25 @@
+{
+  "_comment": "Soybean, calibrated on the bucket-discharge bench tests (README.md, issue #16). 'material' is a dem_scenario.Material; 'parts' gives the Coulomb friction used for each surface. Fitted on run 1 (reference preset), validated on runs 4 (fit), 3 and 2 (held out) -- see validation in README.md.",
+  "material": {
+    "name": "soybean",
+    "radius": 0.0025,
+    "density": 1200.0,
+    "youngs": 1.0e8,
+    "poisson": 0.35,
+    "restitution": 0.7,
+    "friction": 0.35,
+    "rolling_friction": 0.2,
+    "wall_rolling_friction": 0.02,
+    "rot_damp": 0.0,
+    "rot_damp_wall": 0.0,
+    "tangential_ratio": 1.0,
+    "contact": "hertz"
+  },
+  "parts": {
+    "galvanised_steel": {"friction": 0.30},
+    "rubber_belt": {"friction": 0.50}
+  },
+  "solver": "reference preset (youngs_divisor 1, neighbor_every 0)",
+  "fitted": ["rolling_friction", "wall_rolling_friction", "restitution", "rot_damp (0: it suppresses rolling entirely for 5 mm grains)"],
+  "not_identified": ["friction (grain-grain sliding: weak -- 0.6 with rolling 0.03 left 517 g vs 502 g at 0.35 with rolling 0.05; not swept at rolling 0.2)", "steel wall friction (0.3 vs 0.5: no effect)", "youngs (taken from literature)"]
+}
