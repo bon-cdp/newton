@@ -1,0 +1,18 @@
+{
+  "description": "Soybean bucket-discharge tests, 2026-10-02.  Galvanised cylindrical bucket 190 mm dia x 240 mm tall, drilled bottom hole (~33 mm equivalent, see hole_contour.json), plugged with paper towel which is pulled at t_open.  Grains fall onto a conveyor belt (rubber) at drop_mm below the bucket bottom.  Masses in g are bucket contents (scale).  Video times are seconds of video time, read from 0.25-0.4 s crop strips (+-0.15 s).  Camera ~210 mm from the bucket, handheld.",
+  "grain_mm": 5.0,
+  "grain_mm_measured_from_video": "5.0-5.4 (median blob 25 px at 0.208 mm/px, run3/run4 falling stream)",
+  "runs": {
+    "run1": {"video": "run1.MOV", "fps": 29.98, "m0_g": 916.0, "m_end_g": 604.0, "drop_mm": 75,
+             "t_open": 2.9, "t_steady_end": 6.6, "t_last": 9.8, "choked": false},
+    "run2": {"video": "run2.MOV", "fps": 29.98, "m0_g": 1560.0, "m_end_g": 850.0, "drop_mm": 55,
+             "t_open": 3.0, "t_choke": 8.6, "choked": true,
+             "note": "pile on the belt grew up to the bucket bottom and stopped the flow"},
+    "run3": {"video": "run3.mov", "fps": 120.0, "m0_g": 1502.0, "m_end_g": 641.6, "drop_mm": 115,
+             "t_open": 5.8, "t_steady_end": 15.2, "t_last": 22.0, "choked": false,
+             "note": "recorded in slow-motion mode; the file is 120 fps with real-time timestamps (flow rate agrees with runs 1 and 4)"},
+    "run4": {"video": "run4.MOV", "fps": 29.98, "m0_g": 1326.0, "m_end_g": 588.4, "drop_mm": 123,
+             "t_open": 3.1, "t_steady_end": 11.6, "t_last": 16.7, "choked": false}
+  },
+  "split": {"fit": ["run1", "run4"], "test": ["run3", "run2"]}
+}
