@@ -221,6 +221,77 @@ def track(path, step=1, scale=0.5):
     return out, fps
 
 
+def rotvec_to_R(rv):
+    th = np.linalg.norm(rv)
+    if th < 1e-12:
+        return np.eye(3)
+    k = rv / th
+    Kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(th) * Kx + (1 - np.cos(th)) * Kx @ Kx
+
+
+def refine(im, R_track, C0):
+    """Re-fit the pose to the bucket silhouette in this frame, starting from the tracked
+    pose: a small rotation correction (rotvec, camera frame) and a camera offset.
+    Returns (rotvec, dC, rms px, n features) or None if the bucket is not usable."""
+    try:
+        mask = segment_bucket(im)
+        bottom, lr = outline(mask)
+    except Exception:
+        return None
+    if len(bottom) < 30:
+        return None
+    if not len(lr):
+        lr = np.zeros((0, 3))
+
+    def resid(q):
+        R = rotvec_to_R(q[:3]) @ R_track
+        yb, xl, xr = model_outline(R, C0 + q[3:], bottom[:, 0], lr[:, 0])
+        r = np.concatenate([yb - bottom[:, 1], xl - lr[:, 1], xr - lr[:, 2]])
+        return np.nan_to_num(r, nan=200.0)
+
+    s = least_squares(resid, np.zeros(6), x_scale=[0.01, 0.01, 0.01, 0.005, 0.005, 0.005],
+                      loss="soft_l1", f_scale=5.0)
+    r = resid(s.x)
+    return s.x[:3], s.x[3:], float(np.sqrt(np.mean(r ** 2))), len(bottom) + len(lr)
+
+
+def keyframe_corrections(path, tt, poses, C0, every=0.5, max_rms=12.0):
+    """Corrections at keyframes every `every` s where the bucket outline fits well."""
+    cap = cv2.VideoCapture(path)
+    keys = []
+    for tq in np.arange(0.0, tt[-1], every):
+        i = int(np.argmin(np.abs(tt - tq)))
+        cap.set(cv2.CAP_PROP_POS_MSEC, tt[i] * 1000)
+        ok, im = cap.read()
+        if not ok:
+            continue
+        res = refine(im, poses[i], C0)
+        if res is None:
+            continue
+        rv, dc, rms, n = res
+        if rms < max_rms and np.linalg.norm(dc) < 0.08 and np.linalg.norm(rv) < np.radians(4.0):
+            keys.append((tt[i], rv, dc, rms))
+    return keys
+
+
+def apply_corrections(tt, poses, C0, keys):
+    """Per-frame (R, C): tracked rotation with the keyframe corrections interpolated
+    linearly in time (held constant before the first / after the last keyframe)."""
+    if not keys:
+        return [R for R in poses], [C0.copy() for _ in poses]
+    kt = np.array([k[0] for k in keys])
+    krv = np.array([k[1] for k in keys])
+    kdc = np.array([k[2] for k in keys])
+    Rs, Cs = [], []
+    for t, R in zip(tt, poses):
+        rv = np.array([np.interp(t, kt, krv[:, j]) for j in range(3)])
+        dc = np.array([np.interp(t, kt, kdc[:, j]) for j in range(3)])
+        Rs.append(rotvec_to_R(rv) @ R)
+        Cs.append(C0 + dc)
+    return Rs, Cs
+
+
 def main():
     vdir = sys.argv[1]
     want = sys.argv[2:] or ["run1", "run2", "run3", "run4"]
@@ -241,11 +312,22 @@ def main():
         tt = np.array([t for t, _ in frames])
         iref = int(np.argmin(np.abs(tt - REF_T[rid])))
         dref = frames[iref][1]
-        poses = [(t, (dR @ dref.T @ R0)) for t, dR in frames]
+        tracked = [dR @ dref.T @ R0 for _, dR in frames]
+        keys = keyframe_corrections(path, tt, tracked, C0)
+        Rs, Cs = apply_corrections(tt, tracked, C0, keys)
+        poses = list(zip(tt, Rs))
+        print(f"{rid}: {len(keys)} keyframe re-fits, rms {np.median([k[3] for k in keys]) if keys else 0:.1f} px "
+              f"(median), camera offset up to {max([np.linalg.norm(k[2]) for k in keys] or [0])*1e3:.0f} mm, "
+              f"rotation correction up to {np.degrees(max([np.linalg.norm(k[1]) for k in keys] or [0])):.2f} deg",
+              flush=True)
         json.dump(dict(run=rid, f_px=F_PX, size=[W, H], ref_t=REF_T[rid], ref_rms_px=rms,
                        ref_params=p.tolist(), C=C0.tolist(), fps=fps,
+                       keyframes=[dict(t=round(float(k[0]), 3), rms_px=round(k[3], 2),
+                                       rotvec=np.round(k[1], 6).tolist(),
+                                       dC=np.round(k[2], 5).tolist()) for k in keys],
                        t=[round(t, 4) for t, _ in poses],
-                       R=[np.round(Rt, 6).tolist() for _, Rt in poses]),
+                       R=[np.round(Rt, 6).tolist() for _, Rt in poses],
+                       Cs=[np.round(c, 5).tolist() for c in Cs]),
                   open(os.path.join(HERE, f"camera_{rid}.json"), "w"))
         # check image: bucket outline drawn at several times
         tiles = []
@@ -253,13 +335,13 @@ def main():
             i = int(np.argmin(np.abs(tt - tq)))
             cap.set(cv2.CAP_PROP_POS_MSEC, tt[i] * 1000)
             ok, fr = cap.read()
-            uv, z = project(BUCKET, poses[i][1], C0)
+            uv, z = project(BUCKET, poses[i][1], Cs[i])
             for u, v in uv[z > 0][::7].astype(int):
                 if 0 <= u < W and 0 <= v < H:
-                    fr[v, u] = (0, 0, 255)
+                    cv2.circle(fr, (u, v), 2, (0, 0, 255), -1)
             belt = np.array([[x, -r["drop_mm"] * 1e-3, zz] for x in np.linspace(-.3, .3, 13)
                              for zz in np.linspace(-.1, .3, 9)])
-            uvb, zb = project(belt, poses[i][1], C0)
+            uvb, zb = project(belt, poses[i][1], Cs[i])
             for u, v in uvb[zb > 0].astype(int):
                 cv2.circle(fr, (u, v), 4, (255, 0, 0), -1)
             cv2.putText(fr, f"{rid} t={tt[i]:.1f}", (30, 60), 0, 1.5, (0, 0, 255), 3)

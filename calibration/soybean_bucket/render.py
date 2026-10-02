@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 
 import camera as cam
-from measure_flow import BAND          # the same band as the occupancy curves
+from measure_flow import FLOW_RUNS, band_px, camera_track, pose_at   # same band and poses
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BEAN_BGR = (90, 170, 215)
@@ -118,10 +118,7 @@ def main():
     radius, t_open_sim, fps_sim = p["radius"], p["t_open"], p["fps"]
     h = meas["drop_mm"] * 1e-3
     frames = sorted(glob.glob(os.path.join(a.rundir, "out", "frame_*_particles.vtk")))
-    C = np.array(camj["C"])
-    Rs = [np.array(R) for R in camj["R"]]
-    tv = np.array(camj["t"])
-    y0, y1, x0, x1 = [4 * v for v in BAND[run_id]] if run_id in BAND else (0, 0, 0, 0)
+    track = camera_track(run_id)
 
     cap = cv2.VideoCapture(os.path.join(a.videos, meas["video"]))
     fps_v = cap.get(cv2.CAP_PROP_FPS)
@@ -145,8 +142,7 @@ def main():
         fi = int(round(ts * fps_sim))
         if ts < t_open_sim - 0.5 or fi >= len(frames):
             continue
-        i = min(int(np.searchsorted(tv, t)), len(Rs) - 1)
-        R = Rs[i]
+        R, C = pose_at(track, t)
         P = read_points(frames[fi])
         P[:, 1] -= h                                   # sim (belt at 0) -> camera world
         inside = (np.hypot(P[:, 0], P[:, 2]) < cam.R_B + 0.002) & (P[:, 1] > -0.002)
@@ -156,6 +152,7 @@ def main():
         uva, _ = cam.project(np.array([[0.0, -h, 0.0]]), R, C)
         ua, va = int(uva[0, 0]), int(min(uva[0, 1], cam.H - 1))
         cols = (max(ua - 40, 0), min(ua + 40, cam.W))
+        y0, y1, x0, x1 = band_px(h, R, C) if run_id in FLOW_RUNS else (0, 0, 0, 0)
         row = dict(t_video=round(t, 3), t_since_open=round(t - meas["t_open"], 3))
         if y1 > y0:
             row["band_video"] = round(float((vid[y0:y1, x0:x1] > 0).mean()), 4)
@@ -184,6 +181,30 @@ def main():
         writer.release()
     json.dump(rows, open(os.path.join(a.rundir, "frames.json"), "w"))
     print(f"{run_id}: {len(rows)} frames compared -> {a.rundir}/frames.json")
+    print(summarize(rows))
+
+
+def r_half(cov):
+    """Radius (mm) where belt coverage first falls below 50%."""
+    for k, c in enumerate(cov):
+        if c is not None and c < 0.5:
+            return float(RADII[k] * 1e3)
+    return float(RADII[-1] * 1e3)
+
+
+def summarize(rows):
+    cov = [r for r in rows if "cover_video" in r]
+    last = rows[int(0.75 * len(rows)):]
+    out = dict(
+        r50_video_mm=r_half(cov[-1]["cover_video"]), r50_sim_mm=r_half(cov[-1]["cover_sim"]),
+        pile_video_mm=float(np.median([r["pile_video_mm"] for r in last])),
+        pile_sim_mm=float(np.median([r["pile_sim_mm"] for r in last])))
+    b = [(r["band_video"], r["band_sim"]) for r in rows if "band_video" in r and r["t_since_open"] > 1.0]
+    if b:
+        b = np.array(b)
+        out["band_rms"] = float(np.sqrt(np.mean((b[:, 0] - b[:, 1]) ** 2)))
+        out["band_mean_video"], out["band_mean_sim"] = float(b[:, 0].mean()), float(b[:, 1].mean())
+    return {k: round(v, 3) for k, v in out.items()}
 
 
 if __name__ == "__main__":
