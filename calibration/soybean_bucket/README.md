@@ -90,6 +90,24 @@ The first second after opening is not a fair comparison: the towel takes ~1 s to
 
 The real residuals scatter ±4% between nominally similar runs, and run 3 is the high one.
 
+4. **Spread on the belt comes from bounciness, not rolling.**
+   - Clumps barely roll on the belt, so belt rolling friction 0.02 → 0.005 changed nothing.
+   - Restitution 0.85 widened the carpet (r50 120 → 160 mm on run 1) and lowered the heap
+     to the video's height (34 vs 35 mm).
+   - The **final set** is in `soybean_material.json` (`soy2`, restitution 0.85, grain rolling
+     0.025, wall rolling 0.01):
+
+| run | residual g (meas) | t90 s (meas) | curve rms g | pile mm (video) | r50 mm (video) |
+|---|---|---|---|---|---|
+| 1 fit | 601 (604) | 4.3 (4.3) | 17 | 31 (35) | 160 (220) |
+| 4 fit | 615 (588) | 8.5 (7.0) | 33 | 32 (44) | 220 (260) |
+| 3 test | 604 (642) | 8.3 (9.2) | 48 | 52 (60) | 200 (300) |
+| 2 test | 896 (850), chokes at ~6 s vs 5.6 s | – | – | 55 (51) | 140 (260) |
+
+Every residual is within 6%. The heap and spread differences are a few mm and tens of mm.
+Side-by-side videos (footage | simulation, same camera) are in
+`runs/calib/final/<point>/<run>/compare.mp4`.
+
 **Open items:**
 
 - **Belt carpet is too narrow.** r50 is 120–160 mm against 220–300 mm in the video.

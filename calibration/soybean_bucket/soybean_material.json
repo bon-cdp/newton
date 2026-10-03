@@ -1,25 +1,38 @@
 {
-  "_comment": "Soybean, calibrated on the bucket-discharge bench tests (README.md, issue #16). 'material' is a dem_scenario.Material; 'parts' gives the Coulomb friction used for each surface. Fitted on run 1 (reference preset), validated on runs 4 (fit), 3 and 2 (held out) -- see validation in README.md.",
+  "_comment": "Soybean calibrated on the bucket-discharge bench tests (README.md, issue #16). Fit on runs 1 and 4, tested on runs 3 and 2, all with the reference preset. 'material' is a dem_scenario.Material, 'clump' the multi-sphere grain shape (granular_clumps.py / dem_clumps.py), and 'parts' the Coulomb friction for each surface.",
   "material": {
     "name": "soybean",
-    "radius": 0.0025,
+    "radius": 0.00245,
     "density": 1200.0,
     "youngs": 1.0e8,
     "poisson": 0.35,
-    "restitution": 0.7,
+    "restitution": 0.85,
     "friction": 0.35,
-    "rolling_friction": 0.2,
-    "wall_rolling_friction": 0.02,
+    "rolling_friction": 0.025,
+    "wall_rolling_friction": 0.01,
     "rot_damp": 0.0,
     "rot_damp_wall": 0.0,
     "tangential_ratio": 1.0,
     "contact": "hertz"
+  },
+  "clump": {
+    "name": "soy2",
+    "offsets_mm": [[-0.6, 0, 0], [0.6, 0, 0]],
+    "radii_mm": [2.45, 2.45],
+    "extents_mm": [6.1, 4.9, 4.9],
+    "volume_equivalent_diameter_mm": 5.43,
+    "mass_g": 0.1006
   },
   "parts": {
     "galvanised_steel": {"friction": 0.30},
     "rubber_belt": {"friction": 0.50}
   },
   "solver": "reference preset (youngs_divisor 1, neighbor_every 0)",
-  "fitted": ["rolling_friction", "wall_rolling_friction", "restitution", "rot_damp (0: it suppresses rolling entirely for 5 mm grains)"],
-  "not_identified": ["friction (grain-grain sliding: weak -- 0.6 with rolling 0.03 left 517 g vs 502 g at 0.35 with rolling 0.05; not swept at rolling 0.2)", "steel wall friction (0.3 vs 0.5: no effect)", "youngs (taken from literature)"]
+  "validation_residual_g": {"run1_fit": [601, 604], "run4_fit": [615, 588], "run3_test": [604, 642], "run2_test_choked": [896, 850]},
+  "sphere_fallback": {
+    "_comment": "Best single-sphere settings (no clumps). They cannot fit both fill levels: rolling friction 0.17 leaves 577 g / 632 g in runs 1 / 4, and the flow creeps on after the real flow stops.",
+    "radius": 0.0025, "restitution": 0.7, "rolling_friction": 0.17, "wall_rolling_friction": 0.02,
+    "rot_damp": 0.0, "rot_damp_wall": 0.0
+  },
+  "not_identified": ["friction (grain-grain sliding: weak effect)", "steel wall friction (0.3 vs 0.5: no effect)", "youngs (literature value)"]
 }
