@@ -29,6 +29,13 @@
   },
   "solver": "reference preset (youngs_divisor 1, neighbor_every 0)",
   "validation_residual_g": {"run1_fit": [601, 604], "run4_fit": [615, 588], "run3_test": [604, 642], "run2_test_choked": [896, 850]},
+  "alternative_soy2a": {
+    "_comment": "Unequal pair (2.55 + 2.30 mm spheres, 1.2 mm apart), restitution 0.8, other values as above. Preferred visually by the user (2026-10-05); residuals run ~4-12% low. Rolling friction ~0.035 should lift them (not yet run).",
+    "clump": {"offsets_mm": [[-0.6, 0, 0], [0.6, 0, 0]], "radii_mm": [2.55, 2.3]},
+    "restitution": 0.8, "rolling_friction": 0.025, "wall_rolling_friction": 0.01,
+    "validation_residual_g": {"run1_fit": [581, 604], "run4_fit": [563, 588], "run3_test": [562, 642], "run2_test_choked": [877, 850]},
+    "pile_mm_sim_vs_video": {"run1": [39, 35], "run4": [54, 44], "run3": [61, 60], "run2": [55, 51]}
+  },
   "sphere_fallback": {
     "_comment": "Best single-sphere settings (no clumps). They cannot fit both fill levels: rolling friction 0.17 leaves 577 g / 632 g in runs 1 / 4, and the flow creeps on after the real flow stops.",
     "radius": 0.0025, "restitution": 0.7, "rolling_friction": 0.17, "wall_rolling_friction": 0.02,
