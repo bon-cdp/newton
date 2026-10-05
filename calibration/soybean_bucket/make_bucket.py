@@ -54,6 +54,8 @@ MATERIAL_KEYS = {f for f in Material.__dataclass_fields__}
 CLUMPS = {
     # two spheres along the long axis: 6.1 x 4.9 x 4.9 mm (aspect 1.24)
     "soy2": {"offsets_mm": [[-0.6, 0, 0], [0.6, 0, 0]], "radii_mm": [2.45, 2.45]},
+    # unequal pair (one end slightly smaller, like a bean's germ end): 6.05 x 5.1 x 5.1 mm
+    "soy2a": {"offsets_mm": [[-0.6, 0, 0], [0.6, 0, 0]], "radii_mm": [2.55, 2.3]},
     # flatter, longer: 6.4 x 4.6 x 4.6 mm (aspect 1.39)
     "soy2b": {"offsets_mm": [[-0.9, 0, 0], [0.9, 0, 0]], "radii_mm": [2.3, 2.3]},
     # triaxial: 4 spheres in a flat rhombus, ~6.2 x 5.4 x 4.6 mm

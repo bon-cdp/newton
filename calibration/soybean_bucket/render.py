@@ -30,7 +30,7 @@ import camera as cam
 from measure_flow import FLOW_RUNS, band_px, camera_track, pose_at   # same band and poses
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BEAN_BGR = (90, 170, 215)
+BEAN_BGR = (125, 190, 228)
 
 
 def read_points(path):
@@ -51,6 +51,85 @@ def render(P, R, C, radius):
     for (u, v), r in zip(np.round(uv).astype(int), rad):
         cv2.circle(m, (int(u), int(v)), int(r), 255, -1)
     return m
+
+
+WALL_BGR = (226, 228, 228)
+BELT_BGR = (58, 58, 60)
+METAL_BGR = (150, 152, 155)
+LIGHT = np.array([-0.45, -0.65, 0.62])          # image frame (x right, y down, z to camera)
+LIGHT = LIGHT / np.linalg.norm(LIGHT)
+_SPRITES = {}
+
+
+def _sprite(r):
+    """Shaded sphere of pixel radius r: (BGR float image, alpha) -- Lambert + ambient + a
+    small specular highlight, light from the upper left."""
+    if r not in _SPRITES:
+        y, x = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float64) / max(r, 1)
+        rr = x * x + y * y
+        a = np.clip((1.0 - rr) * r, 0.0, 1.0)            # anti-aliased edge
+        z = np.sqrt(np.clip(1.0 - rr, 0.0, 1.0))
+        lam = np.clip(x * LIGHT[0] + y * LIGHT[1] + z * LIGHT[2], 0.0, 1.0)
+        spec = lam ** 24 * 0.35
+        base = np.array(BEAN_BGR, dtype=np.float64)
+        img = base[None, None, :] * (0.38 + 0.72 * lam)[..., None] + 255.0 * spec[..., None]
+        _SPRITES[r] = (np.clip(img, 0, 255), a)
+    return _SPRITES[r]
+
+
+def render_shaded(P, R, C, radius, drop):
+    """Display image of the simulation through the camera: wall, belt plane, bucket, soft
+    shadows of the grains on the belt, then the grains as shaded spheres (far to near)."""
+    img = np.empty((cam.H, cam.W, 3), np.float64)
+    img[:] = WALL_BGR
+    # belt: a 1.2 m square at y = -drop, clipped to the part in front of the camera
+    s = np.linspace(-0.6, 0.6, 25)
+    belt = np.array([[x, -drop, zz] for x in s for zz in s])
+    uvb, zb = cam.project(belt, R, C)
+    belt_mask = np.zeros((cam.H, cam.W), np.uint8)
+    ok = zb > 0.02
+    if ok.sum() > 3:
+        hull = cv2.convexHull(uvb[ok].astype(np.float32)).astype(np.int32)
+        cv2.fillConvexPoly(belt_mask, hull, 1)
+    img[belt_mask > 0] = BELT_BGR
+    # shadows: each grain darkens a soft disc straight below it on the belt
+    sh = np.zeros((cam.H, cam.W), np.float32)
+    below = P.copy()
+    below[:, 1] = -drop
+    uvs, zs = cam.project(below, R, C)
+    for (u, v), z, h in zip(uvs, zs, P[:, 1] + drop):
+        if z <= 0.02:
+            continue
+        rp = cam.F_PX * radius / z * (1.0 + 2.0 * min(h, 0.05) / 0.05)   # softer when higher
+        cv2.ellipse(sh, (int(u), int(v)), (max(1, int(rp)), max(1, int(rp * 0.45))), 0, 0, 360,
+                    0.55 / (1.0 + 20.0 * h), -1)
+    sh = cv2.GaussianBlur(np.minimum(sh, 0.6), (0, 0), 3)
+    img *= (1.0 - sh * belt_mask)[..., None]
+    # bucket silhouette
+    uvk, zk = cam.project(cam.BUCKET, R, C)
+    okk = zk > 0.02
+    if okk.sum() > 3:
+        hull = cv2.convexHull(uvk[okk].astype(np.float32)).astype(np.int32)
+        bm = np.zeros((cam.H, cam.W), np.uint8)
+        cv2.fillConvexPoly(bm, hull, 1)
+        img[bm > 0] = METAL_BGR
+    # grains, far to near
+    uv, z = cam.project(P, R, C)
+    keep = (z > 0.02) & (uv[:, 0] > -50) & (uv[:, 0] < cam.W + 50) & (uv[:, 1] > -50) & (uv[:, 1] < cam.H + 50)
+    uv, z = uv[keep], z[keep]
+    order = np.argsort(-z)
+    for (u, v), zz in zip(np.round(uv[order]).astype(int), z[order]):
+        r = max(1, int(round(cam.F_PX * radius / zz)))
+        spr, a = _sprite(r)
+        y0, x0 = v - r, u - r
+        ys, xs = max(0, -y0), max(0, -x0)
+        ye, xe = min(2 * r + 1, cam.H - y0), min(2 * r + 1, cam.W - x0)
+        if ye <= ys or xe <= xs:
+            continue
+        reg = img[y0 + ys:y0 + ye, x0 + xs:x0 + xe]
+        aa = a[ys:ye, xs:xe, None]
+        reg[:] = reg * (1.0 - aa) + spr[ys:ye, xs:xe] * aa
+    return np.clip(img, 0, 255).astype(np.uint8)
 
 
 def bean_mask(im):
@@ -165,13 +244,12 @@ def main():
         rows.append(row)
         if writer is not None:
             left = im.copy()
-            right = np.full_like(im, 235)
-            right[sim > 0] = BEAN_BGR
+            right = render_shaded(P[~inside], R, C, radius, h)
             uv, z = cam.project(outline_pts, R, C)
+            for u, v in uv[z > 0].astype(int):           # model bucket outline on the footage
+                if 0 <= u < cam.W and 0 <= v < cam.H:
+                    left[v, u] = (0, 0, 255)
             for img in (left, right):
-                for u, v in uv[z > 0].astype(int):
-                    if 0 <= u < cam.W and 0 <= v < cam.H:
-                        img[v, u] = (0, 0, 255)
                 if y1 > y0:
                     cv2.rectangle(img, (x0, y0), (x1, y1), (0, 200, 0), 2)
             cv2.putText(left, f"video {run_id}  t={t - meas['t_open']:5.2f} s", (30, 70), 0, 2, (0, 0, 255), 4)
