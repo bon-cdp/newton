@@ -41,13 +41,53 @@ def read_points(path):
     return np.frombuffer(raw, dtype=">f4", count=n * 3, offset=e + 1).reshape(n, 3).astype(np.float64)
 
 
-def render(P, R, C, radius):
-    """Mask of grains (uint8) for world points P, painter's algorithm (no colour needed)."""
+def quat_to_R(q):
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return np.stack([
+        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
+        np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
+        np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1)], -2)
+
+
+def projected_ellipses(P, Q, axes, R, C):
+    """Image ellipses of ellipsoids (centres P, orientations Q x,y,z,w, semi-axes `axes`)
+    at their own depth (weak perspective per grain): (uv, z, semi-axes px (n,2), angle deg)."""
+    Xc = (P - C) @ R.T
+    z = Xc[:, 2]
+    zz = np.maximum(z, 1e-6)
+    J = np.zeros((len(P), 2, 3))
+    J[:, 0, 0] = J[:, 1, 1] = cam.F_PX / zz
+    J[:, 0, 2] = -cam.F_PX * Xc[:, 0] / zz ** 2
+    J[:, 1, 2] = -cam.F_PX * Xc[:, 1] / zz ** 2
+    Rb = R[None] @ quat_to_R(Q)                       # body -> camera
+    Mc = Rb @ np.diag(np.asarray(axes) ** 2)[None] @ np.transpose(Rb, (0, 2, 1))
+    S = J @ Mc @ np.transpose(J, (0, 2, 1))           # (n,2,2) silhouette covariance
+    ev, evec = np.linalg.eigh(S)
+    semi = np.sqrt(np.maximum(ev, 1e-12))[:, ::-1]    # major, minor
+    ang = np.degrees(np.arctan2(evec[:, 1, 1], evec[:, 0, 1]))
+    uv = Xc[:, :2] / zz[:, None] * cam.F_PX + np.array([cam.W / 2, cam.H / 2])
+    return uv, z, semi, ang
+
+
+def _visible(uv, z):
+    return (z > 0.02) & (uv[:, 0] > -50) & (uv[:, 0] < cam.W + 50) & (uv[:, 1] > -50) & (uv[:, 1] < cam.H + 50)
+
+
+def render(P, R, C, radius, Q=None, axes=None):
+    """Mask of grains (uint8) for world points P, painter's algorithm (no colour needed).
+    With orientations Q and semi-axes, grains are the projected ellipses."""
+    m = np.zeros((cam.H, cam.W), np.uint8)
+    if Q is not None:
+        uv, z, semi, ang = projected_ellipses(P, Q, axes, R, C)
+        ok = _visible(uv, z)
+        for (u, v), (sa, sb), a in zip(np.round(uv[ok]).astype(int), semi[ok], ang[ok]):
+            cv2.ellipse(m, (int(u), int(v)), (max(1, int(round(sa))), max(1, int(round(sb)))),
+                        float(a), 0, 360, 255, -1)
+        return m
     uv, z = cam.project(P, R, C)
-    ok = (z > 0.02) & (uv[:, 0] > -50) & (uv[:, 0] < cam.W + 50) & (uv[:, 1] > -50) & (uv[:, 1] < cam.H + 50)
+    ok = _visible(uv, z)
     uv, z = uv[ok], z[ok]
     rad = np.maximum(1, np.round(cam.F_PX * radius / z)).astype(int)
-    m = np.zeros((cam.H, cam.W), np.uint8)
     for (u, v), r in zip(np.round(uv).astype(int), rad):
         cv2.circle(m, (int(u), int(v)), int(r), 255, -1)
     return m
@@ -77,7 +117,7 @@ def _sprite(r):
     return _SPRITES[r]
 
 
-def render_shaded(P, R, C, radius, drop):
+def render_shaded(P, R, C, radius, drop, Q=None, axes=None):
     """Display image of the simulation through the camera: wall, belt plane, bucket, soft
     shadows of the grains on the belt, then the grains as shaded spheres (far to near)."""
     img = np.empty((cam.H, cam.W, 3), np.float64)
@@ -114,8 +154,37 @@ def render_shaded(P, R, C, radius, drop):
         cv2.fillConvexPoly(bm, hull, 1)
         img[bm > 0] = METAL_BGR
     # grains, far to near
+    if Q is not None:
+        # ellipsoids: the shaded sphere sprite mapped affinely onto each projected ellipse
+        uv, z, semi, ang = projected_ellipses(P, Q, axes, R, C)
+        keep = _visible(uv, z)
+        uv, z, semi, ang = uv[keep], z[keep], semi[keep], ang[keep]
+        r0 = 24
+        spr0, a0 = _sprite(r0)
+        spr0 = spr0.astype(np.float32)
+        a0 = a0.astype(np.float32)
+        for k in np.argsort(-z):
+            sa, sb = semi[k]
+            hs = int(np.ceil(sa)) + 1
+            th = np.radians(ang[k])
+            Rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+            A = Rot @ np.diag([sa / r0, sb / r0])
+            Mx = np.c_[A, np.array([hs, hs]) - A @ np.array([r0, r0])].astype(np.float32)
+            size = (2 * hs + 1, 2 * hs + 1)
+            pc = cv2.warpAffine(spr0, Mx, size, flags=cv2.INTER_LINEAR, borderValue=0)
+            pa = cv2.warpAffine(a0, Mx, size, flags=cv2.INTER_LINEAR, borderValue=0)
+            u, v = int(round(uv[k, 0])), int(round(uv[k, 1]))
+            y0, x0 = v - hs, u - hs
+            ys, xs = max(0, -y0), max(0, -x0)
+            ye, xe = min(2 * hs + 1, cam.H - y0), min(2 * hs + 1, cam.W - x0)
+            if ye <= ys or xe <= xs:
+                continue
+            reg = img[y0 + ys:y0 + ye, x0 + xs:x0 + xe]
+            aa = pa[ys:ye, xs:xe, None]
+            reg[:] = reg * (1.0 - aa) + pc[ys:ye, xs:xe] * aa
+        return np.clip(img, 0, 255).astype(np.uint8)
     uv, z = cam.project(P, R, C)
-    keep = (z > 0.02) & (uv[:, 0] > -50) & (uv[:, 0] < cam.W + 50) & (uv[:, 1] > -50) & (uv[:, 1] < cam.H + 50)
+    keep = _visible(uv, z)
     uv, z = uv[keep], z[keep]
     order = np.argsort(-z)
     for (u, v), zz in zip(np.round(uv[order]).astype(int), z[order]):
@@ -195,6 +264,10 @@ def main():
     sc = json.load(open(os.path.join(a.rundir, "scenario.json")))
     p = sc["notes"]["params"]
     radius, t_open_sim, fps_sim = p["radius"], p["t_open"], p["fps"]
+    ell = sc["notes"].get("ellipsoid")
+    axes = np.asarray(ell["axes_mm"]) * 1e-3 if ell else None
+    if ell:
+        radius = float((axes.prod()) ** (1.0 / 3.0))  # shadows: volume-equivalent size
     h = meas["drop_mm"] * 1e-3
     frames = sorted(glob.glob(os.path.join(a.rundir, "out", "frame_*_particles.vtk")))
     track = camera_track(run_id)
@@ -225,7 +298,10 @@ def main():
         P = read_points(frames[fi])
         P[:, 1] -= h                                   # sim (belt at 0) -> camera world
         inside = (np.hypot(P[:, 0], P[:, 2]) < cam.R_B + 0.002) & (P[:, 1] > -0.002)
-        sim = render(P[~inside], R, C, radius)
+        Q = None
+        if ell:
+            Q = np.load(frames[fi].replace("_particles.vtk", "_quat.npy")).astype(np.float64)[~inside]
+        sim = render(P[~inside], R, C, radius, Q, axes)
         vid = bean_mask(im)
         # the hole axis column in this frame, for the pile-top window
         uva, _ = cam.project(np.array([[0.0, -h, 0.0]]), R, C)
@@ -244,7 +320,7 @@ def main():
         rows.append(row)
         if writer is not None:
             left = im.copy()
-            right = render_shaded(P[~inside], R, C, radius, h)
+            right = render_shaded(P[~inside], R, C, radius, h, Q, axes)
             uv, z = cam.project(outline_pts, R, C)
             for u, v in uv[z > 0].astype(int):           # model bucket outline on the footage
                 if 0 <= u < cam.W and 0 <= v < cam.H:

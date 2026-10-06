@@ -31,6 +31,7 @@ from bfa_replication_mpm import write_particles_vtk
 from dem_run import (clear_of_walls, load_stl, resolve_dt, surface_motion, wall_grid_cell)
 from dem_scenario import INF, Scenario, rayleigh_time
 from granular_clumps import ClumpTemplate, SolverGranularClumps, random_quats
+from granular_ellipsoids import EllipsoidShape, SolverGranularEllipsoids
 from granular_dem import build_collider, build_wall_grid
 
 
@@ -76,10 +77,17 @@ def main():
     wp.init()
     wp.set_module_options({"enable_backward": False})
 
-    cl, fill = sc.notes["clump"], sc.notes["fill"]
-    tpl = ClumpTemplate(np.asarray(cl["offsets_mm"]) * 1e-3, np.asarray(cl["radii_mm"]) * 1e-3,
-                        m.density)
-    m.radius = float(tpl.radii.min())                  # dt follows the smallest sphere
+    fill = sc.notes["fill"]
+    ell = sc.notes.get("ellipsoid")
+    if ell:
+        # one rigid ellipsoid per particle (granular_ellipsoids.py)
+        tpl = EllipsoidShape(*(np.asarray(ell["axes_mm"]) * 1e-3), m.density)
+        m.radius = float(tpl.axes.min())               # dt from the smallest semi-axis
+    else:
+        cl = sc.notes["clump"]
+        tpl = ClumpTemplate(np.asarray(cl["offsets_mm"]) * 1e-3, np.asarray(cl["radii_mm"]) * 1e-3,
+                            m.density)
+        m.radius = float(tpl.radii.min())              # dt follows the smallest sphere
     dt, substeps, youngs_eff = resolve_dt(sc)
     hertz = m.contact == "hertz"
     e = max(min(m.restitution, 0.999), 1e-4)
@@ -126,7 +134,8 @@ def main():
     wall_grid, winfo = build_wall_grid(parts, meshes, collider.lower, collider.upper, reach, cell, device)
     print(f"wall grid             {winfo['dims']} cells of {cell*1e3:.0f} mm")
 
-    solver = SolverGranularClumps(model, collider, grid_cell=2.0 * rmax, keepalive=meshes,
+    Solver = SolverGranularEllipsoids if ell else SolverGranularClumps
+    solver = Solver(model, collider, grid_cell=2.0 * rmax, keepalive=meshes,
                                   wall_grid=wall_grid,
                                   hash_dims=tuple(s.hash_dims) if s.hash_dims else None,
                                   wall_cache=s.wall_cache, rotation=True,
@@ -136,7 +145,10 @@ def main():
                                   youngs=youngs_eff, poisson=m.poisson, restitution=e)
     st = model.state()
     solver.bind_state(st)
-    solver.set_clumps(tpl, com, quats, kill_y=sc.domain_lo[1], park=park)
+    if ell:
+        solver.set_ellipsoids(tpl, com, quats, kill_y=sc.domain_lo[1], park=park)
+    else:
+        solver.set_clumps(tpl, com, quats, kill_y=sc.domain_lo[1], park=park)
 
     # graph capture of K steps (in place)
     K = max(1, min(s.graph_steps, substeps))
@@ -144,9 +156,10 @@ def main():
     if device.startswith("cuda"):
         model.particle_grid.reserve(model.particle_count)
         import granular_clumps as _gc
+        import granular_ellipsoids as _ge
         import granular_dem as _gd
         import newton._src.solvers.semi_implicit.kernels_contact as _kc
-        for _mod in (_gd, _gc, _kc):
+        for _mod in (_gd, _gc, _ge, _kc):
             wp.load_module(_mod, device=device)
 
         def capture(n):
@@ -213,6 +226,11 @@ def main():
                 write_particles_vtk(os.path.join(a.out, f"frame_{frame:04d}_particles.vtk"), frame,
                                     st.particle_q.numpy()[act], st.particle_qd.numpy()[act], rmax,
                                     spin=solver.particle_w.numpy()[act], ids=act)
+                if ell:
+                    # orientation of each written body (same order as the VTK points), so
+                    # render.py can draw the projected ellipses
+                    np.save(os.path.join(a.out, f"frame_{frame:04d}_quat.npy"),
+                            solver.clump_q.numpy()[act].astype(np.float32))
         if a.checkpoint_at is not None and not saved and frame / out.fps >= a.checkpoint_at:
             saved = True
             np.savez(os.path.join(a.out, "checkpoint.npz"), q=st.particle_q.numpy(),

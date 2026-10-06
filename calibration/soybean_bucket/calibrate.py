@@ -118,7 +118,7 @@ def run_one(tag, run_id, params, label):
     sc = make(run_id, d, p)
     t0 = time.time()
     with open(os.path.join(d, "log.txt"), "w") as log:
-        runner = "dem_clumps.py" if p.get("clump") else "dem_run.py"
+        runner = "dem_clumps.py" if (p.get("clump") or p.get("ell_a")) else "dem_run.py"
         subprocess.run([PY, "-u", os.path.join(ROOT, runner), sc, "--out",
                         os.path.join(d, "out")] + ([] if p["vtk"] else ["--no-vtk"]) + ["--checkpoint-at",
                         f"{p['t_open'] + p['discharge_s'] - 0.1:.3f}"], stdout=log, stderr=subprocess.STDOUT,

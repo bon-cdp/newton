@@ -1,0 +1,38 @@
+{
+ "run1": {
+  "far_edge_z_m": 0.563,
+  "z_spread_m": 0.0729,
+  "x_range_seen_m": [
+   -0.551,
+   0.295
+  ],
+  "n_points": 130
+ },
+ "run2": {
+  "far_edge_z_m": 4.3459,
+  "z_spread_m": 4.0031,
+  "x_range_seen_m": [
+   -1.954,
+   0.446
+  ],
+  "n_points": 32
+ },
+ "run3": {
+  "far_edge_z_m": 1.0172,
+  "z_spread_m": 1.2821,
+  "x_range_seen_m": [
+   -2.747,
+   0.422
+  ],
+  "n_points": 118
+ },
+ "run4": {
+  "far_edge_z_m": 0.4052,
+  "z_spread_m": 0.062,
+  "x_range_seen_m": [
+   -0.518,
+   0.276
+  ],
+  "n_points": 124
+ }
+}

@@ -174,9 +174,13 @@ def make(run_id, out_dir, params=None):
         output=Output(duration=p["t_open"] + p["discharge_s"], fps=p["fps"], vtk=bool(p["vtk"])),
         notes=dict(run=run_id, params=p, measured=r),
     )
-    if p.get("clump"):
-        # dem_clumps.py: the fill is placed at t = 0 as a lattice of clumps in the bucket
-        sc.notes["clump"] = CLUMPS[p["clump"]]
+    if p.get("clump") or p.get("ell_a"):
+        # dem_clumps.py: the fill is placed at t = 0 as a lattice of bodies in the bucket;
+        # ell_a/b/c (semi-axes, mm) select one rigid ellipsoid per grain instead of a clump
+        if p.get("ell_a"):
+            sc.notes["ellipsoid"] = {"axes_mm": [p["ell_a"], p["ell_b"], p["ell_c"]]}
+        else:
+            sc.notes["clump"] = CLUMPS[p["clump"]]
         sc.notes["fill"] = {"shape": "cylinder", "center": [0.0, 0.0], "radius": R_BUCKET,
                             "y0": h, "mass": m0, "clearance": 0.0015}
         sc.domain_lo = [-0.8, -0.15, -0.8]     # bodies falling off the belt are retired here
