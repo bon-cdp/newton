@@ -60,12 +60,18 @@ def axes_of(lw, wt):
     return round(a, 3), round(b, 3), round(c, 3)
 
 
+SHAPE = None          # (length/width, width/thickness) when the shape is fixed (--fix-shape)
+
+
 def params_of(x):
     d = dict(zip([s[0] for s in SPACE], x))
-    a, b, c = axes_of(d["aspect_lw"], d["aspect_wt"])
+    lw, wt = SHAPE if SHAPE else (d["aspect_lw"], d["aspect_wt"])
+    a, b, c = axes_of(lw, wt)
     p = dict(FIXED)
     p.update(ell_a=a, ell_b=b, ell_c=c, rolling_friction=round(d["rolling_friction"], 4),
              restitution=round(d["restitution"], 3))
+    if "friction" in d:
+        p["friction"] = round(d["friction"], 3)
     return p
 
 
@@ -106,7 +112,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--calls", type=int, default=24)
     ap.add_argument("--initial", type=int, default=6)
+    ap.add_argument("--tag", default="opt", help="runs/calib/<tag>, with its own log.jsonl")
+    ap.add_argument("--fix-shape", nargs=2, type=float, metavar=("LW", "WT"),
+                    help="hold length/width and width/thickness; tune rolling friction, "
+                         "restitution and grain sliding friction instead")
     a = ap.parse_args()
+    global TAG, LOG, SPACE, SHAPE
+    TAG = a.tag
+    LOG = os.path.join(ROOT, "runs", "calib", TAG, "log.jsonl")
+    start = [1.13, 1.125, 0.025, 0.8]
+    if a.fix_shape:
+        SHAPE = tuple(a.fix_shape)
+        SPACE = [("rolling_friction", 0.0, 0.10), ("restitution", 0.6, 0.95), ("friction", 0.25, 0.6)]
+        start = [0.045, 0.8, 0.35]
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     opt = Optimizer([(lo, hi) for _n, lo, hi in SPACE], base_estimator="GP", acq_func="EI",
                     n_initial_points=a.initial, initial_point_generator="lhs", random_state=0)
@@ -114,7 +132,7 @@ def main():
     for rec in done:
         opt.tell(rec["x"], rec["score"])
     # the hand-picked starting guess first (soybean-like proportions, the clump fit's values)
-    queue = [[1.13, 1.125, 0.025, 0.8]] if not done else []
+    queue = [start] if not done else []
     while len(done) < a.calls:
         x = queue.pop(0) if queue else opt.ask()
         t0 = time.time()
