@@ -61,6 +61,8 @@ def axes_of(lw, wt):
 
 
 SHAPE = None          # (length/width, width/thickness) when the shape is fixed (--fix-shape)
+FIXED_E = None        # restitution when held (--fix-restitution), e.g. chosen by eye from the
+                      # early-impact footage, which the scores above cannot see
 
 
 def params_of(x):
@@ -68,8 +70,9 @@ def params_of(x):
     lw, wt = SHAPE if SHAPE else (d["aspect_lw"], d["aspect_wt"])
     a, b, c = axes_of(lw, wt)
     p = dict(FIXED)
+    e = FIXED_E if FIXED_E is not None else d["restitution"]
     p.update(ell_a=a, ell_b=b, ell_c=c, rolling_friction=round(d["rolling_friction"], 4),
-             restitution=round(d["restitution"], 3))
+             restitution=round(e, 3))
     if "friction" in d:
         p["friction"] = round(d["friction"], 3)
     return p
@@ -116,8 +119,10 @@ def main():
     ap.add_argument("--fix-shape", nargs=2, type=float, metavar=("LW", "WT"),
                     help="hold length/width and width/thickness; tune rolling friction, "
                          "restitution and grain sliding friction instead")
+    ap.add_argument("--fix-restitution", type=float, default=None,
+                    help="hold restitution (with --fix-shape: tune rolling and sliding friction only)")
     a = ap.parse_args()
-    global TAG, LOG, SPACE, SHAPE
+    global TAG, LOG, SPACE, SHAPE, FIXED_E
     TAG = a.tag
     LOG = os.path.join(ROOT, "runs", "calib", TAG, "log.jsonl")
     start = [1.13, 1.125, 0.025, 0.8]
@@ -125,6 +130,10 @@ def main():
         SHAPE = tuple(a.fix_shape)
         SPACE = [("rolling_friction", 0.0, 0.10), ("restitution", 0.6, 0.95), ("friction", 0.25, 0.6)]
         start = [0.045, 0.8, 0.35]
+        if a.fix_restitution is not None:
+            FIXED_E = a.fix_restitution
+            SPACE = [("rolling_friction", 0.0, 0.10), ("friction", 0.2, 0.6)]
+            start = [0.05, 0.30]
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     opt = Optimizer([(lo, hi) for _n, lo, hi in SPACE], base_estimator="GP", acq_func="EI",
                     n_initial_points=a.initial, initial_point_generator="lhs", random_state=0)

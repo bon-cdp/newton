@@ -230,6 +230,44 @@ def pile_top_mm(mask, R, C, drop, cols, y_floor):
     return float((y + drop) * 1e3)
 
 
+HEAP_X_MM = (-60.0, -40.0, -25.0, 25.0, 40.0, 60.0)
+
+
+def heap_profile_mm(mask, R, C, drop, xs_mm=HEAP_X_MM, half_px=6):
+    """Heap height (mm) beside the stream: at each lateral offset x (in the vertical plane
+    through the axis, facing the camera) the contiguous stack of grain pixels that RESTS ON
+    THE BELT -- a block that does not reach down to the projected belt line is a falling
+    stream or airborne grains and counts as 0.  Same pixels for footage and simulation."""
+    out = []
+    for xm in xs_mm:
+        uvb, zb = cam.project(np.array([[xm * 1e-3, -drop, 0.0]]), R, C)
+        u, vb = int(round(uvb[0, 0])), int(round(uvb[0, 1]))
+        if zb[0] <= 0 or not (half_px <= u < cam.W - half_px) or not (0 < vb < cam.H):
+            out.append(None)
+            continue
+        col = mask[:vb + 1, u - half_px:u + half_px + 1] > 0
+        cov = col.mean(axis=1) > 0.5
+        top = vb
+        gap = 0
+        found = False
+        for v in range(vb, -1, -1):          # climb from the belt line
+            if cov[v]:
+                top, gap, found = v, 0, True
+            else:
+                gap += 1
+                if gap > 3:
+                    break
+            if not found and vb - v > 4:     # nothing on the belt here
+                break
+        if not found:
+            out.append(0.0)
+            continue
+        ray_w = R.T @ (np.linalg.inv(cam.K) @ np.array([u, top, 1.0]))
+        s = -C[2] / ray_w[2]
+        out.append(round(float((C[1] + s * ray_w[1] + drop) * 1e3), 1))
+    return out
+
+
 RADII = np.arange(0.0, 0.32, 0.02)
 
 
@@ -314,6 +352,8 @@ def main():
             row["band_sim"] = round(float((sim[y0:y1, x0:x1] > 0).mean()), 4)
         row["pile_video_mm"] = round(pile_top_mm(vid, R, C, h, cols, va), 1)
         row["pile_sim_mm"] = round(pile_top_mm(sim, R, C, h, cols, va), 1)
+        row["heap_video_mm"] = heap_profile_mm(vid, R, C, h)
+        row["heap_sim_mm"] = heap_profile_mm(sim, R, C, h)
         if len(rows) % 15 == 0:
             row["cover_video"] = belt_coverage(vid, R, C, h)
             row["cover_sim"] = belt_coverage(sim, R, C, h)
