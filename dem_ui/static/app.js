@@ -119,6 +119,7 @@ async function loadGeometry(kind, key) {
   const geo = await api(kind === "scenario" ? `/api/geometry?scenario=${encodeURIComponent(key)}`
                                              : `/api/runs/${encodeURIComponent(key)}/geometry`);
   const r = kind === "scenario" ? S.scen?.material?.radius : S.runInfo?.meta?.material?.radius;
+  viewer.setUp(kind === "scenario" ? S.scen?.gravity : S.runInfo?.meta?.gravity);
   viewer.setGeometry(geo, r);
   S.geo = geo;
 }
@@ -161,6 +162,23 @@ function renderSetup() {
     if (e.target.value === "fast") Object.assign(sc.solver, { youngs_divisor: 10, dt: "auto", neighbor_every: 4, skin_speed: 6 });
     if (e.target.value === "reference") Object.assign(sc.solver, { youngs_divisor: 1, neighbor_every: 0, dt: sc.notes?.bfa_timestep || "auto" });
   };
+  // gravity: a principal direction or a custom vector (m/s²).  "Up" in the 3D view and for
+  // box injectors and belts follows it.
+  const gsel = $("#gravity-dir"), gcus = $("#gravity-custom"), gin = [...gcus.querySelectorAll("input")];
+  const gv = sc.gravity || [0, -9.81, 0];
+  const gkey = gv.map(x => +(+x).toPrecision(6) || 0).join(",");
+  gsel.value = [...gsel.options].some(o => o.value === gkey) ? gkey : "custom";
+  gcus.hidden = gsel.value !== "custom";
+  gin.forEach((inp, k) => inp.value = num(gv[k]));
+  const applyGravity = g => { sc.gravity = g; viewer.setUp(g); refreshInjectorPreview(); };
+  gsel.onchange = () => {
+    gcus.hidden = gsel.value !== "custom";
+    if (gsel.value === "custom") return;
+    const g = gsel.value.split(",").map(Number);
+    gin.forEach((inp, k) => inp.value = g[k]);
+    applyGravity(g);
+  };
+  gin.forEach(inp => inp.onchange = () => applyGravity(gin.map(i => +i.value)));
   // material
   const mf = $("#material-fields"); mf.innerHTML = "";
   for (const [k, type, label] of MATERIAL_FIELDS) {

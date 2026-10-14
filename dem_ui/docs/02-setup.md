@@ -38,6 +38,7 @@ the domain itself if the injection box sticks out of it.
 | **preset** | **reference** (default): true Young's modulus and BFA's own timestep — closest to BFA. **fast**: Young's modulus / 10, larger timestep, neighbour lists — about 3× faster; on the iron-ore conveyor it kept flows within 1–3 % but over-steered the left/right split by up to 0.04 at the steepest deflectors. |
 | **output fps** | Frames written per simulated second (15 is BFA's default). More frames: smoother playback and finer measurements, more disk. |
 | **write VTK frames** | Needed for playback and every measurement; turn off only for quick checks. |
+| **gravity** | Its direction in the geometry's own coordinates: −Y (Y up, the default) or −Z for Z-up CAD exports, any other axis, or a custom vector in m/s². "Up" follows it everywhere: the 3D view, box injectors placed above a belt or plane, belt running directions, and which side of the domain counts as discharge. |
 | **duration** | Next to Run: simulated seconds. |
 
 ## Material

@@ -219,6 +219,8 @@ def recycle(
     free_count: wp.array(dtype=wp.int32),
     discharged: wp.array(dtype=wp.int32),
     escaped: wp.array(dtype=wp.int32),
+    down_axis: int,
+    down_sign: int,
 ):
     i = wp.tid()
     if ~particle_flags[i] & wp.int32(newton.ParticleFlags.ACTIVE):
@@ -231,7 +233,11 @@ def recycle(
     particle_qd[i] = wp.vec3(0.0)
     slot = wp.atomic_add(free_count, 0, 1)
     free_idx[slot] = i
-    if p[1] < lo[1]:
+    # discharged = left through the domain face on the gravity ("down") side
+    out_bottom = p[down_axis] < lo[down_axis]
+    if down_sign > 0:
+        out_bottom = p[down_axis] > hi[down_axis]
+    if out_bottom:
         wp.atomic_add(discharged, 0, 1)
     else:
         wp.atomic_add(escaped, 0, 1)   # left through a side or the top: a leak, not discharge
@@ -923,6 +929,11 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     hist = open(os.path.join(out_dir, "history.csv"), "w")
     hist.write(",".join(cols) + "\n")
 
+    # gravity's dominant axis and sign: grains leaving the domain on that side are
+    # "discharged", anywhere else "escaped" (default [0, -9.81, 0]: below the domain in y)
+    _g = np.asarray(sc.gravity, dtype=np.float64)
+    down_axis = int(np.argmax(np.abs(_g)))
+    down_sign = 1 if _g[down_axis] > 0.0 else -1
     n_frames = int(round(out.duration * out.fps))
     rng = np.random.default_rng(sc.solver.seed)
     t0 = time.time()
@@ -1063,7 +1074,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 wp.launch(recycle, dim=n_pool, device=device, inputs=[
                     s0.particle_q, s0.particle_qd, model.particle_flags,
                     wp.vec3(*sc.domain_lo), wp.vec3(*sc.domain_hi), S.park_lo,
-                    S.free_idx, S.free_count, S.discharged, S.escaped])
+                    S.free_idx, S.free_count, S.discharged, S.escaped, down_axis, down_sign])
                 # recycle appends with atomics (arbitrary order): re-sort the free list so
                 # the next spawns get the same pool slots on every run.  Once per frame.
                 _fc = int(S.free_count.numpy()[0])

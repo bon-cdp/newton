@@ -38,6 +38,8 @@ summary { font-weight: 600; cursor: pointer; padding: 4px 0; }
 .grid2 label { display: flex; flex-direction: column; font-size: 11px; color: var(--muted); }
 .grid2 input, .grid2 select { font: inherit; color: var(--ink); padding: 3px 5px; border: 1px solid var(--line); border-radius: 4px; }
 .grid2 input[type=checkbox] { align-self: flex-start; }
+.grid2 .row3 { display: flex; gap: 4px; }
+.grid2 .row3 input { width: 33%; min-width: 0; }
 button { font: inherit; padding: 5px 12px; border: 1px solid var(--line); background: #fff; border-radius: 6px; cursor: pointer; }
 button:hover { border-color: #b8c0cd; }
 button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }

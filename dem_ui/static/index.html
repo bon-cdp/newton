@@ -80,6 +80,20 @@
             </label>
             <label>output fps <input data-bind="output.fps" type="number" step="any"></label>
             <label>write VTK frames <input data-bind="output.vtk" type="checkbox"></label>
+            <label title="direction of gravity in the geometry's coordinates (CAD exports are often Z-up)">gravity
+              <select id="gravity-dir">
+                <option value="0,-9.81,0">−Y (Y up)</option>
+                <option value="0,0,-9.81">−Z (Z up)</option>
+                <option value="-9.81,0,0">−X (X up)</option>
+                <option value="0,9.81,0">+Y</option>
+                <option value="0,0,9.81">+Z</option>
+                <option value="9.81,0,0">+X</option>
+                <option value="custom">custom vector…</option>
+              </select>
+            </label>
+            <label id="gravity-custom" hidden>gravity vector (m/s²: x, y, z)
+              <span class="row3"><input type="number" step="any"><input type="number" step="any"><input type="number" step="any"></span>
+            </label>
           </div>
         </details>
 

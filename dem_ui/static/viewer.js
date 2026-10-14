@@ -43,7 +43,9 @@ export class Viewer {
     this.camera.position.set(3, 2, 5);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x8890a0, 1.1));
+    this.hemi = new THREE.HemisphereLight(0xffffff, 0x8890a0, 1.1);
+    this.scene.add(this.hemi);
+    this.up = new THREE.Vector3(0, 1, 0);
     const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(3, 8, 5);
     this.scene.add(sun);
     this.world = new THREE.Group(); this.scene.add(this.world);
@@ -137,11 +139,38 @@ export class Viewer {
     return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xf59e0b, side: THREE.DoubleSide, transparent: true, opacity: 0.18, depthWrite: false }));
   }
 
+  // "Up" = against gravity: CAD geometry is often Z-up.  OrbitControls cache the camera's up
+  // when they are built, so they are rebuilt (keeping the target) when it changes.
+  setUp(gravity) {
+    const gv = gravity || [0, -9.81, 0];
+    const g = new THREE.Vector3(gv[0], gv[1], gv[2]);
+    if (g.lengthSq() < 1e-12) return;
+    const up = g.negate().normalize();
+    if (up.distanceTo(this.up) < 1e-6) return;
+    this.up = up;
+    const target = this.controls.target.clone();
+    this.controls.dispose();
+    this.camera.up.copy(up);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.target.copy(target);
+    this.hemi.position.copy(up);              // sky light from above
+    if (this.lastBox) this.fit(this.lastBox);
+  }
+
   fit(box) {
     if (box.isEmpty()) return;
+    this.lastBox = box.clone();
     const c = box.getCenter(new THREE.Vector3()), s = box.getSize(new THREE.Vector3()).length();
     this.controls.target.copy(c);
-    this.camera.position.copy(c).add(new THREE.Vector3(0.55, 0.35, 0.75).multiplyScalar(s));
+    // view from above and to one side, in a frame whose vertical is "up" (for Y-up this is
+    // the original (0.55, 0.35, 0.75) offset)
+    const up = this.up;
+    const a = Math.abs(up.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const e1 = a.sub(up.clone().multiplyScalar(a.dot(up))).normalize();
+    const e2 = new THREE.Vector3().crossVectors(e1, up);
+    const off = e1.multiplyScalar(0.55).add(up.clone().multiplyScalar(0.35)).add(e2.multiplyScalar(0.75));
+    this.camera.position.copy(c).add(off.multiplyScalar(s));
     this.camera.near = s / 1000; this.camera.far = s * 20; this.camera.updateProjectionMatrix();
   }
 
