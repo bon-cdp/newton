@@ -398,7 +398,8 @@ class SolverGranularDEM(SolverBase):
                  calibrate_restitution: bool = False, cal_dt: float = 2.4316429e-5,
                  cal_v0: float = 2.4, wall_grid: WallGrid | None = None,
                  hash_dims: tuple[int, int, int] | None = None,
-                 neighbor_every: int = 0, skin: float = 0.003, skin_max: float = 0.006):
+                 neighbor_every: int = 0, skin: float = 0.003, skin_max: float = 0.006,
+                 cohesion: float = 0.0, wall_cohesion=None):
         super().__init__(model=model)
         # baked candidate-triangle grid; None falls back to per-step BVH queries
         self.wall_grid = wall_grid
@@ -408,6 +409,12 @@ class SolverGranularDEM(SolverBase):
         self.mu_roll_wall = float(mu_roll_wall)
         self.rot_damp = float(rot_damp)
         self.rot_damp_wall = float(rot_damp_wall)
+        # cohesion energy densities (J/m^3, simplified JKR): grain-grain, and grain-wall per
+        # part.  Both are applied by separate passes, launched only when non-zero.
+        self.cohesion = float(cohesion)
+        wc = [float(x) for x in (wall_cohesion or [])]
+        self.wall_cohesion = (wp.array(wc, dtype=float, device=model.device)
+                              if any(x > 0.0 for x in wc) else None)
         # k_t as a fraction of k_n.  2/7 is the Hertz-Mindlin equal-partition value and
         # the usual default in DEM codes; 0 disables the spring and restores the
         # viscous-Coulomb law, which is the A/B control.
@@ -667,6 +674,22 @@ class SolverGranularDEM(SolverBase):
                 device=model.device,
             )
 
+        # grain-grain cohesion: a separate pass, launched only when cohesion is on.  In the
+        # contact kernels above even branch-free cohesion arithmetic cost ~12% of the whole
+        # step (they are register-bound) and changed their rounding; here it costs nothing
+        # when off.  The grid holds build-time positions on the neighbour-list path, so the
+        # query radius carries the skin there.
+        if self.cohesion > 0.0:
+            wp.launch(
+                kernel=add_pair_cohesion,
+                dim=model.particle_count,
+                inputs=[model.particle_grid.id, state_in.particle_q, model.particle_radius,
+                        model.particle_flags, model.particle_max_radius,
+                        self.skin_max if use_list else 0.0, self.cohesion],
+                outputs=[state_in.particle_f],
+                device=model.device,
+            )
+
         # grain-wall: ADDS to what the grain-grain kernel wrote
         if self.wall_grid is not None:
             wp.launch(
@@ -724,6 +747,19 @@ class SolverGranularDEM(SolverBase):
                     self.wall_slack, dt, model.particle_grid.id,
                 ],
                 outputs=[state_in.particle_f, self.particle_t, self.contact_count],
+                device=model.device,
+            )
+
+        # grain-wall cohesion: a separate pass for the same reason as add_pair_cohesion (the
+        # wall kernel sits at its register limit); baked wall grid only
+        if self.wall_cohesion is not None and self.wall_grid is not None:
+            wp.launch(
+                kernel=add_wall_cohesion,
+                dim=model.particle_count,
+                inputs=[state_in.particle_q, model.particle_radius, model.particle_flags,
+                        self.collider, self.wall_grid, self.wall_cohesion,
+                        model.particle_grid.id],
+                outputs=[state_in.particle_f],
                 device=model.device,
             )
 
@@ -1096,6 +1132,44 @@ def eval_particle_contact_rot(
 
     particle_f[i] = f
     particle_t[i] = t
+
+
+@wp.kernel
+def add_pair_cohesion(
+    grid: wp.uint64,
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    max_radius: float,
+    skin: float,
+    cohesion: float,
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    """Grain-grain cohesion, simplified JKR (LIGGGHTS "sjkr"): while two grains overlap by
+    d they also pull together with cohesion * pi * R* * d (cohesion energy density x contact
+    area, R* = ri rj / (ri + rj)).  ADDS to the contact forces; runs after them."""
+    i = wp.hash_grid_point_id(grid, wp.tid())
+    if i == -1:
+        return
+    if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
+        return
+    x = particle_x[i]
+    ri = particle_radius[i]
+    f = wp.vec3(0.0)
+    query = wp.hash_grid_query(grid, x, ri + max_radius + skin)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        if (particle_flags[j] & newton.ParticleFlags.ACTIVE) == 0:
+            continue
+        rj = particle_radius[j]
+        d_vec = x - particle_x[j]
+        d = wp.length(d_vec)
+        if d < 1.0e-9 or d >= ri + rj:
+            continue
+        f -= (d_vec / d) * (cohesion * 3.14159265 * (ri * rj / (ri + rj)) * (ri + rj - d))
+    particle_f[i] = particle_f[i] + f
 
 
 @wp.func
@@ -1662,6 +1736,19 @@ def _avg_normal_from_list(g: WallGrid, mode: int, wl: wp.array2d(dtype=int), i: 
     return wp.normalize(acc)
 
 
+@wp.func
+def _avg_normal_seg(g: WallGrid, k0: int, s0: int, s1: int, cp: wp.vec3):
+    """_avg_normal_from_list for a contiguous cell list (mode 0), for add_wall_cohesion."""
+    acc = wp.vec3(0.0)
+    eps_sq = _EPS_NORMAL * _EPS_NORMAL
+    for s in range(s0, s1):
+        r = g.rec[k0 + s]
+        sq, _q = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, cp)
+        if sq < eps_sq:
+            acc += r.n
+    return wp.normalize(acc)
+
+
 MAX_WALL_CANDIDATES = wp.constant(96)
 
 
@@ -1887,6 +1974,77 @@ def eval_wall_grid_rot(
         # plain read-modify-write is safe -- no atomic needed
         particle_f[i] = particle_f[i] + f_total
         particle_t[i] = particle_t[i] + t_total
+
+
+@wp.kernel
+def add_wall_cohesion(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    collider: ShellCollider,
+    g: WallGrid,
+    wall_cohesion: wp.array(dtype=float),
+    grid: wp.uint64,
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    """Grain-wall cohesion, simplified JKR: per part in contact, a pull of
+    cohesion[part] * pi * r * overlap toward the wall.  Same search and signed distance as
+    eval_wall_grid_rot (closest triangle of each part, from the grain's cell list); ADDS to
+    the contact forces."""
+    i = wp.hash_grid_point_id(grid, wp.tid())
+    if ~particle_flags[i] & newton.ParticleFlags.ACTIVE:
+        return
+    x = particle_q[i]
+    cc = _cell_of(g, x)
+    if cc[0] < 0 or cc[1] < 0 or cc[2] < 0 or cc[0] >= g.nx or cc[1] >= g.ny or cc[2] >= g.nz:
+        return
+    cell = (cc[2] * g.ny + cc[1]) * g.nx + cc[0]
+    k0 = g.cell_start[cell]
+    ncand = g.cell_start[cell + 1] - k0
+    if ncand == 0:
+        return
+    radius = particle_radius[i]
+    f = wp.vec3(0.0)
+    cur = int(-1)
+    seg0 = int(0)
+    best_sq = float(0.0)
+    best_t = int(-1)
+    for s in range(ncand + 1):
+        t = int(-1)
+        p = int(-1)
+        r = WallTri()
+        if s < ncand:
+            t = k0 + s
+            r = g.rec[t]
+            p = r.part
+        if p != cur:
+            if best_t >= 0 and wall_cohesion[cur] > 0.0:
+                br = g.rec[best_t]
+                _sq, cp = _tri_closest(br.v0, br.u, br.w, br.n, br.t2, x)
+                face_n = br.n
+                if collider.two_sided[cur] == 0:
+                    face_n = _avg_normal_seg(g, k0, seg0, s, cp)
+                sdf, n = _shell_sdf(collider.two_sided[cur], collider.thickness[cur], x - cp,
+                                    wp.sqrt(best_sq), face_n)
+                c = sdf - radius
+                if c < 0.0 and c >= -radius:
+                    f -= n * (wall_cohesion[cur] * 3.14159265 * radius * (-c))
+            cur = p
+            seg0 = s
+            best_t = -1
+            rr = radius + collider.thickness[wp.max(p, 0)]
+            best_sq = rr * rr
+            if p >= 0:
+                if collider.active[p] == 0:
+                    best_sq = 0.0
+        if t >= 0:
+            h = wp.dot(x - r.v0, r.n)
+            if h * h < best_sq:
+                sq, _cand = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, x)
+                if sq < best_sq:
+                    best_sq = sq
+                    best_t = t
+    particle_f[i] = particle_f[i] + f
 
 
 # ---------------------------------------------------------------------------

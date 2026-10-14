@@ -48,6 +48,19 @@ tangential/normal stiffness ratio.  New projects start from placeholder values (
 1000 kg/m³) — **set the real material**: grain size and density decide how many grains the
 run needs and therefore its cost (see *Run estimate*).
 
+**Cohesion** (J/m³) makes grains stick to each other and to walls, for moist or sticky
+material.  The model is the simplified JKR one used by LIGGGHTS and EDEM: while two grains
+(or a grain and a wall) overlap by *d*, they also pull together with
+cohesion × π × R\* × *d*, where R\* is the effective radius.
+
+- **0** (the default) means cohesionless, and costs nothing.
+- **Wall cohesion** left blank means the same value as grain–grain.  A single part can
+  override it in the scenario file (`"cohesion"` on the part), for example a sticky liner.
+
+Calibrate the value against a repose or hold-up test. As a rough scale, a 5 mm grain held
+against a ceiling by cohesion alone needs about 2×10⁵ J/m³ at E = 10⁷ Pa (`test_cohesion.py`
+gives the closed form).  Cohesion adds one extra pass per contact type when switched on.
+
 ## Parts
 
 One row per part:

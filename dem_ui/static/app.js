@@ -130,6 +130,8 @@ const MATERIAL_FIELDS = [
   ["restitution", "number", "restitution"], ["friction", "number", "grain-grain sliding μ"],
   ["rolling_friction", "number", "grain-grain rolling μ"], ["wall_rolling_friction", "number", "wall rolling μ"],
   ["contact", "select:hertz,linear", "contact law"], ["tangential_ratio", "number", "Mindlin kt/kn"],
+  ["cohesion", "number", "grain-grain cohesion (J/m³)"],
+  ["wall_cohesion", "number?", "wall cohesion (J/m³, blank = same)"],
 ];
 
 async function openScenario(path) {
@@ -167,9 +169,15 @@ function renderSetup() {
     if (type.startsWith("select:")) {
       inp = document.createElement("select");
       for (const o of type.slice(7).split(",")) inp.add(new Option(o, o));
-    } else { inp = document.createElement("input"); inp.type = type; if (type === "number") inp.step = "any"; }
-    inp.value = num(sc.material[k]);
-    inp.onchange = () => sc.material[k] = type === "number" ? +inp.value : inp.value;
+    } else {
+      // "number?" = optional number: an empty box stores null (e.g. wall cohesion = same
+      // as grain-grain)
+      inp = document.createElement("input"); inp.type = type.startsWith("number") ? "number" : type;
+      if (inp.type === "number") inp.step = "any";
+    }
+    inp.value = num(sc.material[k]) ?? "";
+    inp.onchange = () => sc.material[k] = type === "number?" ? (inp.value === "" ? null : +inp.value)
+      : type === "number" ? +inp.value : inp.value;
     l.appendChild(inp); mf.appendChild(l);
   }
   // parts

@@ -490,6 +490,14 @@ def wall_grid_cell(parts, radius, reach, requested=None, budget=64.0e6):
                  f"{budget/1e6:.0f} M cells ({ext.round(1).tolist()} m geometry)")
 
 
+def wall_cohesion(m, part) -> float:
+    """Grain-wall cohesion (J/m^3) for one part: its own value, else the material's
+    wall_cohesion, else the grain-grain cohesion."""
+    if part.cohesion is not None:
+        return float(part.cohesion)
+    return float(m.cohesion if m.wall_cohesion is None else m.wall_cohesion)
+
+
 def resolve_dt(sc: Scenario):
     """(dt, substeps, effective Young's modulus).  dt divides the frame interval."""
     m, s = sc.material, sc.solver
@@ -615,6 +623,12 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         f"{s.youngs_divisor:g}), nu {m.poisson}" if hertz else f", ke {m.ke:.3g} N/m")
         + f";  rotation {'ON' if m.rotation else 'OFF'}")
     log(f"  restitution           {e:.3f} -> kd {kd_pp:.3f} grain-grain, {kd_wall:.3f} grain-wall")
+    if m.cohesion > 0.0 or any(wall_cohesion(m, p) > 0.0 for p in sc.parts):
+        wc = sorted({wall_cohesion(m, p) for p in sc.parts})
+        log(f"  cohesion              {m.cohesion:g} J/m3 grain-grain, "
+            f"{', '.join(f'{x:g}' for x in wc)} J/m3 grain-wall (simplified JKR)")
+        if s.bvh_walls and any(x > 0.0 for x in wc):
+            log("  !! grain-wall cohesion needs the baked wall grid: ignored with bvh_walls")
     log(f"  dt                    {dt*1e6:.3f} us = {dt/t_r:.2f} Rayleigh time"
         f"   ({substeps} steps per frame)")
     log(f"  steps                 {int(round(sc.output.duration / dt)):,}")
@@ -811,7 +825,9 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                                rot_damp=m.rot_damp, rot_damp_wall=m.rot_damp_wall,
                                tangential_ratio=m.tangential_ratio,
                                hertz=hertz, youngs=youngs_eff, poisson=m.poisson, restitution=e,
-                               calibrate_restitution=m.calibrate_restitution, cal_dt=dt)
+                               calibrate_restitution=m.calibrate_restitution, cal_dt=dt,
+                               cohesion=m.cohesion,
+                               wall_cohesion=[wall_cohesion(m, p) for p in sc.parts])
 
     s0, s1 = model.state(), model.state()
     free_idx = wp.array(np.arange(n_pool, dtype=np.int32), dtype=wp.int32, device=device)

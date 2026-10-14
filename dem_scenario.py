@@ -57,6 +57,11 @@ class Material:
     kd_wall: float | None = None          # override grain-wall damping
     calibrate_restitution: bool = False
     rotation: bool = True
+    # Cohesion energy density (J/m^3), simplified JKR: while two grains overlap by d they
+    # also pull together with cohesion * pi * R* * d.  0 = cohesionless.  Typical moist
+    # bulk solids are of order 1e3-1e5 J/m^3; calibrate against a repose test.
+    cohesion: float = 0.0
+    wall_cohesion: float | None = None    # grain-wall; None = same as cohesion
 
     @property
     def mass(self) -> float:
@@ -77,6 +82,8 @@ class Part:
     active: list[float] = field(default_factory=lambda: [0.0, INF])   # [on, off) seconds
     motion: dict | None = None            # surface motion (belt / rotating), see dem_run.surface_motion
     corners: bool = False                 # second contact in concave creases of this part (#13)
+    cohesion: float | None = None         # grain-wall cohesion for this part (J/m^3);
+                                          # None = the material's wall_cohesion
 
 
 @dataclass
