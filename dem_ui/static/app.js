@@ -175,7 +175,7 @@ function renderSetup() {
       inp = document.createElement("input"); inp.type = type.startsWith("number") ? "number" : type;
       if (inp.type === "number") inp.step = "any";
     }
-    inp.value = num(sc.material[k]) ?? "";
+    inp.value = num(sc.material[k]) ?? (k === "cohesion" ? 0 : "");
     inp.onchange = () => sc.material[k] = type === "number?" ? (inp.value === "" ? null : +inp.value)
       : type === "number" ? +inp.value : inp.value;
     l.appendChild(inp); mf.appendChild(l);
@@ -190,16 +190,18 @@ function renderSetup() {
       <td><select><option value="wall">wall</option><option value="belt">conveyor belt</option><option value="rotating">rotating</option></select></td>
       <td><input type="checkbox" ${p.two_sided ? "checked" : ""}></td>
       <td><input type="number" step="any" value="${p.friction}"></td>
+      <td><input type="number" step="any" value="${p.cohesion ?? ""}" placeholder="material" title="grain-wall cohesion for this part (J/m³); blank = the material's wall cohesion"></td>
       <td><input type="number" step="any" value="${p.active[0]}"></td>
       <td><input type="number" step="any" value="${p.active[1] >= INF ? "" : p.active[1]}" placeholder="end"></td>
       <td><input type="checkbox" ${p.corners ? "checked" : ""}></td>
       <td><button class="small" title="remove part">×</button></td>`;
-    const [show, two, fric, on, off, corn] = tr.querySelectorAll("input");
+    const [show, two, fric, coh, on, off, corn] = tr.querySelectorAll("input");
     const type = tr.querySelector("select"), del = tr.querySelector("button");
     type.value = kind;
     show.onchange = () => viewer.setPartVisible(p.name, show.checked);
     two.onchange = () => p.two_sided = two.checked;
     fric.onchange = () => p.friction = +fric.value;
+    coh.onchange = () => { if (coh.value === "") delete p.cohesion; else p.cohesion = +coh.value; };
     on.onchange = () => p.active[0] = +on.value;
     off.onchange = () => p.active[1] = off.value === "" ? INF : +off.value;
     corn.onchange = () => p.corners = corn.checked;

@@ -55,7 +55,8 @@ cohesion × π × R\* × *d*, where R\* is the effective radius.
 
 - **0** (the default) means cohesionless, and costs nothing.
 - **Wall cohesion** left blank means the same value as grain–grain.  A single part can
-  override it in the scenario file (`"cohesion"` on the part), for example a sticky liner.
+  override it in the **cohesion** column of the Parts table (blank = the material's value),
+  for example a sticky liner.
 
 Calibrate the value against a repose or hold-up test. As a rough scale, a 5 mm grain held
 against a ceiling by cohesion alone needs about 2×10⁵ J/m³ at E = 10⁷ Pa (`test_cohesion.py`
@@ -71,6 +72,7 @@ One row per part:
 | type | **wall**, **conveyor belt** or **rotating**. |
 | 2-sided | Grains bounce off both faces (open sheets, chutes). One-sided parts collide on their outward face only. |
 | friction | Grain–wall sliding friction. |
+| cohesion | Grain–wall cohesion for this part (J/m³); blank = the material's wall cohesion. |
 | on / off (s) | Active window: the part exists only in this time span.  This is how BFA's staged deflectors are modelled — one part per position, each active for its window. Empty *off* = until the end. |
 | corners | Second contact in concave corners and creases (troughed belts, chute corners). Slightly slower; belts get it automatically. |
 | × | Remove the part from the scenario (the STL file stays). |
