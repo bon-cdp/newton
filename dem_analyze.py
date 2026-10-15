@@ -107,8 +107,8 @@ def _frame_wall_loads(
     q: wp.array(dtype=wp.vec3),
     qd: wp.array(dtype=wp.vec3),
     w_ang: wp.array(dtype=wp.vec3),
-    radius: float,
-    mass: float,
+    radius_a: wp.array(dtype=float),
+    mass_a: wp.array(dtype=float),
     collider: G.ShellCollider,
     g: G.WallGrid,
     hertz: int,
@@ -133,6 +133,8 @@ def _frame_wall_loads(
     k1 = g.cell_start[cell + 1]
     v = qd[i]
     w = w_ang[i]
+    radius = radius_a[i]
+    mass = mass_a[i]
     cur = int(-1)
     seg0 = k0
     best_sq = float(0.0)
@@ -200,6 +202,19 @@ def _frame_wall_loads(
                     best_k = k
 
 
+def grain_sizes(sc, fr):
+    """(radius, mass) per grain of one frame.  With a size distribution each frame radius
+    (float32) snaps to its class, so masses are the run's exact class masses."""
+    n = len(fr["pos"])
+    cls = sc.material.classes()
+    if len(cls) == 1 or "radius" not in fr:
+        r, m, _p = cls[0] if len(cls) == 1 else (sc.material.radius_max, sc.material.mean_mass, 1)
+        return np.full(n, r), np.full(n, m)
+    cr = np.array([c[0] for c in cls])
+    k = np.abs(fr["radius"][:, None] - cr[None, :]).argmin(axis=1)
+    return cr[k], np.array([c[1] for c in cls])[k]
+
+
 def _collider_for(run, device):
     """Parts, collider and baked wall grid exactly as dem_run built them."""
     import dem_run
@@ -217,7 +232,7 @@ def _collider_for(run, device):
     if kd_wall is None:
         e = max(min(m.restitution, 0.999), 1e-4)
         zeta = -math.log(e) / math.sqrt(math.pi ** 2 + math.log(e) ** 2)
-        kd_wall = zeta * 2.0 * math.sqrt(m.mass * m.ke)
+        kd_wall = zeta * 2.0 * math.sqrt(m.mean_mass * m.ke)
     collider, meshes = G.build_collider(
         parts, two_sided=[p.two_sided for p in sc.parts], friction=[p.friction for p in sc.parts],
         ke=[m.ke] * len(parts), kd=[kd_wall] * len(parts), kf=[m.kf] * len(parts),
@@ -225,8 +240,8 @@ def _collider_for(run, device):
         device=device, corners=[p.corners for p in sc.parts],
         motions=[dem_run.surface_motion(p.motion, sc.gravity) for p in sc.parts])
     max_thick = max([p.thickness if p.two_sided else 0.0 for p in sc.parts] + [0.0])
-    reach = m.radius + max_thick + 1.0e-3 + 1.0e-4
-    cell, _note = dem_run.wall_grid_cell(parts, m.radius, reach, sc.solver.wall_grid_cell)
+    reach = m.radius_max + max_thick + 1.0e-3 + 1.0e-4
+    cell, _note = dem_run.wall_grid_cell(parts, m.radius_max, reach, sc.solver.wall_grid_cell)
     grid, _info = G.build_wall_grid(parts, meshes, collider.lower, collider.upper, reach, cell,
                                     device)
     return parts, collider, meshes, grid
@@ -263,6 +278,7 @@ def wall_loads(run, t0=None, t1=None, device="cuda:0", out_dir=None, quiet=False
             continue
         qd = fr["vel"]
         spin = fr.get("spin", np.zeros_like(qd))
+        rad, gmass = grain_sizes(sc, fr)
         # part activity at this time (staged deflectors)
         act = [1 if p.active[0] <= t < p.active[1] else 0 for p in sc.parts]
         if act != active_prev:
@@ -272,7 +288,8 @@ def wall_loads(run, t0=None, t1=None, device="cuda:0", out_dir=None, quiet=False
             wp.array(fr["pos"].astype(np.float32), dtype=wp.vec3, device=device),
             wp.array(qd.astype(np.float32), dtype=wp.vec3, device=device),
             wp.array(spin.astype(np.float32), dtype=wp.vec3, device=device),
-            float(m.radius), float(m.mass), collider, grid, hertz, float(e_star), float(beta),
+            wp.array(rad.astype(np.float32), dtype=float, device=device),
+            wp.array(gmass.astype(np.float32), dtype=float, device=device), collider, grid, hertz, float(e_star), float(beta),
             acc["force"], acc["moment"], acc["normal"], acc["shear"], acc["wear"], acc["count"]])
         cur = {k: v.numpy().copy() for k, v in acc.items()}
         d = {k: cur[k] - prev[k] for k in acc}
@@ -346,7 +363,6 @@ def flows(run, planes=None, t0=None, t1=None, out_dir=None, quiet=False):
     grains by the ids stored in the frames.  Frames must be close enough that no grain
     crosses a plane and leaves the domain in between (true at 15 fps for these flows)."""
     planes = planes if planes is not None else run.sc.flow_planes
-    gm = run.sc.material.mass
     frames = run.window(t0, t1)
     rows, prev = [], None
     dtf = 1.0 / run.sc.output.fps
@@ -358,15 +374,16 @@ def flows(run, planes=None, t0=None, t1=None, out_dir=None, quiet=False):
             raise ValueError(f"{f} has no grain ids (written before ids were added); "
                              "use the run's own flow_* columns in history.csv instead")
         pos, ids = fr["pos"], fr["id"].astype(np.int64)
+        gm = grain_sizes(run.sc, fr)[1]
         if prev is not None and len(pos):
             ppos, pids = prev
             lookup = np.full(max(ids.max(), pids.max()) + 1, -1, dtype=np.int64)
             lookup[pids] = np.arange(len(pids))
             j = lookup[ids]
             ok = j >= 0
-            p0, p1 = ppos[j[ok]], pos[ok]
+            p0, p1, g1 = ppos[j[ok]], pos[ok], gm[ok]
             moved = np.linalg.norm(p1 - p0, axis=1) <= jump
-            p0, p1 = p0[moved], p1[moved]
+            p0, p1, g1 = p0[moved], p1[moved], g1[moved]
             for k, fp in enumerate(planes):
                 a = fp.axis
                 s0, s1 = p0[:, a] - fp.value, p1[:, a] - fp.value
@@ -378,7 +395,7 @@ def flows(run, planes=None, t0=None, t1=None, out_dir=None, quiet=False):
                     for b in range(3):
                         if b != a:
                             inside &= (pt[:, b] >= fp.lo[b]) & (pt[:, b] <= fp.hi[b])
-                    total[k] += inside.sum() * gm
+                    total[k] += g1[cr][inside].sum()
         rows.append([t] + total.tolist())
         prev = (pos, ids)
     out_dir = out_dir or os.path.join(run.dir, "analysis")
@@ -399,15 +416,15 @@ def flows(run, planes=None, t0=None, t1=None, out_dir=None, quiet=False):
 def regions(run, t0=None, t1=None, out_dir=None, quiet=False):
     """Mass and mean speed in each scenario region, per frame."""
     regs = run.sc.regions
-    gm = run.sc.material.mass
     rows = []
     for t, f in run.window(t0, t1):
         fr = read_frame(f)
         pos, sp = fr["pos"], np.linalg.norm(fr["vel"], axis=1)
+        gm = grain_sizes(run.sc, fr)[1]
         row = [t]
         for r in regs:
             m = np.all((pos > np.array(r.lo)) & (pos < np.array(r.hi)), axis=1)
-            row += [m.sum() * gm, sp[m].mean() if m.any() else 0.0]
+            row += [gm[m].sum(), sp[m].mean() if m.any() else 0.0]
         rows.append(row)
     out_dir = out_dir or os.path.join(run.dir, "analysis")
     os.makedirs(out_dir, exist_ok=True)

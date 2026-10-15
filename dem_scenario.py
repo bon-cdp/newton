@@ -63,9 +63,40 @@ class Material:
     cohesion: float = 0.0
     wall_cohesion: float | None = None    # grain-wall; None = same as cohesion
 
+    # Size distribution: [{"radius": m, "fraction": mass fraction}, ...].  None (or one row)
+    # = every grain has `radius`.  Fractions are by MASS, as sieve curves are; they need not
+    # sum to 1 (normalised).
+    sizes: list | None = None
+
     @property
     def mass(self) -> float:
         return 4.0 / 3.0 * math.pi * self.radius ** 3 * self.density
+
+    def classes(self) -> list[tuple[float, float, float]]:
+        """[(radius, grain mass, NUMBER fraction)] per size class.  A mass fraction w of
+        grains of mass m is w/m grains per kg, so number fractions are w_k/m_k normalised."""
+        rows = [r for r in (self.sizes or []) if float(r.get("fraction", 0)) > 0]
+        if not rows:
+            return [(self.radius, self.mass, 1.0)]
+        rad = [float(r["radius"]) for r in rows]
+        w = [float(r["fraction"]) for r in rows]
+        m = [4.0 / 3.0 * math.pi * x ** 3 * self.density for x in rad]
+        n = [wk / mk for wk, mk in zip(w, m)]
+        tot = sum(n)
+        return [(x, mk, nk / tot) for x, mk, nk in zip(rad, m, n)]
+
+    @property
+    def mean_mass(self) -> float:
+        """Mean grain mass (kg): mass rate / mean_mass = grains per second."""
+        return sum(m * p for _r, m, p in self.classes())
+
+    @property
+    def radius_max(self) -> float:
+        return max(r for r, _m, _p in self.classes())
+
+    @property
+    def radius_min(self) -> float:
+        return min(r for r, _m, _p in self.classes())
 
 
 @dataclass

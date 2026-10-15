@@ -536,7 +536,8 @@ def _run_base_dir(meta: dict, d: str) -> str:
 
 @app.get("/api/runs/{run_id}/frame/{k}")
 def frame(run_id: str, k: int):
-    """Binary: uint32 n, then n*3 float32 positions, then n float32 speeds."""
+    """Binary: uint32 n, then n*3 float32 positions, n float32 speeds and, when the frame
+    has them, n float32 radii (a size distribution)."""
     d = _run_dir(run_id)
     f = os.path.join(d, f"frame_{k:04d}_particles.vtk")
     if not os.path.exists(f):
@@ -545,6 +546,8 @@ def frame(run_id: str, k: int):
     pos = fr["pos"].astype(np.float32)
     spd = np.linalg.norm(fr["vel"], axis=1).astype(np.float32)
     body = np.array([len(pos)], dtype=np.uint32).tobytes() + pos.tobytes() + spd.tobytes()
+    if "radius" in fr:
+        body += fr["radius"].astype(np.float32).tobytes()
     return Response(body, media_type="application/octet-stream")
 
 

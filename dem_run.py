@@ -221,6 +221,7 @@ def recycle(
     escaped: wp.array(dtype=wp.int32),
     down_axis: int,
     down_sign: int,
+    class_id: wp.array(dtype=wp.int32),
 ):
     i = wp.tid()
     if ~particle_flags[i] & wp.int32(newton.ParticleFlags.ACTIVE):
@@ -237,10 +238,11 @@ def recycle(
     out_bottom = p[down_axis] < lo[down_axis]
     if down_sign > 0:
         out_bottom = p[down_axis] > hi[down_axis]
+    c = int(class_id[i])                  # counted per size class: mass = count x class mass
     if out_bottom:
-        wp.atomic_add(discharged, 0, 1)
+        wp.atomic_add(discharged, c, 1)
     else:
-        wp.atomic_add(escaped, 0, 1)   # left through a side or the top: a leak, not discharge
+        wp.atomic_add(escaped, c, 1)   # left through a side or the top: a leak, not discharge
 
 
 @wp.kernel
@@ -249,16 +251,23 @@ def region_stats(
     particle_qd: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
     particle_w: wp.array(dtype=wp.vec3),
-    mass: float,
+    class_id: wp.array(dtype=wp.int32),
+    class_mass: wp.array(dtype=float),
+    n_cls: int,
     reg_lo: wp.array(dtype=wp.vec3),
     reg_hi: wp.array(dtype=wp.vec3),
     out: wp.array(dtype=float),
 ):
-    """out = [n, KE, sum|w|, max speed, then per region r: n, sum speed, sum |w|].
-    Region membership is strict (lo < p < hi on every axis)."""
+    """out = [n, KE, sum|w|, max speed, then per region r: n, sum speed, sum |w|, then grains
+    per size class in the domain, then per region per class].  Region membership is strict
+    (lo < p < hi on every axis)."""
     i = wp.tid()
     if ~particle_flags[i] & wp.int32(newton.ParticleFlags.ACTIVE):
         return
+    c = int(class_id[i])
+    mass = class_mass[c]
+    base = 4 + 3 * reg_lo.shape[0]
+    wp.atomic_add(out, base + c, 1.0)
     x = particle_q[i]
     v = particle_qd[i]
     speed = wp.length(v)
@@ -275,6 +284,7 @@ def region_stats(
             wp.atomic_add(out, 4 + 3 * r, 1.0)
             wp.atomic_add(out, 5 + 3 * r, speed)
             wp.atomic_add(out, 6 + 3 * r, spin)
+            wp.atomic_add(out, base + n_cls * (1 + r) + c, 1.0)
 
 
 @wp.kernel
@@ -601,7 +611,8 @@ def resolve_dt(sc: Scenario):
     m, s = sc.material, sc.solver
     youngs_eff = m.youngs / s.youngs_divisor
     if s.dt == "auto":
-        dt_req = s.rayleigh_fraction * rayleigh_time(m.radius, m.density, youngs_eff, m.poisson)
+        # the smallest grains have the shortest contact time
+        dt_req = s.rayleigh_fraction * rayleigh_time(m.radius_min, m.density, youngs_eff, m.poisson)
     else:
         dt_req = float(s.dt)
     frame_dt = 1.0 / sc.output.fps
@@ -650,7 +661,7 @@ def pool_size(sc: Scenario, device=None):
     scenario sets expected_holdup_kg, and capped at what the GPU can hold -- an operator-
     screen project at 10,000 t/h of 12 mm grains asked for 3 M grains/s against a 55 k pool
     sized for the old fixed 20 kg default and starved from the first frame."""
-    s, gmass = sc.solver, sc.material.mass
+    s, gmass = sc.solver, sc.material.mean_mass
     kg, _res, _how = holdup_estimate(sc)
     pool = int(max(s.min_pool, kg / gmass * s.pool_factor))
     notes = []
@@ -671,7 +682,7 @@ def pool_size(sc: Scenario, device=None):
 def estimate(sc: Scenario):
     """Rough size and cost of a run, from the scenario alone (no GPU): for the operator
     screen's pre-run summary and build()'s log."""
-    gmass = sc.material.mass
+    gmass = sc.material.mean_mass
     dt, _sub, _E = resolve_dt(sc)
     rate = sum(i.mass_rate for i in sc.injectors)
     kg, res, how = holdup_estimate(sc)
@@ -688,7 +699,10 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     injection sites...) shared by run() and tools/dem_bench.py."""
     log = (lambda *a, **k: None) if quiet else print
     m, s = sc.material, sc.solver
-    radius, gmass = m.radius, m.mass
+    # with a size distribution: the largest radius sizes the lattice, grids and clearances,
+    # the mean grain mass converts mass rates to grain rates (one size: radius and mass)
+    radius, gmass = m.radius_max, m.mean_mass
+    classes = m.classes()
     hertz = m.contact == "hertz"
     unit = sc.unit_scale
 
@@ -709,11 +723,19 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                                       f"{sc.name}_{datetime.datetime.now():%Y%m%d_%H%M%S}")
     os.makedirs(out_dir, exist_ok=True)
 
-    t_r = rayleigh_time(radius, m.density, youngs_eff, m.poisson)
+    t_r = rayleigh_time(m.radius_min, m.density, youngs_eff, m.poisson)
     log("=" * 74)
     log(f"DEM scenario: {sc.name}  (SolverGranularDEM)")
     log("=" * 74)
-    log(f"  grain                 r {radius*1e3:.1f} mm, m {gmass*1e3:.4f} g, rho {m.density:g}")
+    if len(classes) == 1:
+        log(f"  grain                 r {radius*1e3:.1f} mm, m {gmass*1e3:.4f} g, rho {m.density:g}")
+    else:
+        log(f"  grain sizes           {len(classes)} classes, rho {m.density:g}, mean grain "
+            f"{gmass*1e3:.4f} g:")
+        tot_w = sum(mk * pk for _r, mk, pk in classes)
+        for rk, mk, pk in classes:
+            log(f"                          r {rk*1e3:6.2f} mm  m {mk*1e3:9.4f} g  "
+                f"{100*mk*pk/tot_w:5.1f}% by mass  {100*pk:5.1f}% by number")
     log(f"  mass flow             {total_rate*gmass:g} kg/s -> {total_rate:,.0f} grains/s")
     log(f"  friction              grain-grain slide {m.friction:.3f}  roll {m.rolling_friction:.3f}"
         f";  wall roll {m.wall_rolling_friction:.3f}")
@@ -863,6 +885,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     # inlet capacity, the same rule for every source (and the UI's): the inlet seen along the
     # injection velocity passes at most cross-section x lattice packing x density x speed
     packing = (4.0 / 3.0) * math.pi / inj.site_spacing ** 3
+    if len(classes) > 1:      # sites spaced for the largest grain, filled by the mean one
+        packing *= m.mean_mass / (m.density * 4.0 / 3.0 * math.pi * radius ** 3)
     if inj.box:
         xs = fr["width"] * fr["height"]
     elif inj.extrude > 0.0:
@@ -913,6 +937,23 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     model.particle_max_velocity = s.max_velocity
     model.set_gravity(tuple(sc.gravity))
     n_pool = model.particle_count
+    # size classes: each pool slot gets one for good (seeded draw by number fraction), so a
+    # spawned grain simply has its slot's radius and mass and the GPU injection, recycling
+    # and contact code are unchanged.  One class: nothing to set.
+    n_cls = len(classes)
+    class_host = np.zeros(n_pool, dtype=np.int32)
+    if n_cls > 1:
+        crng = np.random.default_rng(s.seed + 104729)
+        class_host = crng.choice(n_cls, size=n_pool, p=[pk for _r, _m, pk in classes]).astype(np.int32)
+        rad = np.array([rk for rk, _m, _p in classes], dtype=np.float64)[class_host]
+        mas = np.array([mk for _r, mk, _p in classes], dtype=np.float64)[class_host]
+        model.particle_radius.assign(rad.astype(np.float32))
+        model.particle_inv_mass.assign((1.0 / mas).astype(np.float32))
+        if getattr(model, "particle_mass", None) is not None:
+            model.particle_mass.assign(mas.astype(np.float32))
+    class_id = wp.array(class_host, dtype=wp.int32, device=device)
+    class_mass = wp.array(np.array([mk for _r, mk, _p in classes] if n_cls > 1 else [gmass],
+                                   dtype=np.float32), dtype=float, device=device)
 
     collider, meshes = build_collider(
         parts,
@@ -959,8 +1000,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     s0, s1 = model.state(), model.state()
     free_idx = wp.array(np.arange(n_pool, dtype=np.int32), dtype=wp.int32, device=device)
     free_count = wp.array([n_pool], dtype=wp.int32, device=device)
-    discharged = wp.zeros(1, dtype=wp.int32, device=device)
-    escaped = wp.zeros(1, dtype=wp.int32, device=device)
+    discharged = wp.zeros(n_cls, dtype=wp.int32, device=device)    # per size class
+    escaped = wp.zeros(n_cls, dtype=wp.int32, device=device)
     injected = wp.zeros(1, dtype=int, device=device)
     starved = wp.zeros(1, dtype=int, device=device)
     occupied = wp.zeros(len(sites), dtype=int, device=device)
@@ -970,7 +1011,9 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                       device=device)
     reg_hi = wp.array(np.array([r.hi for r in regs] or [[0.0] * 3], dtype=np.float32), dtype=wp.vec3,
                       device=device)
-    stats = wp.zeros(4 + 3 * max(len(regs), 1), dtype=float, device=device)
+    # [n, KE, sum|w|, max speed, 3 per region, then grains per size class: in the domain,
+    # then per region] -- counts, so the host turns them into kg exactly
+    stats = wp.zeros(4 + 3 * max(len(regs), 1) + n_cls * (1 + len(regs)), dtype=float, device=device)
     spawn_vel = wp.vec3(*[float(c) for c in spawn_velocity])
     return argparse.Namespace(
         sc=sc, model=model, solver=solver, collider=collider, meshes=meshes, parts=parts,
@@ -980,7 +1023,9 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         injected=injected, starved=starved, lattice=lattice, occupied=occupied, backlog=backlog,
         reg_lo=reg_lo, reg_hi=reg_hi, stats=stats, spawn_vel=spawn_vel, park_lo=park_lo,
         out_dir=out_dir, device=device, kd_pp=kd_pp, kd_wall=kd_wall, restitution=e, zeta=zeta,
-        youngs_eff=youngs_eff, skin=skin, grain_mass=gmass, grain_radius=radius)
+        youngs_eff=youngs_eff, skin=skin, grain_mass=gmass, grain_radius=radius,
+        classes=classes, n_cls=n_cls, class_id=class_id, class_mass=class_mass,
+        class_host=class_host)
 
 
 # ---------------------------------------------------------------------------
@@ -993,6 +1038,15 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     sc, model, solver, device = S.sc, S.model, S.solver, S.device
     s0, dt, substeps, batch = S.s0, S.dt, S.substeps, S.batch
     gmass, out_dir, n_pool = S.grain_mass, S.out_dir, S.n_pool
+    # mass from per-size-class grain counts (exact; one class: count x grain mass as before)
+    n_cls = S.n_cls
+    cls_m = np.array([mk for _r, mk, _p in S.classes], dtype=np.float64)
+    cls_r_host = (np.array([rk for rk, _m, _p in S.classes], dtype=np.float32)[S.class_host]
+                  if n_cls > 1 else None)
+
+    def kg(counts):
+        counts = np.asarray(counts, dtype=np.float64).reshape(-1)
+        return float(counts[0] * gmass) if n_cls == 1 else float(counts @ cls_m)
     out = sc.output
 
     if out.vtk:
@@ -1191,11 +1245,14 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                                 for b in range(3):
                                     if b != a:
                                         inside &= (pt[:, b] >= fp.lo[b]) & (pt[:, b] <= fp.hi[b])
-                                flow_kg[k] += inside.sum() * gmass
+                                flow_kg[k] += (inside.sum() * gmass if n_cls == 1 else
+                                               kg(np.bincount(S.class_host[cross][inside],
+                                                              minlength=n_cls)))
                 wp.launch(recycle, dim=n_pool, device=device, inputs=[
                     s0.particle_q, s0.particle_qd, model.particle_flags,
                     wp.vec3(*sc.domain_lo), wp.vec3(*sc.domain_hi), S.park_lo,
-                    S.free_idx, S.free_count, S.discharged, S.escaped, down_axis, down_sign])
+                    S.free_idx, S.free_count, S.discharged, S.escaped, down_axis, down_sign,
+                    S.class_id])
                 # recycle appends with atomics (arbitrary order): re-sort the free list so
                 # the next spawns get the same pool slots on every run.  Once per frame.
                 _fc = int(S.free_count.numpy()[0])
@@ -1229,26 +1286,31 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
             S.stats.zero_()
             wp.launch(region_stats, dim=n_pool, device=device, inputs=[
                 s0.particle_q, s0.particle_qd, model.particle_flags, solver.particle_w,
-                gmass, S.reg_lo, S.reg_hi, S.stats])
+                S.class_id, S.class_mass, n_cls, S.reg_lo, S.reg_hi, S.stats])
             st = S.stats.numpy()
             n = st[0]
-            out_kg = int(S.discharged.numpy()[0]) * gmass
+            cb = 4 + 3 * max(len(regs), 1)            # start of the per-class counts
+            held_kg = n * gmass if n_cls == 1 else kg(st[cb:cb + n_cls])
+            out_kg = kg(S.discharged.numpy()) if n_cls > 1 else int(S.discharged.numpy()[0]) * gmass
             wall = time.time() - t0
-            row = [f"{frame*S.frame_dt:.4f}", f"{int(n)}", f"{n*gmass:.6f}", f"{st[1]:.6f}",
+            row = [f"{frame*S.frame_dt:.4f}", f"{int(n)}", f"{held_kg:.6f}", f"{st[1]:.6f}",
                    f"{st[3]:.4f}"]
             show = []
             for k, r in enumerate(regs):
                 c, sv = st[4 + 3 * k], st[5 + 3 * k]
                 v = sv / c if c > 0 else 0.0
-                row += [f"{c*gmass:.6f}", f"{v:.4f}"]
-                show.append(f"{c*gmass:11.2f} {v:5.2f}")
+                rk = c * gmass if n_cls == 1 else kg(st[cb + n_cls * (1 + k):cb + n_cls * (2 + k)])
+                row += [f"{rk:.6f}", f"{v:.4f}"]
+                show.append(f"{rk:11.2f} {v:5.2f}")
             row.append(f"{(st[2] / n if n > 0 else 0.0):.3f}")
             for k, r in enumerate(regs):
                 if r.spin:
                     c = st[4 + 3 * k]
                     row.append(f"{(st[6 + 3 * k] / c if c > 0 else 0.0):.3f}")
-            inj_kg = int(S.injected.numpy()[0]) * gmass
-            esc_kg = int(S.escaped.numpy()[0]) * gmass
+            esc_kg = kg(S.escaped.numpy()) if n_cls > 1 else int(S.escaped.numpy()[0]) * gmass
+            # grains only enter by injection: with several sizes, injected = held + out + escaped
+            inj_kg = (int(S.injected.numpy()[0]) * gmass if n_cls == 1
+                      else held_kg + out_kg + esc_kg)
             row += [f"{out_kg:.6f}", f"{inj_kg:.6f}", f"{esc_kg:.6f}"]
             row += [f"{kg:.6f}" for kg in flow_kg]
             row += [f"{wall:.2f}"]
@@ -1268,7 +1330,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 # No rng state: the injection schedule is drawn up front from the seed, so a
                 # resume regenerates it and continues at global step nstep.
                 print(f"  checkpoint written at t = {sim_t:.4f} s", flush=True)
-            print(f"{frame*S.frame_dt:7.3f} {int(n):9,d} {n*gmass:8.2f} {st[1]:10.2f} "
+            print(f"{frame*S.frame_dt:7.3f} {int(n):9,d} {held_kg:8.2f} {st[1]:10.2f} "
                   + " ".join(show) + f" {out_kg:9.2f} {wall:6.0f}", flush=True)
 
             if out.vtk:
@@ -1277,7 +1339,8 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 if len(act):
                     write_particles_vtk(os.path.join(out_dir, f"frame_{frame:04d}_particles.vtk"),
                                         frame, s0.particle_q.numpy()[act],
-                                        s0.particle_qd.numpy()[act], S.grain_radius,
+                                        s0.particle_qd.numpy()[act],
+                                        S.grain_radius if n_cls == 1 else cls_r_host[act],
                                         spin=solver.particle_w.numpy()[act], ids=act)
     except KeyboardInterrupt:
         print("\ninterrupted")
@@ -1287,11 +1350,17 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
         print(f"neighbour list: {nbr_fallbacks} grain-steps fell back to a direct search")
     # mass audit: scheduled vs delivered injection, and where the mass went
     t_end = min(sim_t, S.inj.stop) - max(S.inj.start, 0.0)
-    inj_kg = int(S.injected.numpy()[0]) * gmass
     target = S.inj.mass_rate * max(t_end, 0.0)
-    held = int(S.stats.numpy()[0]) * gmass
-    out_kg = int(S.discharged.numpy()[0]) * gmass
-    esc_kg = int(S.escaped.numpy()[0]) * gmass
+    if n_cls == 1:
+        inj_kg = int(S.injected.numpy()[0]) * gmass
+        held = int(S.stats.numpy()[0]) * gmass
+        out_kg = int(S.discharged.numpy()[0]) * gmass
+        esc_kg = int(S.escaped.numpy()[0]) * gmass
+    else:
+        cb = 4 + 3 * max(len(regs), 1)
+        held = kg(S.stats.numpy()[cb:cb + n_cls])
+        out_kg, esc_kg = kg(S.discharged.numpy()), kg(S.escaped.numpy())
+        inj_kg = held + out_kg + esc_kg
     print(f"mass audit: injected {inj_kg:.2f} kg vs target {target:.2f} kg "
           f"({S.inj.mass_rate:g} kg/s x {t_end:.3f} s; {100*inj_kg/max(target,1e-12):.2f}%)"
           f";  held {held:.2f} + discharged {out_kg:.2f} + escaped {esc_kg:.2f} = "

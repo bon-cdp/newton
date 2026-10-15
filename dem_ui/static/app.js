@@ -136,6 +136,42 @@ const MATERIAL_FIELDS = [
   ["wall_cohesion", "number?", "wall cohesion (J/m³, blank = same)"],
 ];
 
+// Size distribution: rows of radius (m) and MASS fraction (%, as a sieve curve; need not
+// sum to 100).  No rows = every grain has the material's radius.
+function renderSizes(sc) {
+  const box = $("#size-dist"), mat = sc.material;
+  const changed = () => { renderSizes(sc); updateCapacity(); refreshEstimate(); };
+  const rows = mat.sizes || [];
+  box.innerHTML = `<table class="tbl"><thead><tr><th>radius (m)</th><th>mass %</th><th title="share of grains by number">grains %</th><th></th></tr></thead><tbody></tbody></table>
+    <button type="button" id="size-add">+ size</button> <span id="size-note" style="color:var(--muted);font-size:11px"></span>`;
+  const tb = box.querySelector("tbody"), cls = sizeClasses(mat);
+  const wsum = rows.reduce((a, s) => a + (+s.fraction > 0 ? +s.fraction : 0), 0);
+  rows.forEach((s, k) => {
+    const tr = document.createElement("tr");
+    const ci = rows.slice(0, k + 1).filter(q => +q.fraction > 0 && +q.radius > 0).length - 1;
+    const live = +s.fraction > 0 && +s.radius > 0;
+    tr.innerHTML = `<td><input type="number" step="any" value="${s.radius}" style="width:6em"></td>
+      <td><input type="number" step="any" value="${+(s.fraction * 100).toPrecision(6)}" style="width:5em"></td>
+      <td class="num">${live ? fmt(100 * cls[ci].p) : "—"}</td><td><button type="button" title="remove">×</button></td>`;
+    const [ir, iw] = tr.querySelectorAll("input");
+    ir.onchange = () => { s.radius = +ir.value; changed(); };
+    iw.onchange = () => { s.fraction = +iw.value / 100; changed(); };
+    tr.querySelector("button").onclick = () => { rows.splice(k, 1); if (!rows.length) delete mat.sizes; changed(); };
+    tb.appendChild(tr);
+  });
+  box.querySelector("#size-add").onclick = () => {
+    mat.sizes = rows;
+    if (!rows.length) rows.push({ radius: +mat.radius, fraction: 1 });   // the current size first
+    rows.push({ radius: +(+mat.radius / 2).toPrecision(3), fraction: 0 });
+    changed();
+  };
+  const mean = cls.reduce((a, k) => a + k.p * k.m, 0);
+  box.querySelector("#size-note").textContent = !rows.length
+    ? "one size: every grain has the radius above"
+    : `${cls.length} size${cls.length > 1 ? "s" : ""} (the radius above is not used) · mean grain ${fmt(mean * 1e3)} g` +
+      (wsum > 0 && Math.abs(wsum - 1) > 1e-6 ? ` · mass % sum to ${fmt(wsum * 100)}, normalised` : "");
+}
+
 async function openScenario(path) {
   S.scenPath = path; S.scen = await api(`/api/scenario?path=${encodeURIComponent(path)}`);
   S.geoKey = null;
@@ -199,6 +235,7 @@ function renderSetup() {
       : type === "number" ? +inp.value : inp.value;
     l.appendChild(inp); mf.appendChild(l);
   }
+  renderSizes(sc);
   // parts
   const tb = $("#parts-table tbody"); tb.innerHTML = "";
   sc.parts.forEach((p, k) => {
@@ -278,6 +315,21 @@ function refreshEstimate() {
 // "injection volume from belt reference").  A box can pass at most
 // width x height x packing x density x speed; the lattice packing is (4/3 pi r^3)/(2.2 r)^3.
 const LATTICE_PACKING = (4 / 3) * Math.PI / Math.pow(2.2, 3);
+
+// Size classes as dem_scenario.Material.classes(): [{r, m, p}] with p the NUMBER fraction
+// (mass fractions w over grain masses, normalised).  No rows = one size, material.radius.
+function sizeClasses(mat) {
+  const rows = (mat.sizes || []).filter(s => +s.fraction > 0 && +s.radius > 0);
+  if (!rows.length) return [{ r: +mat.radius, m: 4 / 3 * Math.PI * mat.radius ** 3 * mat.density, p: 1 }];
+  const c = rows.map(s => ({ r: +s.radius, m: 4 / 3 * Math.PI * s.radius ** 3 * mat.density, w: +s.fraction }));
+  const tot = c.reduce((a, k) => a + k.w / k.m, 0);
+  return c.map(k => ({ r: k.r, m: k.m, p: k.w / k.m / tot }));
+}
+// lattice packing: sites spaced for the largest grain, each holding a grain of mean size
+function packing(mat) {
+  const c = sizeClasses(mat), rmax = Math.max(...c.map(k => k.r));
+  return LATTICE_PACKING * c.reduce((a, k) => a + k.p * k.r ** 3, 0) / rmax ** 3;
+}
 
 async function renderInjector(sc) {
   const inf = $("#injector-fields"); inf.innerHTML = "";
@@ -390,7 +442,7 @@ function updateCapacity() {
     const g = S.geo?.injectors?.[0];
     if (!inj.face_stl || g?.cross_section == null) { el.textContent = ""; return; }
     const speed = Math.hypot(...inj.velocity);
-    const cap = g.cross_section * LATTICE_PACKING * sc.material.density * speed;
+    const cap = g.cross_section * packing(sc.material) * sc.material.density * speed;
     const ok = cap >= inj.mass_rate * 1.1;
     el.className = "msg " + (ok ? "ok" : "err");
     el.textContent = speed <= 0
@@ -405,7 +457,7 @@ function updateCapacity() {
     const p = sc.parts.find(q => q.name === bx.part);
     speed = p?.motion ? Math.hypot(...p.motion.velocity) : 0;
   }
-  const cap = bx.width * bx.height * LATTICE_PACKING * sc.material.density * speed;
+  const cap = bx.width * bx.height * packing(sc.material) * sc.material.density * speed;
   const ok = cap >= inj.mass_rate * 1.1;
   el.className = "msg " + (ok ? "ok" : "err");
   el.textContent = `box can pass ≈ ${fmt(cap)} kg/s (${fmt(cap * 3.6)} t/h) at ${fmt(speed)} m/s — ` +
@@ -609,9 +661,10 @@ async function showFrame(i) {
   const buf = await api(`/api/runs/${S.run}/frame/${k}`);
   const n = new Uint32Array(buf, 0, 1)[0];
   const pos = new Float32Array(buf, 4, n * 3), spd = new Float32Array(buf, 4 + 12 * n, n);
-  S.lastSpeed = spd; S.lastPos = pos;
+  const rad = buf.byteLength >= 4 + 20 * n && n ? new Float32Array(buf, 4 + 16 * n, n) : null;
+  S.lastSpeed = spd; S.lastPos = pos; S.lastRadius = rad;
   if (S.speedMax == null) autoSpeedRange(spd);
-  viewer.setParticles(pos, spd, S.speedMin, S.speedMax);
+  viewer.setParticles(pos, spd, S.speedMin, S.speedMax, rad);
   viewer.showParticles($("#show-particles").checked);
   if ($("#colour-by").value === "speed") particleLegend();
   showDust(k);
@@ -809,7 +862,7 @@ function particleLegend() {
     () => { autoSpeedRange(S.lastSpeed); recolourParticles(); particleLegend(); });
 }
 function recolourParticles() {
-  if (S.lastPos) viewer.setParticles(S.lastPos, S.lastSpeed, S.speedMin, S.speedMax);
+  if (S.lastPos) viewer.setParticles(S.lastPos, S.lastSpeed, S.speedMin, S.speedMax, S.lastRadius);
   viewer.showParticles($("#show-particles").checked);
 }
 

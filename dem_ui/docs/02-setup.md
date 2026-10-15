@@ -49,6 +49,17 @@ tangential/normal stiffness ratio.  New projects start from placeholder values (
 1000 kg/m³) — **set the real material**: grain size and density decide how many grains the
 run needs and therefore its cost (see *Run estimate*).
 
+**Size distribution** mixes sphere sizes. Press **+ size**: a row with the current radius at
+100 % appears, then a smaller size at 0 %. Each row takes a radius (m) and a **mass %**, the
+way a sieve curve is given; percentages need not add up to 100, they are normalised. The
+*grains %* column shows the share of each size by count. While the table has rows, the single
+**grain radius** above is not used. Remove every row to go back to one size.
+
+- The timestep comes from the smallest grain, and injection spacing and grids from the largest,
+  so a wide spread costs time.
+- Mass rates, held/discharged masses, flows and regions count each grain at its own mass.
+- Playback draws each size at its own diameter.
+
 **Cohesion** (J/m³) makes grains stick to each other and to walls, for moist or sticky
 material.  The model is the simplified JKR one used by LIGGGHTS and EDEM: while two grains
 (or a grain and a wall) overlap by *d*, they also pull together with

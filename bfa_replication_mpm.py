@@ -305,7 +305,7 @@ def write_particles_vtk(path, frame, pos, vel, radius, binary=True, spin=None, i
             f.writelines("1\n" for _ in range(n))
             f.write(f"\nPOINT_DATA {n}\n")
             f.write("SCALARS radius float 1\nLOOKUP_TABLE default\n")
-            f.writelines(f"{radius}\n" for _ in range(n))
+            f.writelines(f"{r}\n" for r in np.broadcast_to(np.asarray(radius, dtype=np.float32), (n,)))
             f.write("\nSCALARS speed float 1\nLOOKUP_TABLE default\n")
             f.writelines(f"{s}\n" for s in speed)
             f.write("\nVECTORS velocity float\n")

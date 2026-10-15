@@ -291,29 +291,50 @@ export class Viewer {
     if (p) { p.mesh.visible = on; p.edges.visible = on; }
   }
 
-  setParticles(pos, scalar, lo, hi) {
+  // radii: one per grain (a size distribution), or null = every grain grainRadius.
+  // PointsMaterial has one size, so each distinct radius gets its own THREE.Points.
+  setParticles(pos, scalar, lo, hi, radii = null) {
     const n = pos.length / 3, cols = new Float32Array(n * 3);
     for (let i = 0; i < n; i++) cols.set(colormap((scalar[i] - lo) / (hi - lo || 1)), i * 3);
-    if (!this.points) {
-      const g = new THREE.BufferGeometry();
-      this.points = new THREE.Points(g, new THREE.PointsMaterial({
-        size: this.pointSize(), sizeAttenuation: true, vertexColors: true,
-        map: this.sprite, alphaTest: 0.5 }));
-      this.scene.add(this.points);
+    const groups = new Map();                       // radius (µm) -> grain indices
+    if (radii) for (let i = 0; i < n; i++) {
+      const key = Math.round(radii[i] * 1e6);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(i);
     }
-    this.points.material.size = this.pointSize();
-    const g = this.points.geometry;
-    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-    g.setAttribute("color", new THREE.BufferAttribute(cols, 3));
-    g.computeBoundingSphere();
+    const sets = groups.size > 1
+      ? [...groups].map(([key, idx]) => {
+          const p = new Float32Array(idx.length * 3), c = new Float32Array(idx.length * 3);
+          idx.forEach((i, j) => { p.set(pos.subarray(3 * i, 3 * i + 3), 3 * j); c.set(cols.subarray(3 * i, 3 * i + 3), 3 * j); });
+          return [key * 1e-6, p, c];
+        })
+      : [[groups.size ? [...groups.keys()][0] * 1e-6 : this.grainRadius, pos, cols]];
+    if (!this.points) { this.points = new THREE.Group(); this.scene.add(this.points); }
+    while (this.points.children.length > sets.length) {
+      const o = this.points.children.at(-1);
+      o.geometry.dispose(); o.material.dispose(); this.points.remove(o);
+    }
+    sets.forEach(([r, p, c], k) => {
+      let pts = this.points.children[k];
+      if (!pts) {
+        pts = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({
+          sizeAttenuation: true, vertexColors: true, map: this.sprite, alphaTest: 0.5 }));
+        this.points.add(pts);
+      }
+      pts.material.size = this.pointSize(r);
+      const g = pts.geometry;
+      g.setAttribute("position", new THREE.BufferAttribute(p, 3));
+      g.setAttribute("color", new THREE.BufferAttribute(c, 3));
+      g.computeBoundingSphere();
+    });
   }
 
   // three.js draws an attenuated point size * (viewport height / 2) / depth pixels across,
   // which leaves out the camera's field of view: a grain's true diameter on screen is
   // 2r * (height / 2) / (depth * tan(fov / 2)).  The disc sprite fills 31/32 of its texture.
-  pointSize() {
+  pointSize(r = this.grainRadius) {
     const t = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-    return 2 * this.grainRadius / t * 32 / 31;
+    return 2 * r / t * 32 / 31;
   }
 
   showParticles(on) { if (this.points) this.points.visible = on; }
