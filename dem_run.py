@@ -459,6 +459,65 @@ def _ray_hits(o, d, v, f):
     return o + np.outer(t[hit], d)
 
 
+def face_frame(tris, flip=False):
+    """(centroid, e1, e2, n) of a planar injection face: n is the area-weighted face normal
+    (reversed with flip), e1 the face's longest in-plane direction, e2 = n x e1."""
+    a, b, c = tris[:, 0], tris[:, 1], tris[:, 2]
+    nv = np.cross(b - a, c - a).sum(axis=0)
+    nl = float(np.linalg.norm(nv))
+    if nl < 1e-12:
+        raise ValueError("injection face has no area (or its triangles cancel out)")
+    n = nv / nl * (-1.0 if flip else 1.0)
+    pts = tris.reshape(-1, 3)
+    p0 = pts.mean(axis=0)
+    q = (pts - p0) - np.outer((pts - p0) @ n, n)
+    _u, _s, vt = np.linalg.svd(q, full_matrices=False)
+    e1 = vt[0] - (vt[0] @ n) * n
+    e1 /= np.linalg.norm(e1)
+    return p0, e1, np.cross(n, e1), n
+
+
+def face_volume_lattice(tris, spacing, depth, flip=False):
+    """Lattice sites filling the volume swept by a planar face along its normal: the face
+    extruded by `depth` (m) on its normal side (the other side with flip).  Grains need
+    room to spawn, which a bare face does not give.  Returns (sites, idx (iu, iv, iw),
+    lattice origin, (e1, e2, n), (nu, nv, nw), max off-plane distance of the face)."""
+    p0, e1, e2, n = face_frame(tris, flip)
+    pts = tris.reshape(-1, 3)
+    off_plane = float(np.abs((pts - p0) @ n).max())
+    u, v = (pts - p0) @ e1, (pts - p0) @ e2
+    gu = np.arange(u.min() + 0.5 * spacing, u.max(), spacing)
+    gv = np.arange(v.min() + 0.5 * spacing, v.max(), spacing)
+    nw = max(1, int(depth // spacing))
+    UU, VV = np.meshgrid(gu, gv, indexing="ij")
+    cu, cv = UU.ravel(), VV.ravel()
+    inside = np.zeros(cu.size, dtype=bool)
+    tu, tv = ((tris - p0) @ e1), ((tris - p0) @ e2)            # (n_tri, 3) in-plane coords
+    for k in range(len(tris)):                                   # 2D point-in-triangle
+        x0, y0 = tu[k, 0], tv[k, 0]
+        d1x, d1y = tu[k, 1] - x0, tv[k, 1] - y0
+        d2x, d2y = tu[k, 2] - x0, tv[k, 2] - y0
+        den = d1x * d2y - d2x * d1y
+        if abs(den) < 1e-18:
+            continue
+        px, py = cu - x0, cv - y0
+        s = (px * d2y - d2x * py) / den
+        t = (d1x * py - px * d1y) / den
+        inside |= (s >= 0) & (t >= 0) & (s + t <= 1)
+    iu, iv = np.unravel_index(np.flatnonzero(inside), UU.shape)
+    origin = p0 + e1 * gu[0] + e2 * gv[0] + n * (0.5 * spacing) if len(gu) and len(gv) else p0
+    idx = np.array([(a, b, w) for w in range(nw) for a, b in zip(iu, iv)], dtype=int).reshape(-1, 3)
+    sites = (origin + np.outer(idx[:, 0] * spacing, e1) + np.outer(idx[:, 1] * spacing, e2)
+             + np.outer(idx[:, 2] * spacing, n))
+    return sites, idx, origin, (e1, e2, n), (len(gu), len(gv), nw), off_plane
+
+
+def face_volume_triangles(tris, depth, flip=False):
+    """(base, top) triangles of an extruded injection face, for drawing."""
+    _p0, _e1, _e2, n = face_frame(tris, flip)
+    return tris, tris + n * depth
+
+
 def box_lattice(fr, spacing):
     """Lattice sites filling an injector box: (sites, (iu, iv, iw) per site, lattice origin,
     (u, v, n) axes, (nu, nv, nw))."""
@@ -688,6 +747,18 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
             spawn_velocity = fr["velocity"]
         what = (f"injection box {fr['length']:g} x {fr['width']:g} x {fr['height']:g} m "
                 f"{fr['describe']}")
+    elif inj.extrude > 0.0:
+        # the face extruded along its normal into a volume, so grains have room to spawn
+        tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
+        tris = tris + np.asarray(inj.offset, dtype=np.float64)
+        sites, idx, lat_origin, axes, dims, off_plane = face_volume_lattice(
+            tris, site_spacing, inj.extrude, inj.extrude_flip)
+        if off_plane > 0.5 * site_spacing:
+            log(f"  !! injection face is not flat ({off_plane*1e3:.1f} mm off its mean plane): "
+                f"the volume follows the mean plane")
+        what = (f"injection face        {face_area:.4f} m2 extruded {inj.extrude:g} m along its "
+                f"{'reversed ' if inj.extrude_flip else ''}normal "
+                f"({', '.join(f'{x:.3f}' for x in axes[2])}), {dims[2]} layer(s)")
     else:
         tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
         sites = lattice_sites(tris, site_spacing)

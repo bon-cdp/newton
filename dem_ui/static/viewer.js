@@ -103,6 +103,21 @@ export class Viewer {
         const t = b64(inj.triangles, Float32Array);
         const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(t, 3));
         this.world.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.5 })));
+        if (inj.top_triangles) {
+          // extruded injection volume: the swept face, its outline joined to the face, and an
+          // arrow along the extrusion direction
+          const tt = b64(inj.top_triangles, Float32Array);
+          const g2 = new THREE.BufferGeometry(); g2.setAttribute("position", new THREE.BufferAttribute(tt, 3));
+          this.world.add(new THREE.Mesh(g2, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.18, depthWrite: false })));
+          const seg = [];
+          for (let k = 0; k < t.length; k += 3) seg.push(t[k], t[k + 1], t[k + 2], tt[k], tt[k + 1], tt[k + 2]);
+          const lg = new THREE.BufferGeometry(); lg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(seg), 3));
+          this.world.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x16a34a, transparent: true, opacity: 0.6 })));
+          const len = Math.max(inj.depth, 1e-3);
+          this.world.add(new THREE.ArrowHelper(new THREE.Vector3(...inj.normal), new THREE.Vector3(...inj.centre),
+                                               len * 1.4, 0x15803d, len * 0.35, len * 0.2));
+          for (let k = 0; k < tt.length; k += 3) box.expandByPoint(new THREE.Vector3(tt[k], tt[k + 1], tt[k + 2]));
+        }
       }
       if (inj.box_corners) this.world.add(...this.injectorBox(inj.box_corners));
     }

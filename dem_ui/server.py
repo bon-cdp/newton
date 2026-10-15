@@ -262,6 +262,10 @@ async def upload(request: __import__("fastapi").Request):
             inj = (sc.get("injectors") or [None])[0] or {
                 "name": stem, "face_stl": fname, "mass_rate": 10.0, "velocity": [0.0, -1.0, 0.0]}
             inj["face_stl"] = fname
+            inj.pop("box", None)
+            if not inj.get("extrude"):
+                # grains need room to spawn: start with the face extruded 5 grain diameters
+                inj["extrude"] = round(10.0 * float(sc.get("material", {}).get("radius", 0.006)), 4)
             sc["injectors"] = [inj]
         else:
             names = {p["name"] for p in sc["parts"]}
@@ -386,6 +390,12 @@ def _geometry(sc: Scenario):
             elif i.face_stl and os.path.exists(sc.path(i.face_stl)):
                 tris, area = dem_run.face_triangles(sc.path(i.face_stl), sc.unit_scale)
                 entry.update(triangles=_b64(tris.reshape(-1), np.float32), area=area)
+                if i.extrude > 0.0:
+                    # the injection volume: the face swept along its (flippable) normal
+                    _base, top = dem_run.face_volume_triangles(tris, i.extrude, i.extrude_flip)
+                    p0, _e1, _e2, n = dem_run.face_frame(tris, i.extrude_flip)
+                    entry.update(top_triangles=_b64(top.reshape(-1), np.float32),
+                                 normal=n.tolist(), centre=p0.tolist(), depth=i.extrude)
         except (ValueError, KeyError, IndexError) as e:
             entry["error"] = str(e)                # shown in the UI, e.g. no belt under the box
         inj.append(entry)

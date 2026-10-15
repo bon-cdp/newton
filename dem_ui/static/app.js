@@ -322,8 +322,21 @@ async function renderInjector(sc) {
     fs.add(new Option("— choose —", ""));
     for (const f of files) fs.add(new Option(f, f));
     fs.value = inj.face_stl || "";
-    fs.onchange = () => { inj.face_stl = fs.value; refreshInjectorPreview(); };
+    // grains need room to spawn: a chosen face starts extruded by 5 grain diameters
+    const defaultDepth = () => +(10 * (sc.material.radius || 0.006)).toPrecision(3);
+    fs.onchange = () => {
+      inj.face_stl = fs.value;
+      if (fs.value && !(inj.extrude > 0)) inj.extrude = defaultDepth();
+      renderInjector(sc); refreshInjectorPreview();
+    };
     l.appendChild(fs); inf.appendChild(l);
+    field("extrude depth (m, 0 = on the face)", () => inj.extrude ?? 0, v => inj.extrude = Math.max(0, v), { preview: true });
+    const fl = document.createElement("label"); fl.textContent = "extrusion side";
+    const fb = document.createElement("button"); fb.className = "small";
+    fb.textContent = inj.extrude_flip ? "reversed normal — flip" : "face normal — flip";
+    fb.title = "extrude to the other side of the face (the arrow in the 3D view shows the side)";
+    fb.onclick = e => { e.preventDefault(); inj.extrude_flip = !inj.extrude_flip; renderInjector(sc); refreshInjectorPreview(); };
+    fl.appendChild(fb); inf.appendChild(fl);
   } else if (bx.reference === "belt") {
     const l = document.createElement("label"); l.textContent = "belt";
     const bs = document.createElement("select");
@@ -546,6 +559,7 @@ async function refreshRun() {
   $("#results-empty").hidden = true; $("#results-view").hidden = false;
   $("#results-title").textContent = r.id;
   S.frames = r.frames; S.fps = r.fps;
+  if (S.lastRun !== r.id) S.speedMax = null;     // a new run sets its own colour range
   const slider = $("#frame-slider"); slider.max = Math.max(0, S.frames.length - 1);
   if ($("#win0").value === "" || S.lastRun !== r.id) {
     const tEnd = t.at(-1) || dur;
@@ -575,11 +589,11 @@ async function showFrame(i) {
   const buf = await api(`/api/runs/${S.run}/frame/${k}`);
   const n = new Uint32Array(buf, 0, 1)[0];
   const pos = new Float32Array(buf, 4, n * 3), spd = new Float32Array(buf, 4 + 12 * n, n);
-  S.lastSpeed = spd;
-  const hi = S.speedMax || (S.speedMax = Math.max(1, percentile(spd, 0.99)));
-  viewer.setParticles(pos, spd, 0, hi);
+  S.lastSpeed = spd; S.lastPos = pos;
+  if (S.speedMax == null) autoSpeedRange(spd);
+  viewer.setParticles(pos, spd, S.speedMin, S.speedMax);
   viewer.showParticles($("#show-particles").checked);
-  if ($("#colour-by").value === "speed") legend("speed (m/s)", 0, hi);
+  if ($("#colour-by").value === "speed") particleLegend();
   showDust(k);
 }
 
@@ -732,7 +746,7 @@ function refreshColouring() {
   }
   if (key === "speed") {
     viewer.clearWallMap();
-    if (S.lastSpeed) legend("speed (m/s)", 0, S.speedMax || 1);
+    if (S.lastSpeed) particleLegend();
     return;
   }
   const maps = S.analysis?.wall_maps;
@@ -748,9 +762,35 @@ function refreshColouring() {
   legend(`${labels[key]}${w ? `, mean ${fmt(w[0])}–${fmt(w[1])} s` : ""}`, 0, hi);
 }
 
-function legend(title, lo, hi) {
+// onRange(lo, hi), when given, makes the two ends editable (plus an "auto" button).
+function legend(title, lo, hi, onRange, onAuto) {
   const L = $("#legend"); L.hidden = false;
-  L.innerHTML = `<div>${title}</div><div class="bar" style="background:${colormapCss()}"></div><div class="ends"><span>${fmt(lo)}</span><span>${fmt(hi)}</span></div>`;
+  if (!onRange) {
+    L.innerHTML = `<div>${title}</div><div class="bar" style="background:${colormapCss()}"></div><div class="ends"><span>${fmt(lo)}</span><span>${fmt(hi)}</span></div>`;
+    return;
+  }
+  L.innerHTML = `<div>${title}</div><div class="bar" style="background:${colormapCss()}"></div>
+    <div class="ends"><input type="number" step="any" value="${fmt(lo)}" title="colour scale minimum">
+    <button class="small" title="0 to the 99th percentile of this frame">auto</button>
+    <input type="number" step="any" value="${fmt(hi)}" title="colour scale maximum"></div>`;
+  const [a, b] = L.querySelectorAll("input");
+  const apply = () => { const x = +a.value, y = +b.value; if (isFinite(x) && isFinite(y) && y > x) onRange(x, y); };
+  a.onchange = b.onchange = apply;
+  L.querySelector("button").onclick = onAuto;
+}
+
+// Particle colour = velocity magnitude.  The range is set once per run from the first frame
+// shown (0 to its 99th percentile) and then held, so frames stay comparable; the legend
+// ends edit it, "auto" resets it from the current frame.
+function autoSpeedRange(spd) { S.speedMin = 0; S.speedMax = Math.max(1e-3, percentile(spd, 0.99)); }
+function particleLegend() {
+  legend("velocity magnitude (m/s)", S.speedMin, S.speedMax,
+    (lo, hi) => { S.speedMin = lo; S.speedMax = hi; recolourParticles(); },
+    () => { autoSpeedRange(S.lastSpeed); recolourParticles(); particleLegend(); });
+}
+function recolourParticles() {
+  if (S.lastPos) viewer.setParticles(S.lastPos, S.lastSpeed, S.speedMin, S.speedMax);
+  viewer.showParticles($("#show-particles").checked);
 }
 
 // ---------------------------------------------------------------- start

@@ -111,6 +111,9 @@ class Injector:
     set_coordinate: list[float] | None = None   # [axis, value]: place all sites on that plane
     offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # m, added to sites
     box: dict | None = None               # box injector instead of face_stl (see above)
+    extrude: float = 0.0                  # m: fill the face extruded this far along its normal
+                                          # (0 = sites on the face itself, the original layout)
+    extrude_flip: bool = False            # extrude to the other side of the face
 
 
 @dataclass

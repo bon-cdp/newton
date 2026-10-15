@@ -97,7 +97,12 @@ through the part's centre; purple arrows show the axis.  Rigid motion of whole p
 
 **source** chooses how grains enter:
 
-- **STL face** — grains appear on a lattice over a flat face, with the velocity you set.
+- **STL face**: grains appear on a lattice in the volume swept by a flat face along its
+  normal, with the velocity you set.
+  - **extrude depth** sets how far the volume reaches. A new face starts at 5 grain
+    diameters; 0 puts the sites on the face itself, the original layout.
+  - **flip** puts the volume on the other side; the green arrow in the 3D view shows which.
+  - The face may be tilted.
 - **box on belt** — a box of spawn points above a conveyor (BFA's *injection volume from
   belt reference*): position from the belt tail, lateral offset, clearance above the belt
   surface, and the box's length, width and height.  With **move at belt velocity**, grains start
