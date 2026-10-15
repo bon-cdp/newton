@@ -102,7 +102,14 @@ through the part's centre; purple arrows show the axis.  Rigid motion of whole p
   - **extrude depth** sets how far the volume reaches. A new face starts at 5 grain
     diameters; 0 puts the sites on the face itself, the original layout.
   - **flip** puts the volume on the other side; the green arrow in the 3D view shows which.
+  - **offset from face** starts the volume that far from the face, along the same normal,
+    for example to keep spawned grains clear of a wall the face lies on. A negative value
+    moves it back through the face.
   - The face may be tilted.
+  - As for boxes, the panel shows what the inlet can pass: its cross-section seen along the
+    injection velocity × lattice packing × density × speed. If that is less than the mass
+    rate, enlarge the face or the depth, or raise the speed. The run log reports the same
+    check for every injector.
 - **box on belt** — a box of spawn points above a conveyor (BFA's *injection volume from
   belt reference*): position from the belt tail, lateral offset, clearance above the belt
   surface, and the box's length, width and height.  With **move at belt velocity**, grains start

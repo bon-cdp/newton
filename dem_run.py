@@ -477,9 +477,10 @@ def face_frame(tris, flip=False):
     return p0, e1, np.cross(n, e1), n
 
 
-def face_volume_lattice(tris, spacing, depth, flip=False):
+def face_volume_lattice(tris, spacing, depth, flip=False, offset=0.0):
     """Lattice sites filling the volume swept by a planar face along its normal: the face
-    extruded by `depth` (m) on its normal side (the other side with flip).  Grains need
+    extruded by `depth` (m) on its normal side (the other side with flip), starting `offset`
+    (m) from the face along the same normal.  Grains need
     room to spawn, which a bare face does not give.  Returns (sites, idx (iu, iv, iw),
     lattice origin, (e1, e2, n), (nu, nv, nw), max off-plane distance of the face)."""
     p0, e1, e2, n = face_frame(tris, flip)
@@ -505,17 +506,49 @@ def face_volume_lattice(tris, spacing, depth, flip=False):
         t = (d1x * py - px * d1y) / den
         inside |= (s >= 0) & (t >= 0) & (s + t <= 1)
     iu, iv = np.unravel_index(np.flatnonzero(inside), UU.shape)
-    origin = p0 + e1 * gu[0] + e2 * gv[0] + n * (0.5 * spacing) if len(gu) and len(gv) else p0
+    origin = (p0 + e1 * gu[0] + e2 * gv[0] + n * (offset + 0.5 * spacing)
+              if len(gu) and len(gv) else p0)
     idx = np.array([(a, b, w) for w in range(nw) for a, b in zip(iu, iv)], dtype=int).reshape(-1, 3)
     sites = (origin + np.outer(idx[:, 0] * spacing, e1) + np.outer(idx[:, 1] * spacing, e2)
              + np.outer(idx[:, 2] * spacing, n))
     return sites, idx, origin, (e1, e2, n), (len(gu), len(gv), nw), off_plane
 
 
-def face_volume_triangles(tris, depth, flip=False):
-    """(base, top) triangles of an extruded injection face, for drawing."""
+def inlet_cross_section(points, velocity):
+    """Area (m^2) of an inlet seen along its injection velocity: the points projected onto
+    the plane normal to the velocity, convex hull.  A lattice inlet passes at most this area x
+    packing x density x speed (for a box moving along its length, this is width x height)."""
+    v = np.asarray(velocity, dtype=np.float64)
+    sp = float(np.linalg.norm(v))
+    if sp < 1e-12:
+        return 0.0
+    d = v / sp
+    a = np.array([1.0, 0.0, 0.0]) if abs(d[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = a - (a @ d) * d
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(d, e1)
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    q = np.unique(np.round(np.stack([p @ e1, p @ e2], axis=1), 9), axis=0)
+    if len(q) < 3:
+        return 0.0
+    q = q[np.lexsort((q[:, 1], q[:, 0]))]
+
+    def half(pts):                                   # Andrew's monotone chain
+        h = []
+        for pt in pts:
+            while len(h) >= 2 and np.cross(h[-1] - h[-2], pt - h[-2]) <= 0:
+                h.pop()
+            h.append(pt)
+        return h
+    hull = np.array(half(q)[:-1] + half(q[::-1])[:-1])
+    x, y = hull[:, 0], hull[:, 1]
+    return float(0.5 * abs(x @ np.roll(y, -1) - y @ np.roll(x, -1)))
+
+
+def face_volume_triangles(tris, depth, flip=False, offset=0.0):
+    """(base, top) triangles of an extruded injection volume, for drawing."""
     _p0, _e1, _e2, n = face_frame(tris, flip)
-    return tris, tris + n * depth
+    return tris + n * offset, tris + n * (offset + depth)
 
 
 def box_lattice(fr, spacing):
@@ -752,12 +785,13 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
         tris = tris + np.asarray(inj.offset, dtype=np.float64)
         sites, idx, lat_origin, axes, dims, off_plane = face_volume_lattice(
-            tris, site_spacing, inj.extrude, inj.extrude_flip)
+            tris, site_spacing, inj.extrude, inj.extrude_flip, inj.extrude_offset)
         if off_plane > 0.5 * site_spacing:
             log(f"  !! injection face is not flat ({off_plane*1e3:.1f} mm off its mean plane): "
                 f"the volume follows the mean plane")
         what = (f"injection face        {face_area:.4f} m2 extruded {inj.extrude:g} m along its "
-                f"{'reversed ' if inj.extrude_flip else ''}normal "
+                f"{'reversed ' if inj.extrude_flip else ''}normal"
+                + (f" from {inj.extrude_offset:g} m off the face" if inj.extrude_offset else "") + " "
                 f"({', '.join(f'{x:.3f}' for x in axes[2])}), {dims[2]} layer(s)")
     else:
         tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
@@ -826,6 +860,22 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     if spawn_speed * inj_interval < 2.0 * radius:
         log("  !! consecutive injection batches overlap: raise the injection speed or lower "
             "batch_fraction")
+    # inlet capacity, the same rule for every source (and the UI's): the inlet seen along the
+    # injection velocity passes at most cross-section x lattice packing x density x speed
+    packing = (4.0 / 3.0) * math.pi / inj.site_spacing ** 3
+    if inj.box:
+        xs = fr["width"] * fr["height"]
+    elif inj.extrude > 0.0:
+        xs = inlet_cross_section(np.concatenate(face_volume_triangles(
+            tris, inj.extrude, inj.extrude_flip, inj.extrude_offset)), spawn_velocity)
+    else:
+        xs = inlet_cross_section(tris, spawn_velocity)
+    cap = xs * packing * m.density * spawn_speed
+    log(f"  inlet capacity        ~{cap:.4g} kg/s through {xs:.4g} m2 at {spawn_speed:g} m/s "
+        f"(mass rate {inj.mass_rate:g} kg/s)")
+    if cap < inj.mass_rate:
+        log("  !! the inlet cannot pass the mass rate: enlarge it (face, extrusion depth or box) "
+            "or raise the injection speed -- injection will back up")
 
     # --- neighbour list sizing -------------------------------------------------------
     skin = s.skin if s.skin is not None else 2.0 * s.skin_speed * max(s.neighbor_every, 1) * dt

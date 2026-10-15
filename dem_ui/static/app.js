@@ -122,6 +122,7 @@ async function loadGeometry(kind, key) {
   viewer.setUp(kind === "scenario" ? S.scen?.gravity : S.runInfo?.meta?.gravity);
   viewer.setGeometry(geo, r);
   S.geo = geo;
+  if (kind === "scenario") updateCapacity();     // face inlets need the geometry first
 }
 
 // ---------------------------------------------------------------- setup
@@ -331,6 +332,7 @@ async function renderInjector(sc) {
     };
     l.appendChild(fs); inf.appendChild(l);
     field("extrude depth (m, 0 = on the face)", () => inj.extrude ?? 0, v => inj.extrude = Math.max(0, v), { preview: true });
+    field("offset from face (m)", () => inj.extrude_offset ?? 0, v => inj.extrude_offset = v, { preview: true });
     const fl = document.createElement("label"); fl.textContent = "extrusion side";
     const fb = document.createElement("button"); fb.className = "small";
     fb.textContent = inj.extrude_flip ? "reversed normal — flip" : "face normal — flip";
@@ -369,7 +371,9 @@ async function renderInjector(sc) {
     l.appendChild(c); inf.appendChild(l);
   }
   if (!(bx?.reference === "belt" && bx.match_belt !== false))
-    ["x", "y", "z"].forEach((ax, k) => field(`velocity ${ax} (m/s)`, () => inj.velocity[k], v => inj.velocity[k] = v));
+    // a face inlet's capacity depends on the velocity's direction: refresh the preview
+    ["x", "y", "z"].forEach((ax, k) => field(`velocity ${ax} (m/s)`, () => inj.velocity[k], v => inj.velocity[k] = v,
+                                              { preview: !bx }));
   field("start (s)", () => inj.start ?? 0, v => inj.start = v);
   field("stop (s)", () => ((inj.stop ?? INF) >= INF ? "" : inj.stop), v => inj.stop = v || INF);
   const cap = document.createElement("div"); cap.id = "inj-capacity"; cap.className = "msg"; cap.style.gridColumn = "1 / -1";
@@ -379,7 +383,22 @@ async function renderInjector(sc) {
 
 function updateCapacity() {
   const el = $("#inj-capacity"), sc = S.scen, inj = sc?.injectors?.[0];
-  if (!el || !inj?.box) { if (el) el.textContent = ""; return; }
+  if (!el || !inj) { if (el) el.textContent = ""; return; }
+  if (!inj.box) {
+    // STL face (extruded or not): its cross-section seen along the injection velocity, from
+    // the geometry preview, passes area x packing x density x speed -- the box rule
+    const g = S.geo?.injectors?.[0];
+    if (!inj.face_stl || g?.cross_section == null) { el.textContent = ""; return; }
+    const speed = Math.hypot(...inj.velocity);
+    const cap = g.cross_section * LATTICE_PACKING * sc.material.density * speed;
+    const ok = cap >= inj.mass_rate * 1.1;
+    el.className = "msg " + (ok ? "ok" : "err");
+    el.textContent = speed <= 0
+      ? "injection velocity is zero: the inlet cannot pass any mass — set a velocity"
+      : `inlet can pass ≈ ${fmt(cap)} kg/s (${fmt(cap * 3.6)} t/h) at ${fmt(speed)} m/s through ${fmt(g.cross_section)} m² — ` +
+        (ok ? "enough for the mass rate" : "LESS than the mass rate: enlarge the face or the extrusion depth, or raise the speed, or the inlet will choke");
+    return;
+  }
   const bx = inj.box;
   let speed = Math.hypot(...inj.velocity);
   if (bx.reference === "belt" && bx.match_belt !== false) {
@@ -402,6 +421,7 @@ async function refreshInjectorPreview() {
       const err = geo.injectors?.find(i => i.error);
       if (err) showError("Injection: " + err.error);
       viewer.setGeometry(geo, S.scen.material.radius); viewer.setMotionArrows(S.scen.parts);
+      S.geo = geo; updateCapacity();      // face inlets: capacity comes from the preview
     } catch (e) { showError(e.message); }
   }, 300);
 }

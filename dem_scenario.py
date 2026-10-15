@@ -114,6 +114,8 @@ class Injector:
     extrude: float = 0.0                  # m: fill the face extruded this far along its normal
                                           # (0 = sites on the face itself, the original layout)
     extrude_flip: bool = False            # extrude to the other side of the face
+    extrude_offset: float = 0.0           # m: start the extruded volume this far from the face,
+                                          # along the same (flipped) normal
 
 
 @dataclass

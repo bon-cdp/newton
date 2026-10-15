@@ -390,11 +390,20 @@ def _geometry(sc: Scenario):
             elif i.face_stl and os.path.exists(sc.path(i.face_stl)):
                 tris, area = dem_run.face_triangles(sc.path(i.face_stl), sc.unit_scale)
                 entry.update(triangles=_b64(tris.reshape(-1), np.float32), area=area)
+                # inlet capacity, as for boxes: the inlet's cross-section seen along the
+                # injection velocity (the swept volume when extruded, else the bare face)
+                vol = (np.concatenate(dem_run.face_volume_triangles(
+                           tris, i.extrude, i.extrude_flip, i.extrude_offset))
+                       if i.extrude > 0.0 else tris)
+                entry.update(cross_section=dem_run.inlet_cross_section(vol, i.velocity),
+                             speed=float(np.linalg.norm(i.velocity)))
                 if i.extrude > 0.0:
                     # the injection volume: the face swept along its (flippable) normal
-                    _base, top = dem_run.face_volume_triangles(tris, i.extrude, i.extrude_flip)
+                    base, top = dem_run.face_volume_triangles(tris, i.extrude, i.extrude_flip,
+                                                              i.extrude_offset)
                     p0, _e1, _e2, n = dem_run.face_frame(tris, i.extrude_flip)
                     entry.update(top_triangles=_b64(top.reshape(-1), np.float32),
+                                 base_triangles=_b64(base.reshape(-1), np.float32),
                                  normal=n.tolist(), centre=p0.tolist(), depth=i.extrude)
         except (ValueError, KeyError, IndexError) as e:
             entry["error"] = str(e)                # shown in the UI, e.g. no belt under the box

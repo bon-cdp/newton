@@ -109,8 +109,14 @@ export class Viewer {
           const tt = b64(inj.top_triangles, Float32Array);
           const g2 = new THREE.BufferGeometry(); g2.setAttribute("position", new THREE.BufferAttribute(tt, 3));
           this.world.add(new THREE.Mesh(g2, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.18, depthWrite: false })));
+          // base of the volume: the face itself, or the face moved by the offset
+          const tb = inj.base_triangles ? b64(inj.base_triangles, Float32Array) : t;
+          if (inj.base_triangles) {
+            const gb = new THREE.BufferGeometry(); gb.setAttribute("position", new THREE.BufferAttribute(tb, 3));
+            this.world.add(new THREE.Mesh(gb, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.18, depthWrite: false })));
+          }
           const seg = [];
-          for (let k = 0; k < t.length; k += 3) seg.push(t[k], t[k + 1], t[k + 2], tt[k], tt[k + 1], tt[k + 2]);
+          for (let k = 0; k < tb.length; k += 3) seg.push(tb[k], tb[k + 1], tb[k + 2], tt[k], tt[k + 1], tt[k + 2]);
           const lg = new THREE.BufferGeometry(); lg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(seg), 3));
           this.world.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x16a34a, transparent: true, opacity: 0.6 })));
           const len = Math.max(inj.depth, 1e-3);
