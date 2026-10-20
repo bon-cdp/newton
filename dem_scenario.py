@@ -41,6 +41,10 @@ class Material:
     name: str = "material"
     radius: float = 0.006                 # m
     density: float = 994.05               # kg/m3, intrinsic (solid) density
+    # Bulk density as entered (BFA's "Bulk Density"): when set, the grains' own density is
+    # bulk_density x packing_ratio (BFA's "Packing_Ratio" = intrinsic / bulk density).
+    bulk_density: float | None = None     # kg/m3
+    packing_ratio: float = 1.5
     youngs: float = 1.4220405e8           # Pa, TRUE modulus; the solver may soften it
     poisson: float = 0.30
     restitution: float = 0.20
@@ -67,6 +71,12 @@ class Material:
     # = every grain has `radius`.  Fractions are by MASS, as sieve curves are; they need not
     # sum to 1 (normalised).
     sizes: list | None = None
+
+    def __post_init__(self):
+        if self.bulk_density:
+            rho = float(self.bulk_density) * float(self.packing_ratio)
+            if abs(rho - self.density) > 1e-9 * rho:     # keep a saved value bit-exact
+                self.density = rho
 
     @property
     def mass(self) -> float:

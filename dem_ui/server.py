@@ -174,7 +174,8 @@ def import_project(project: str, preset: str = "reference"):
 
 DEFAULT_SCENARIO = {
     "name": "", "units": "m", "gravity": [0.0, -9.81, 0.0],
-    "material": {"name": "material", "radius": 0.006, "density": 1000.0, "youngs": 1.0e8,
+    "material": {"name": "material", "radius": 0.006, "density": 975.0,
+                 "bulk_density": 650.0, "packing_ratio": 1.5, "youngs": 1.0e8,
                  "poisson": 0.3, "restitution": 0.2, "friction": 0.3, "rolling_friction": 0.3,
                  "wall_rolling_friction": 0.3, "tangential_ratio": 1.0, "contact": "hertz"},
     "parts": [], "injectors": [], "domain": {"lo": [-1.0, -1.0, -1.0], "hi": [1.0, 1.0, 1.0]},

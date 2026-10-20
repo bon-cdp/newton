@@ -127,7 +127,9 @@ async function loadGeometry(kind, key) {
 
 // ---------------------------------------------------------------- setup
 const MATERIAL_FIELDS = [
-  ["name", "text"], ["radius", "number", "grain radius (m)"], ["density", "number", "density (kg/m³)"],
+  ["name", "text"], ["radius", "number", "grain radius (m)"],
+  ["bulk_density", "number", "bulk density (kg/m³)"], ["packing_ratio", "number", "packing ratio (particle ÷ bulk)"],
+  ["density", "readonly", "particle density (kg/m³)"],
   ["youngs", "number", "Young's modulus (Pa)"], ["poisson", "number", "Poisson ratio"],
   ["restitution", "number", "restitution"], ["friction", "number", "grain-grain sliding μ"],
   ["rolling_friction", "number", "grain-grain rolling μ"], ["wall_rolling_friction", "number", "wall rolling μ"],
@@ -218,6 +220,11 @@ function renderSetup() {
   gin.forEach(inp => inp.onchange = () => applyGravity(gin.map(i => +i.value)));
   // material
   const mf = $("#material-fields"); mf.innerHTML = "";
+  // density is entered as BULK density x packing ratio (BFA's convention); scenarios saved
+  // with only the particle density start from density / ratio
+  const mat = sc.material;
+  mat.packing_ratio ??= 1.5;
+  if (mat.bulk_density == null && mat.density) mat.bulk_density = +(mat.density / mat.packing_ratio).toPrecision(6);
   for (const [k, type, label] of MATERIAL_FIELDS) {
     const l = document.createElement("label"); l.textContent = label || k;
     let inp;
@@ -230,9 +237,17 @@ function renderSetup() {
       inp = document.createElement("input"); inp.type = type.startsWith("number") ? "number" : type;
       if (inp.type === "number") inp.step = "any";
     }
+    if (type === "readonly") { inp.type = "text"; inp.readOnly = true; inp.id = "mat-" + k; inp.tabIndex = -1; }
     inp.value = num(sc.material[k]) ?? (k === "cohesion" ? 0 : "");
-    inp.onchange = () => sc.material[k] = type === "number?" ? (inp.value === "" ? null : +inp.value)
-      : type === "number" ? +inp.value : inp.value;
+    inp.onchange = () => {
+      sc.material[k] = type === "number?" ? (inp.value === "" ? null : +inp.value)
+        : type === "number" ? +inp.value : inp.value;
+      if (k === "bulk_density" || k === "packing_ratio") {
+        mat.density = mat.bulk_density * mat.packing_ratio;
+        $("#mat-density").value = fmt(mat.density);
+        renderSizes(sc); updateCapacity();
+      }
+    };
     l.appendChild(inp); mf.appendChild(l);
   }
   renderSizes(sc);

@@ -161,6 +161,9 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
                     f"{0.5*(rmin+rmax)*1e3:.1f} mm used (size distributions: issue #10)")
     radius = 0.5 * (rmin + rmax)
     density = bfa_float(M["Material Intr Density"]) * LB_FT3
+    bulk = bfa_float(M.get("Material Bulk Density", "0E+000")) * LB_FT3
+    # BFA's Packing_Ratio is intrinsic / bulk density (1.4000 here = 62.055 / 44.325 lb/ft3)
+    packing = density / bulk if bulk else bfa_float(M.get("Material Packing_Ratio", "0E+000"))
     coh = bfa_float(M.get("Material Cohesion_Coefficient", "0E+000"))
     if coh:
         warn.append(f"cohesion coefficient {coh:g} ignored (no cohesion model yet)")
@@ -340,7 +343,8 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
                   f"Rayleigh time at the true modulus")
 
     mat = Material(name=next((c["Component Name"] for c in by_type.get("MaterialCondition", [])), "material"),
-                   radius=radius, density=density, youngs=youngs, poisson=0.30, restitution=rest,
+                   radius=radius, density=density, youngs=youngs,
+                   bulk_density=bulk or None, packing_ratio=packing or 1.5, poisson=0.30, restitution=rest,
                    friction=mu_pp, rolling_friction=roll_pp,
                    wall_rolling_friction=common(rolls, 0.5), rot_damp=rotr,
                    rot_damp_wall=common(rots, 0.2), tangential_ratio=1.0, contact="hertz")

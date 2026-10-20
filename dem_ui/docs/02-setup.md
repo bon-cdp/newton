@@ -46,8 +46,14 @@ the domain itself if the injection box sticks out of it.
 Grain radius and density, Young's modulus, Poisson ratio, restitution, grain–grain sliding
 and rolling friction, wall rolling friction, contact law (Hertz–Mindlin or linear) and the
 tangential/normal stiffness ratio.  New projects start from placeholder values (6 mm,
-1000 kg/m³) — **set the real material**: grain size and density decide how many grains the
+650 kg/m³ bulk) — **set the real material**: grain size and density decide how many grains the
 run needs and therefore its cost (see *Run estimate*).
+
+Density is entered as in BFA: the **bulk density** of the material and a **packing ratio**
+(particle density ÷ bulk density, 1.5 by default). The grains get the **particle density** =
+bulk × packing ratio, shown read-only under the two. A BFA import takes both from the
+project. Scenarios saved before this field existed open with bulk = particle density ÷ 1.5,
+which leaves the grains unchanged.
 
 **Size distribution** mixes sphere sizes. Press **+ size**: a row with the current radius at
 100 % appears, then a smaller size at 0 %. Each row takes a radius (m) and a **mass %**, the
