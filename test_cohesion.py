@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Checks for cohesion (simplified JKR) in SolverGranularDEM, against closed forms.
+"""Checks for cohesion in SolverGranularDEM, against closed forms.
 
-With Hertz repulsion F_h = (4/3) E* sqrt(R*) d^1.5 and cohesive pull F_c = k pi R* d:
+Cohesion c is a fraction of grain weight (BulkFlowAnalyst's convention): touching grains
+also pull together with F_c = c m* g (g = 9.81, m* = 2 mi mj / (mi + mj) = m for equal
+grains; a grain on a wall: its own m).  With Hertz repulsion F_h = (4/3) E* sqrt(R*) d^1.5:
 
-  1. grain-grain, no gravity: two touching grains settle at the overlap where the two
-     balance,  d_eq = (3 pi k sqrt(R*) / (4 E*))^2   (R* = r/2, grain-grain E*)
+  1. grain-grain, no gravity: two touching grains settle where the two balance,
+     d_eq = (3 c m g / (4 E* sqrt(R*)))^(2/3)   (R* = r/2, grain-grain E*)
   2. grain-wall, no gravity: the same with the wall's E* and R* = r
-  3. a grain seated under a ceiling, with gravity, stays stuck iff the largest net pull,
-     max_d (F_c - F_h) = k pi r d*/3 with sqrt(d*) = k pi r / (1.5 (4/3) E* sqrt(r)), exceeds
-     its weight: 10% above the threshold it stays, 10% below it falls
+  3. a grain under a ceiling, with gravity, stays stuck iff c > 1: at 1.1 it stays, at
+     0.9 it falls
   4. cohesion 0: nothing changes (no pull, grains do not stick)
 
     .venv/bin/python test_cohesion.py
@@ -69,35 +70,28 @@ def run(model, sv, st, seconds, dt=2.0e-6):
 
 
 # 1. grain-grain equilibrium overlap
-k = 3.0e5
-d_eq = (3.0 * math.pi * k * math.sqrt(R / 2) / (4.0 * E_PP)) ** 2
-model, sv, st = make([[0.0, 0.0, 0.0], [2 * R - 1e-6, 0.0, 0.0]], k_pp=k)
+c = 3.0
+d_eq = (3.0 * c * M * 9.81 / (4.0 * E_PP * math.sqrt(R / 2))) ** (2.0 / 3.0)
+model, sv, st = make([[0.0, 0.0, 0.0], [2 * R - 1e-7, 0.0, 0.0]], k_pp=c)
 q = run(model, sv, st, 0.05)
 d = 2 * R - np.linalg.norm(q[1] - q[0])
 check("grain-grain equilibrium overlap", abs(d / d_eq - 1) < 0.02,
       f"{d*1e6:.2f} um vs closed form {d_eq*1e6:.2f} um")
 
 # 2. grain-wall equilibrium overlap (plate at y = 0, grain above it)
-d_eq_w = (3.0 * math.pi * k * math.sqrt(R) / (4.0 * E_W)) ** 2
-model, sv, st = make([[0.0, R - 1e-6, 0.0]], plane_y=0.0, k_w=k)
+d_eq_w = (3.0 * c * M * 9.81 / (4.0 * E_W * math.sqrt(R))) ** (2.0 / 3.0)
+model, sv, st = make([[0.0, R - 1e-7, 0.0]], plane_y=0.0, k_w=c)
 q = run(model, sv, st, 0.05)
 d = R - q[0][1]
 check("grain-wall equilibrium overlap", abs(d / d_eq_w - 1) < 0.02,
       f"{d*1e6:.2f} um vs closed form {d_eq_w*1e6:.2f} um")
 
-# 3. hanging under a ceiling: threshold cohesion where the largest net pull equals mg
-A = 4.0 / 3.0 * E_W * math.sqrt(R)
-# max_d (k pi R d - A d^1.5) = k pi R d*/3 with sqrt(d*) = k pi R / (1.5 A)  =>  k^3 ~ mg
-k_thr = (M * 9.81 * 3.0 * (1.5 * A) ** 2 / (math.pi * R) ** 3) ** (1.0 / 3.0)
-for factor, should_stick in ((1.1, True), (0.9, False)):
-    # start seated at the no-gravity equilibrium overlap (the stable branch), then let
-    # gravity pull: a grain barely touching has almost no cohesive grip yet
-    kk = factor * k_thr
-    d0 = (3.0 * math.pi * kk * math.sqrt(R) / (4.0 * E_W)) ** 2
-    model, sv, st = make([[0.0, -R + d0, 0.0]], plane_y=0.0, k_w=kk, gravity=-9.81)
+# 3. hanging under a ceiling: the pull holds the grain's weight iff c > 1
+for cc, should_stick in ((1.1, True), (0.9, False)):
+    model, sv, st = make([[0.0, -R + 1e-7, 0.0]], plane_y=0.0, k_w=cc, gravity=-9.81)
     q = run(model, sv, st, 0.05)
     stuck = q[0][1] > -R - 0.001
-    check(f"hangs under a ceiling at {factor:.1f} x threshold ({factor * k_thr:.3g} J/m3)",
+    check(f"hangs under a ceiling at cohesion {cc:.1f}",
           stuck == should_stick, f"{'stuck' if stuck else 'fell'} (expected "
           f"{'stuck' if should_stick else 'fell'}), y = {q[0][1]*1e3:.2f} mm")
 

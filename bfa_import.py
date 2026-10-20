@@ -166,7 +166,8 @@ def import_project(proj_dir: str, preset: str = "reference") -> Scenario:
     packing = density / bulk if bulk else bfa_float(M.get("Material Packing_Ratio", "0E+000"))
     coh = bfa_float(M.get("Material Cohesion_Coefficient", "0E+000"))
     if coh:
-        warn.append(f"cohesion coefficient {coh:g} ignored (no cohesion model yet)")
+        interp.append(f"cohesion coefficient {coh:g} -> cohesion {coh:g} x grain weight, "
+                      "grain-grain and grain-wall")
     mode = next((kv(ln)[1] for ln in L if ln.startswith("Contact Mode:")), "?")
     interp.append(f"Contact Mode '{mode}' -> Hertz-Mindlin with the .lin Young's modulus "
                   f"({youngs:.4g} Pa); Poisson's ratio is not in the project, 0.30 assumed")

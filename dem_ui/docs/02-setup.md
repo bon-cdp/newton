@@ -66,19 +66,21 @@ way a sieve curve is given; percentages need not add up to 100, they are normali
 - Mass rates, held/discharged masses, flows and regions count each grain at its own mass.
 - Playback draws each size at its own diameter.
 
-**Cohesion** (J/m³) makes grains stick to each other and to walls, for moist or sticky
-material.  The model is the simplified JKR one used by LIGGGHTS and EDEM: while two grains
-(or a grain and a wall) overlap by *d*, they also pull together with
-cohesion × π × R\* × *d*, where R\* is the effective radius.
+**Cohesion** makes grains stick to each other and to walls, for moist or sticky material.
+As in BFA it is a **fraction of grain weight**: while two grains (or a grain and a wall)
+touch, they also pull together with cohesion × the grain's weight (mass × 9.81 m/s²,
+whatever the gravity setting). For two grains of different sizes the mass is
+2·m₁m₂/(m₁+m₂), which is one grain's mass when they are equal. A BFA import carries
+the project's *Cohesion_Coefficient* over unchanged.
 
 - **0** (the default) means cohesionless, and costs nothing.
 - **Wall cohesion** left blank means the same value as grain–grain.  A single part can
   override it in the **cohesion** column of the Parts table (blank = the material's value),
   for example a sticky liner.
 
-Calibrate the value against a repose or hold-up test. As a rough scale, a 5 mm grain held
-against a ceiling by cohesion alone needs about 2×10⁵ J/m³ at E = 10⁷ Pa (`test_cohesion.py`
-gives the closed form).  Cohesion adds one extra pass per contact type when switched on.
+Calibrate the value against a repose or hold-up test. As a scale: above **1** a single
+grain hangs under a ceiling by cohesion alone; below 1 it falls (`test_cohesion.py`).
+Cohesion adds one extra pass per contact type when switched on.
 
 ## Parts
 
@@ -90,7 +92,7 @@ One row per part:
 | type | **wall**, **conveyor belt** or **rotating**. |
 | 2-sided | Grains bounce off both faces (open sheets, chutes). One-sided parts collide on their outward face only. |
 | friction | Grain–wall sliding friction. |
-| cohesion | Grain–wall cohesion for this part (J/m³); blank = the material's wall cohesion. |
+| cohesion | Grain–wall cohesion for this part (fraction of grain weight); blank = the material's wall cohesion. |
 | on / off (s) | Active window: the part exists only in this time span.  This is how BFA's staged deflectors are modelled — one part per position, each active for its window. Empty *off* = until the end. |
 | corners | Second contact in concave corners and creases (troughed belts, chute corners). Slightly slower; belts get it automatically. |
 | × | Remove the part from the scenario (the STL file stays). |

@@ -134,8 +134,8 @@ const MATERIAL_FIELDS = [
   ["restitution", "number", "restitution"], ["friction", "number", "grain-grain sliding μ"],
   ["rolling_friction", "number", "grain-grain rolling μ"], ["wall_rolling_friction", "number", "wall rolling μ"],
   ["contact", "select:hertz,linear", "contact law"], ["tangential_ratio", "number", "Mindlin kt/kn"],
-  ["cohesion", "number", "grain-grain cohesion (J/m³)"],
-  ["wall_cohesion", "number?", "wall cohesion (J/m³, blank = same)"],
+  ["cohesion", "number", "grain-grain cohesion (× grain weight)"],
+  ["wall_cohesion", "number?", "wall cohesion (× grain weight, blank = same)"],
 ];
 
 // Size distribution: rows of radius (m) and MASS fraction (%, as a sieve curve; need not
@@ -261,7 +261,7 @@ function renderSetup() {
       <td><select><option value="wall">wall</option><option value="belt">conveyor belt</option><option value="rotating">rotating</option></select></td>
       <td><input type="checkbox" ${p.two_sided ? "checked" : ""}></td>
       <td><input type="number" step="any" value="${p.friction}"></td>
-      <td><input type="number" step="any" value="${p.cohesion ?? ""}" placeholder="material" title="grain-wall cohesion for this part (J/m³); blank = the material's wall cohesion"></td>
+      <td><input type="number" step="any" value="${p.cohesion ?? ""}" placeholder="material" title="grain-wall cohesion for this part (fraction of grain weight); blank = the material's wall cohesion"></td>
       <td><input type="number" step="any" value="${p.active[0]}"></td>
       <td><input type="number" step="any" value="${p.active[1] >= INF ? "" : p.active[1]}" placeholder="end"></td>
       <td><input type="checkbox" ${p.corners ? "checked" : ""}></td>

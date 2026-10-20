@@ -599,7 +599,7 @@ def wall_grid_cell(parts, radius, reach, requested=None, budget=64.0e6):
 
 
 def wall_cohesion(m, part) -> float:
-    """Grain-wall cohesion (J/m^3) for one part: its own value, else the material's
+    """Grain-wall cohesion (fraction of grain weight) for one part: its own value, else the material's
     wall_cohesion, else the grain-grain cohesion."""
     if part.cohesion is not None:
         return float(part.cohesion)
@@ -745,8 +745,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     log(f"  restitution           {e:.3f} -> kd {kd_pp:.3f} grain-grain, {kd_wall:.3f} grain-wall")
     if m.cohesion > 0.0 or any(wall_cohesion(m, p) > 0.0 for p in sc.parts):
         wc = sorted({wall_cohesion(m, p) for p in sc.parts})
-        log(f"  cohesion              {m.cohesion:g} J/m3 grain-grain, "
-            f"{', '.join(f'{x:g}' for x in wc)} J/m3 grain-wall (simplified JKR)")
+        log(f"  cohesion              {m.cohesion:g} x grain weight grain-grain, "
+            f"{', '.join(f'{x:g}' for x in wc)} x grain weight grain-wall")
         if s.bvh_walls and any(x > 0.0 for x in wc):
             log("  !! grain-wall cohesion needs the baked wall grid: ignored with bvh_walls")
     log(f"  dt                    {dt*1e6:.3f} us = {dt/t_r:.2f} Rayleigh time"

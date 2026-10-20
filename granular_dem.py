@@ -51,6 +51,8 @@ import newton
 from newton._src.solvers.semi_implicit.kernels_contact import eval_particle_contact
 from newton._src.solvers.solver import SolverBase
 
+G_STD = 9.81      # m/s^2: cohesion fractions are of a grain's weight under standard gravity
+
 # Forward kernels only.  Nothing here is differentiated, and the adjoint of the wall kernel
 # needs a parameter block over CUDA's 4 KB limit (it failed to compile once the collider
 # gained per-part active flags).  Also roughly halves compile time.
@@ -409,10 +411,11 @@ class SolverGranularDEM(SolverBase):
         self.mu_roll_wall = float(mu_roll_wall)
         self.rot_damp = float(rot_damp)
         self.rot_damp_wall = float(rot_damp_wall)
-        # cohesion energy densities (J/m^3, simplified JKR): grain-grain, and grain-wall per
-        # part.  Both are applied by separate passes, launched only when non-zero.
+        # cohesion as fractions of grain weight (BFA): grain-grain, and grain-wall per part,
+        # held as pulls in N/kg (fraction x standard gravity, whatever the scenario's gravity).
+        # Both are applied by separate passes, launched only when non-zero.
         self.cohesion = float(cohesion)
-        wc = [float(x) for x in (wall_cohesion or [])]
+        wc = [float(x) * G_STD for x in (wall_cohesion or [])]
         self.wall_cohesion = (wp.array(wc, dtype=float, device=model.device)
                               if any(x > 0.0 for x in wc) else None)
         # k_t as a fraction of k_n.  2/7 is the Hertz-Mindlin equal-partition value and
@@ -684,8 +687,8 @@ class SolverGranularDEM(SolverBase):
                 kernel=add_pair_cohesion,
                 dim=model.particle_count,
                 inputs=[model.particle_grid.id, state_in.particle_q, model.particle_radius,
-                        model.particle_flags, model.particle_max_radius,
-                        self.skin_max if use_list else 0.0, self.cohesion],
+                        model.particle_inv_mass, model.particle_flags, model.particle_max_radius,
+                        self.skin_max if use_list else 0.0, self.cohesion * G_STD],
                 outputs=[state_in.particle_f],
                 device=model.device,
             )
@@ -756,8 +759,8 @@ class SolverGranularDEM(SolverBase):
             wp.launch(
                 kernel=add_wall_cohesion,
                 dim=model.particle_count,
-                inputs=[state_in.particle_q, model.particle_radius, model.particle_flags,
-                        self.collider, self.wall_grid, self.wall_cohesion,
+                inputs=[state_in.particle_q, model.particle_radius, model.particle_inv_mass,
+                        model.particle_flags, self.collider, self.wall_grid, self.wall_cohesion,
                         model.particle_grid.id],
                 outputs=[state_in.particle_f],
                 device=model.device,
@@ -1139,15 +1142,17 @@ def add_pair_cohesion(
     grid: wp.uint64,
     particle_x: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     max_radius: float,
     skin: float,
-    cohesion: float,
+    pull: float,
     particle_f: wp.array(dtype=wp.vec3),
 ):
-    """Grain-grain cohesion, simplified JKR (LIGGGHTS "sjkr"): while two grains overlap by
-    d they also pull together with cohesion * pi * R* * d (cohesion energy density x contact
-    area, R* = ri rj / (ri + rj)).  ADDS to the contact forces; runs after them."""
+    """Grain-grain cohesion as a fraction of grain weight (BulkFlowAnalyst's convention):
+    while two grains touch they also pull together with a constant force pull * m*, where
+    pull = cohesion fraction x 9.81 m/s^2 and m* = 2 mi mj / (mi + mj) -- the grain's own
+    mass for equal grains.  ADDS to the contact forces; runs after them."""
     i = wp.hash_grid_point_id(grid, wp.tid())
     if i == -1:
         return
@@ -1168,7 +1173,7 @@ def add_pair_cohesion(
         d = wp.length(d_vec)
         if d < 1.0e-9 or d >= ri + rj:
             continue
-        f -= (d_vec / d) * (cohesion * 3.14159265 * (ri * rj / (ri + rj)) * (ri + rj - d))
+        f -= (d_vec / d) * (pull * 2.0 / (particle_inv_mass[i] + particle_inv_mass[j]))
     particle_f[i] = particle_f[i] + f
 
 
@@ -1980,15 +1985,16 @@ def eval_wall_grid_rot(
 def add_wall_cohesion(
     particle_q: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     collider: ShellCollider,
     g: WallGrid,
-    wall_cohesion: wp.array(dtype=float),
+    wall_pull: wp.array(dtype=float),
     grid: wp.uint64,
     particle_f: wp.array(dtype=wp.vec3),
 ):
-    """Grain-wall cohesion, simplified JKR: per part in contact, a pull of
-    cohesion[part] * pi * r * overlap toward the wall.  Same search and signed distance as
+    """Grain-wall cohesion as a fraction of grain weight: per part in contact, a constant
+    pull of wall_pull[part] * m toward the wall (wall_pull = fraction x 9.81 m/s^2).  Same search and signed distance as
     eval_wall_grid_rot (closest triangle of each part, from the grain's cell list); ADDS to
     the contact forces."""
     i = wp.hash_grid_point_id(grid, wp.tid())
@@ -2018,7 +2024,7 @@ def add_wall_cohesion(
             r = g.rec[t]
             p = r.part
         if p != cur:
-            if best_t >= 0 and wall_cohesion[cur] > 0.0:
+            if best_t >= 0 and wall_pull[cur] > 0.0:
                 br = g.rec[best_t]
                 _sq, cp = _tri_closest(br.v0, br.u, br.w, br.n, br.t2, x)
                 face_n = br.n
@@ -2028,7 +2034,7 @@ def add_wall_cohesion(
                                     wp.sqrt(best_sq), face_n)
                 c = sdf - radius
                 if c < 0.0 and c >= -radius:
-                    f -= n * (wall_cohesion[cur] * 3.14159265 * radius * (-c))
+                    f -= n * (wall_pull[cur] / particle_inv_mass[i])
             cur = p
             seg0 = s
             best_t = -1
