@@ -340,11 +340,10 @@ function sizeClasses(mat) {
   const tot = c.reduce((a, k) => a + k.w / k.m, 0);
   return c.map(k => ({ r: k.r, m: k.m, p: k.w / k.m / tot }));
 }
-// lattice packing: sites spaced for the largest grain, each holding a grain of mean size
-function packing(mat) {
-  const c = sizeClasses(mat), rmax = Math.max(...c.map(k => k.r));
-  return LATTICE_PACKING * c.reduce((a, k) => a + k.p * k.r ** 3, 0) / rmax ** 3;
-}
+// lattice packing of the injection sites.  Each size class has its own lattice, but the
+// classes are placed independently and the small grains fill the gaps big ones need: a
+// mixture passes about half what one size does (dem_run.MIXTURE_INLET_FACTOR, measured)
+function packing(mat) { return LATTICE_PACKING * (sizeClasses(mat).length > 1 ? 0.5 : 1); }
 
 async function renderInjector(sc) {
   const inf = $("#injector-fields"); inf.innerHTML = "";

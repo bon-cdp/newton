@@ -65,6 +65,11 @@ way a sieve curve is given; percentages need not add up to 100, they are normali
   so a wide spread costs time.
 - Mass rates, held/discharged masses, flows and regions count each grain at its own mass.
 - Playback draws each size at its own diameter.
+- Each size is injected on its own lattice, spaced for that size. The sizes are still placed
+  independently, so the many small grains fill gaps the big ones need. A mixture inlet
+  therefore passes about **half** of what it would for one size, and the capacity check
+  allows for that. If injection backs up, enlarge the inlet (or its extrusion depth) or
+  raise the injection speed.
 
 **Cohesion** makes grains stick to each other and to walls, for moist or sticky material.
 As in BFA it is a **fraction of grain weight**: while two grains (or a grain and a wall)

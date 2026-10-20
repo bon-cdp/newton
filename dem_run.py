@@ -61,6 +61,8 @@ def mark_occupied(
     step_offset: int,
     particle_q: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_radius: wp.array(dtype=float),
+    site_radius: float,
     lat_origin: wp.vec3,
     lat_u: wp.vec3,
     lat_v: wp.vec3,
@@ -72,18 +74,27 @@ def mark_occupied(
     lat_map: wp.array(dtype=int),
     sites: wp.array(dtype=wp.vec3),
     clear_dist: float,
+    reach: int,
     occupied: wp.array(dtype=int),
 ):
     """On injection steps, stamp every lattice site with a grain closer than clear_dist
     with the event's number + 1 (a stamp, not a flag: nothing has to clear it afterwards).
     Sites form a regular grid (one layer for a face, several for a box), so each grain
-    near it checks only the 3x3x3 sites around it -- O(grains), not O(grains x sites)."""
+    near it checks only the sites within `reach` of it (3x3x3 for one size) -- O(grains),
+    not O(grains x sites).  With size classes a small grains' lattice is finer than a big
+    grain, so reach grows to ceil(clear_dist / spacing)."""
     i = wp.tid()
     e = _event(event_of_step, step_arr, step_offset)
     if e < 0:
         return
     if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
         return
+    # with size classes (site_radius > 0) the clearance is this grain's own: a small grain
+    # blocks a site only where it would overlap the grain spawned there; clear_dist is the
+    # largest such distance and bounds the search
+    cd = clear_dist
+    if site_radius > 0.0:
+        cd = (site_radius + particle_radius[i]) * 1.05
     rel = particle_q[i] - lat_origin
     wn = wp.dot(rel, lat_n)
     if wn <= -clear_dist or wn >= float(lat_nw - 1) * lat_spacing + clear_dist:
@@ -93,20 +104,21 @@ def mark_occupied(
     iu0 = int(wp.floor(fu + 0.5))
     iv0 = int(wp.floor(fv + 0.5))
     iw0 = int(wp.floor(wn / lat_spacing + 0.5))
-    for du in range(-1, 2):
-        for dv in range(-1, 2):
-            for dw in range(-1, 2):
+    for du in range(-reach, reach + 1):
+        for dv in range(-reach, reach + 1):
+            for dw in range(-reach, reach + 1):
                 iu = iu0 + du
                 iv = iv0 + dv
                 iw = iw0 + dw
                 if iu >= 0 and iu < lat_nu and iv >= 0 and iv < lat_nv and iw >= 0 and iw < lat_nw:
                     k = lat_map[(iu * lat_nv + iv) * lat_nw + iw]
                     if k >= 0:
-                        if wp.length_sq(particle_q[i] - sites[k]) < clear_dist * clear_dist:
+                        if wp.length_sq(particle_q[i] - sites[k]) < cd * cd:
                             occupied[k] = e + 1
 
 
 INJECT_BLOCK = 256
+MIXTURE_INLET_FACTOR = 0.5     # inlet capacity of a size mixture / one size's (see build)
 
 
 @wp.func
@@ -217,6 +229,7 @@ def recycle(
     park: wp.vec3,
     free_idx: wp.array(dtype=wp.int32),
     free_count: wp.array(dtype=wp.int32),
+    free_off: wp.array(dtype=wp.int32),
     discharged: wp.array(dtype=wp.int32),
     escaped: wp.array(dtype=wp.int32),
     down_axis: int,
@@ -232,13 +245,14 @@ def recycle(
     particle_flags[i] = wp.int32(0)
     particle_q[i] = park          # see the note on parking in build()
     particle_qd[i] = wp.vec3(0.0)
-    slot = wp.atomic_add(free_count, 0, 1)
-    free_idx[slot] = i
+    # each size class has its own block of pool slots and its own free list segment
+    c = int(class_id[i])                  # counted per size class: mass = count x class mass
+    slot = wp.atomic_add(free_count, c, 1)
+    free_idx[free_off[c] + slot] = i
     # discharged = left through the domain face on the gravity ("down") side
     out_bottom = p[down_axis] < lo[down_axis]
     if down_sign > 0:
         out_bottom = p[down_axis] > hi[down_axis]
-    c = int(class_id[i])                  # counted per size class: mass = count x class mass
     if out_bottom:
         wp.atomic_add(discharged, c, 1)
     else:
@@ -790,103 +804,127 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     if len(sc.injectors) != 1:
         raise NotImplementedError("exactly one injector for now")
     inj = sc.injectors[0]
-    site_spacing = radius * inj.site_spacing
-    spawn_velocity = [float(c) for c in inj.velocity]
-    if inj.box:
-        # a box of lattice sites above a belt or plane (BFA's "injection volume from belt
-        # reference"); see injector_box
-        fr = injector_box(sc, inj, parts)
-        sites, idx, lat_origin, axes, dims = box_lattice(fr, site_spacing)
-        face_area = fr["length"] * fr["width"]
-        if fr["velocity"] is not None:
-            spawn_velocity = fr["velocity"]
-        what = (f"injection box {fr['length']:g} x {fr['width']:g} x {fr['height']:g} m "
-                f"{fr['describe']}")
-    elif inj.extrude > 0.0:
-        # the face extruded along its normal into a volume, so grains have room to spawn
-        tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
-        tris = tris + np.asarray(inj.offset, dtype=np.float64)
-        sites, idx, lat_origin, axes, dims, off_plane = face_volume_lattice(
-            tris, site_spacing, inj.extrude, inj.extrude_flip, inj.extrude_offset)
-        if off_plane > 0.5 * site_spacing:
-            log(f"  !! injection face is not flat ({off_plane*1e3:.1f} mm off its mean plane): "
-                f"the volume follows the mean plane")
-        what = (f"injection face        {face_area:.4f} m2 extruded {inj.extrude:g} m along its "
-                f"{'reversed ' if inj.extrude_flip else ''}normal"
-                + (f" from {inj.extrude_offset:g} m off the face" if inj.extrude_offset else "") + " "
-                f"({', '.join(f'{x:.3f}' for x in axes[2])}), {dims[2]} layer(s)")
-    else:
-        tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
-        sites = lattice_sites(tris, site_spacing)
-        if inj.set_coordinate is not None:
-            sites[:, int(inj.set_coordinate[0])] = inj.set_coordinate[1]
-        sites += np.asarray(inj.offset, dtype=np.float64)
-        # The lattice as a grid in the injection plane, so mark_occupied can find the sites
-        # around a grain directly (same construction as lattice_sites).
-        fpts = tris.reshape(-1, 3)
-        flo, fhi = fpts.min(axis=0), fpts.max(axis=0)
-        ax = int(np.argmin(fhi - flo))
-        au, av = [k for k in range(3) if k != ax]
-        off = np.asarray(inj.offset, dtype=np.float64)
-        o_u, o_v = flo[au] + site_spacing * 0.5 + off[au], flo[av] + site_spacing * 0.5 + off[av]
-        nu = len(np.arange(flo[au] + site_spacing * 0.5, fhi[au], site_spacing))
-        nv = len(np.arange(flo[av] + site_spacing * 0.5, fhi[av], site_spacing))
-        fu, fv = (sites[:, au] - o_u) / site_spacing, (sites[:, av] - o_v) / site_spacing
-        iu, iv = np.rint(fu).astype(int), np.rint(fv).astype(int)
-        assert np.allclose(fu, iu, atol=1e-4) and np.allclose(fv, iv, atol=1e-4) and \
-            np.ptp(sites[:, ax]) < 1e-9, "injection sites are not a planar lattice"
-        idx = np.stack([iu, iv, np.zeros_like(iu)], axis=1)
-        e_ax = np.eye(3)
-        lat_origin = np.zeros(3)
-        lat_origin[au], lat_origin[av], lat_origin[ax] = o_u, o_v, sites[0, ax]
-        axes = (e_ax[au], e_ax[av], e_ax[ax])
-        dims = (nu, nv, 1)
-        what = f"injection face        {face_area:.4f} m2"
-    n_raw = len(sites)
-    # Grains outside the domain are recycled as escaped at once, so the domain must hold
-    # every site: a box sized after "fit domain" (2 m tall over a belt whose domain top was
-    # 0.6 m above it) silently spawned grains only in its bottom 0.6 m.
-    pad = 2.0 * site_spacing
-    lo_s, hi_s = sites.min(axis=0) - pad, sites.max(axis=0) + pad
-    if (lo_s < np.asarray(sc.domain_lo)).any() or (hi_s > np.asarray(sc.domain_hi)).any():
-        new_lo = np.minimum(sc.domain_lo, lo_s).round(4).tolist()
-        new_hi = np.maximum(sc.domain_hi, hi_s).round(4).tolist()
-        log(f"  !! domain {sc.domain_lo} .. {sc.domain_hi} does not hold the injection sites: "
-            f"extended to {new_lo} .. {new_hi}")
-        sc.domain_lo, sc.domain_hi = new_lo, new_hi
-    keep = clear_of_walls(sites, parts, radius * inj.wall_clearance, device, mask=True)
-    sites, idx = sites[keep], idx[keep]
-    if not len(sites):
-        raise RuntimeError(f"injector {inj.name!r}: every lattice site is inside a wall")
-    nu, nv, nw = dims
-    lat_map = np.full(nu * nv * nw, -1, dtype=np.int32)
-    lat_map[(idx[:, 0] * nv + idx[:, 1]) * nw + idx[:, 2]] = np.arange(len(sites), dtype=np.int32)
-    lattice = dict(origin=wp.vec3(*lat_origin), u=wp.vec3(*axes[0]), v=wp.vec3(*axes[1]),
-                   n=wp.vec3(*axes[2]), spacing=float(site_spacing), nu=int(nu), nv=int(nv),
-                   nw=int(nw), map=wp.array(lat_map, dtype=int, device=device))
+    def lattice_for(r_site):
+        """Injection sites for grains of radius r_site (one lattice per size class: a
+        lattice spaced for the largest grain wastes most of its sites on small ones)."""
+        site_spacing = r_site * inj.site_spacing
+        spawn_velocity = [float(c) for c in inj.velocity]
+        fr = tris = None
+        if inj.box:
+            # a box of lattice sites above a belt or plane (BFA's "injection volume from belt
+            # reference"); see injector_box
+            fr = injector_box(sc, inj, parts)
+            sites, idx, lat_origin, axes, dims = box_lattice(fr, site_spacing)
+            face_area = fr["length"] * fr["width"]
+            if fr["velocity"] is not None:
+                spawn_velocity = fr["velocity"]
+            what = (f"injection box {fr['length']:g} x {fr['width']:g} x {fr['height']:g} m "
+                    f"{fr['describe']}")
+        elif inj.extrude > 0.0:
+            # the face extruded along its normal into a volume, so grains have room to spawn
+            tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
+            tris = tris + np.asarray(inj.offset, dtype=np.float64)
+            sites, idx, lat_origin, axes, dims, off_plane = face_volume_lattice(
+                tris, site_spacing, inj.extrude, inj.extrude_flip, inj.extrude_offset)
+            if off_plane > 0.5 * site_spacing:
+                log(f"  !! injection face is not flat ({off_plane*1e3:.1f} mm off its mean plane): "
+                    f"the volume follows the mean plane")
+            what = (f"injection face        {face_area:.4f} m2 extruded {inj.extrude:g} m along its "
+                    f"{'reversed ' if inj.extrude_flip else ''}normal"
+                    + (f" from {inj.extrude_offset:g} m off the face" if inj.extrude_offset else "") + " "
+                    f"({', '.join(f'{x:.3f}' for x in axes[2])}), {dims[2]} layer(s)")
+        else:
+            tris, face_area = face_triangles(sc.path(inj.face_stl), unit)
+            sites = lattice_sites(tris, site_spacing)
+            if inj.set_coordinate is not None:
+                sites[:, int(inj.set_coordinate[0])] = inj.set_coordinate[1]
+            sites += np.asarray(inj.offset, dtype=np.float64)
+            # The lattice as a grid in the injection plane, so mark_occupied can find the sites
+            # around a grain directly (same construction as lattice_sites).
+            fpts = tris.reshape(-1, 3)
+            flo, fhi = fpts.min(axis=0), fpts.max(axis=0)
+            ax = int(np.argmin(fhi - flo))
+            au, av = [k for k in range(3) if k != ax]
+            off = np.asarray(inj.offset, dtype=np.float64)
+            o_u, o_v = flo[au] + site_spacing * 0.5 + off[au], flo[av] + site_spacing * 0.5 + off[av]
+            nu = len(np.arange(flo[au] + site_spacing * 0.5, fhi[au], site_spacing))
+            nv = len(np.arange(flo[av] + site_spacing * 0.5, fhi[av], site_spacing))
+            fu, fv = (sites[:, au] - o_u) / site_spacing, (sites[:, av] - o_v) / site_spacing
+            iu, iv = np.rint(fu).astype(int), np.rint(fv).astype(int)
+            assert np.allclose(fu, iu, atol=1e-4) and np.allclose(fv, iv, atol=1e-4) and \
+                np.ptp(sites[:, ax]) < 1e-9, "injection sites are not a planar lattice"
+            idx = np.stack([iu, iv, np.zeros_like(iu)], axis=1)
+            e_ax = np.eye(3)
+            lat_origin = np.zeros(3)
+            lat_origin[au], lat_origin[av], lat_origin[ax] = o_u, o_v, sites[0, ax]
+            axes = (e_ax[au], e_ax[av], e_ax[ax])
+            dims = (nu, nv, 1)
+            what = f"injection face        {face_area:.4f} m2"
+        n_raw = len(sites)
+        # Grains outside the domain are recycled as escaped at once, so the domain must hold
+        # every site: a box sized after "fit domain" (2 m tall over a belt whose domain top was
+        # 0.6 m above it) silently spawned grains only in its bottom 0.6 m.
+        pad = 2.0 * site_spacing
+        lo_s, hi_s = sites.min(axis=0) - pad, sites.max(axis=0) + pad
+        if (lo_s < np.asarray(sc.domain_lo)).any() or (hi_s > np.asarray(sc.domain_hi)).any():
+            new_lo = np.minimum(sc.domain_lo, lo_s).round(4).tolist()
+            new_hi = np.maximum(sc.domain_hi, hi_s).round(4).tolist()
+            log(f"  !! domain {sc.domain_lo} .. {sc.domain_hi} does not hold the injection sites: "
+                f"extended to {new_lo} .. {new_hi}")
+            sc.domain_lo, sc.domain_hi = new_lo, new_hi
+        keep = clear_of_walls(sites, parts, r_site * inj.wall_clearance, device, mask=True)
+        sites, idx = sites[keep], idx[keep]
+        if not len(sites):
+            raise RuntimeError(f"injector {inj.name!r}: every lattice site is inside a wall")
+        nu, nv, nw = dims
+        lat_map = np.full(nu * nv * nw, -1, dtype=np.int32)
+        lat_map[(idx[:, 0] * nv + idx[:, 1]) * nw + idx[:, 2]] = np.arange(len(sites), dtype=np.int32)
+        lattice = dict(origin=wp.vec3(*lat_origin), u=wp.vec3(*axes[0]), v=wp.vec3(*axes[1]),
+                       n=wp.vec3(*axes[2]), spacing=float(site_spacing), nu=int(nu), nv=int(nv),
+                       nw=int(nw), map=wp.array(lat_map, dtype=int, device=device))
+        return dict(sites=sites, lattice=lattice, n_raw=n_raw, what=what, spacing=site_spacing,
+                    fr=fr, tris=tris, face_area=face_area, spawn_velocity=spawn_velocity)
+
 
     rate = inj.mass_rate / gmass
-    # At most batch_fraction of the sites per event, but also no more than max_interval
-    # between events: a large face with small grains at a low rate would otherwise inject
-    # in big lumps (36,663 sites -> 9,165-grain batches 0.83 s apart delivered 166% of the
-    # target in the first second).  Both validated projects already meet the interval
-    # (15 and 36 ms), so their batches are unchanged.
-    batch = max(1, min(int(len(sites) * inj.batch_fraction), math.ceil(rate * inj.max_interval)))
-    inj_interval = batch / rate
-    spawn_speed = float(np.linalg.norm(spawn_velocity))
-    log(f"\n  {what} -> {len(sites)} of {n_raw} lattice "
-        f"sites at {site_spacing*1e3:.1f} mm ({n_raw-len(sites)} dropped for wall clearance)")
-    log(f"  batch                 {batch} grains every {inj_interval*1e3:.1f} ms -> consecutive "
-        f"batches {spawn_speed*inj_interval*1e3:.0f} mm apart "
-        f"({spawn_speed*inj_interval/(2*radius):.1f} diameters)\n")
-    if spawn_speed * inj_interval < 2.0 * radius:
-        log("  !! consecutive injection batches overlap: raise the injection speed or lower "
-            "batch_fraction")
+    # One injection stream per size class: its own lattice (spaced for its radius), its own
+    # rate (its number fraction of the grains) and schedule.  One class: one stream, as before.
+    streams = []
+    for k, (r_k, _m_k, p_k) in enumerate(classes):
+        L = lattice_for(r_k)
+        sites, what, n_raw, site_spacing = L["sites"], L["what"], L["n_raw"], L["spacing"]
+        fr, tris, face_area, spawn_velocity = L["fr"], L["tris"], L["face_area"], L["spawn_velocity"]
+        rate_k = rate * p_k
+        # At most batch_fraction of the sites per event, but also no more than max_interval
+        # between events: a large face with small grains at a low rate would otherwise inject
+        # in big lumps (36,663 sites -> 9,165-grain batches 0.83 s apart delivered 166% of the
+        # target in the first second).  Both validated projects already meet the interval
+        # (15 and 36 ms), so their batches are unchanged.
+        batch = max(1, min(int(len(sites) * inj.batch_fraction), math.ceil(rate_k * inj.max_interval)))
+        inj_interval = batch / rate_k
+        spawn_speed = float(np.linalg.norm(spawn_velocity))
+        if len(classes) > 1:
+            log(f"\n  size class {k}          radius {r_k*1e3:.2f} mm, {rate_k:,.0f} grains/s")
+        log(f"{'' if len(classes) > 1 else chr(10)}  {what} -> {len(sites)} of {n_raw} lattice "
+            f"sites at {site_spacing*1e3:.1f} mm ({n_raw-len(sites)} dropped for wall clearance)")
+        log(f"  batch                 {batch} grains every {inj_interval*1e3:.1f} ms -> consecutive "
+            f"batches {spawn_speed*inj_interval*1e3:.0f} mm apart "
+            f"({spawn_speed*inj_interval/(2*r_k):.1f} diameters)\n")
+        if spawn_speed * inj_interval < 2.0 * r_k:
+            log("  !! consecutive injection batches overlap: raise the injection speed or lower "
+                "batch_fraction")
+        streams.append(dict(sites=sites, lattice=L["lattice"], batch=batch, interval=inj_interval,
+                            rate=rate_k, radius=r_k))
+    sites = np.concatenate([st["sites"] for st in streams])
     # inlet capacity, the same rule for every source (and the UI's): the inlet seen along the
     # injection velocity passes at most cross-section x lattice packing x density x speed
+    # With size classes each class has a lattice spaced for its own radius, but the classes
+    # are placed independently: the many small grains keep filling the gaps a big one needs,
+    # so a mixture passes about half what one size does (measured, 30 + 10 mm 50/50: 100%
+    # delivered at 0.4 x the one-size capacity, 60% of the rate at 0.8 x).
     packing = (4.0 / 3.0) * math.pi / inj.site_spacing ** 3
-    if len(classes) > 1:      # sites spaced for the largest grain, filled by the mean one
-        packing *= m.mean_mass / (m.density * 4.0 / 3.0 * math.pi * radius ** 3)
+    if len(classes) > 1:
+        packing *= MIXTURE_INLET_FACTOR
     if inj.box:
         xs = fr["width"] * fr["height"]
     elif inj.extrude > 0.0:
@@ -942,9 +980,13 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     # and contact code are unchanged.  One class: nothing to set.
     n_cls = len(classes)
     class_host = np.zeros(n_pool, dtype=np.int32)
+    cls_count = np.array([n_pool], dtype=np.int64)
     if n_cls > 1:
-        crng = np.random.default_rng(s.seed + 104729)
-        class_host = crng.choice(n_cls, size=n_pool, p=[pk for _r, _m, pk in classes]).astype(np.int32)
+        # a contiguous block of slots per class, sized by its number fraction, so each class
+        # keeps its own free list (its own injection stream pops from it)
+        cls_count = np.floor(np.array([pk for _r, _m, pk in classes]) * n_pool).astype(np.int64)
+        cls_count[-1] = n_pool - cls_count[:-1].sum()
+        class_host = np.repeat(np.arange(n_cls), cls_count).astype(np.int32)
         rad = np.array([rk for rk, _m, _p in classes], dtype=np.float64)[class_host]
         mas = np.array([mk for _r, mk, _p in classes], dtype=np.float64)[class_host]
         model.particle_radius.assign(rad.astype(np.float32))
@@ -999,13 +1041,16 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
 
     s0, s1 = model.state(), model.state()
     free_idx = wp.array(np.arange(n_pool, dtype=np.int32), dtype=wp.int32, device=device)
-    free_count = wp.array([n_pool], dtype=wp.int32, device=device)
+    free_count = wp.array(cls_count.astype(np.int32), dtype=wp.int32, device=device)   # per class
+    free_off_host = np.concatenate([[0], np.cumsum(cls_count)[:-1]]).astype(np.int32)
+    free_off = wp.array(free_off_host, dtype=wp.int32, device=device)
     discharged = wp.zeros(n_cls, dtype=wp.int32, device=device)    # per size class
     escaped = wp.zeros(n_cls, dtype=wp.int32, device=device)
     injected = wp.zeros(1, dtype=int, device=device)
     starved = wp.zeros(1, dtype=int, device=device)
-    occupied = wp.zeros(len(sites), dtype=int, device=device)
-    backlog = wp.zeros(1, dtype=int, device=device)
+    for st in streams:
+        st["occupied"] = wp.zeros(len(st["sites"]), dtype=int, device=device)
+    backlog = wp.zeros(n_cls, dtype=int, device=device)           # per stream
     regs = sc.regions
     reg_lo = wp.array(np.array([r.lo for r in regs] or [[0.0] * 3], dtype=np.float32), dtype=wp.vec3,
                       device=device)
@@ -1017,10 +1062,11 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     spawn_vel = wp.vec3(*[float(c) for c in spawn_velocity])
     return argparse.Namespace(
         sc=sc, model=model, solver=solver, collider=collider, meshes=meshes, parts=parts,
-        sites=sites, batch=batch, inj=inj, inj_interval=inj_interval, rate=rate,
+        sites=sites, batch=streams[0]["batch"], inj=inj, streams=streams, rate=rate,
         substeps=substeps, dt=dt, frame_dt=frame_dt, n_pool=n_pool, s0=s0, s1=s1,
         free_idx=free_idx, free_count=free_count, discharged=discharged, escaped=escaped,
-        injected=injected, starved=starved, lattice=lattice, occupied=occupied, backlog=backlog,
+        injected=injected, starved=starved, backlog=backlog, free_off=free_off,
+        free_off_host=free_off_host,
         reg_lo=reg_lo, reg_hi=reg_hi, stats=stats, spawn_vel=spawn_vel, park_lo=park_lo,
         out_dir=out_dir, device=device, kd_pp=kd_pp, kd_wall=kd_wall, restitution=e, zeta=zeta,
         youngs_eff=youngs_eff, skin=skin, grain_mass=gmass, grain_radius=radius,
@@ -1121,51 +1167,62 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     # The host logic the loop used to run (float64 sim_t, the same rng calls in the same
     # order), replayed up front so the device can inject without host input.
     total_steps = n_frames * substeps
-    event_of_step = np.full(total_steps, -1, dtype=np.int32)
-    picks = []
-    _t_sim, _next = 0.0, max(S.inj.start, 0.0)
-    for gstep in range(total_steps):
-        if _t_sim >= _next and _t_sim < S.inj.stop:
-            _next += S.inj_interval
-            event_of_step[gstep] = len(picks)
-            picks.append(rng.choice(len(S.sites), size=batch, replace=False))
-        _t_sim += dt
-    # Candidate order per event: its random picks first (so an unobstructed event places
-    # exactly the grains the plain schedule would), then every other site in a fixed
-    # rotating order -- the reserve used when picks are occupied or a backlog is owed.
-    # The reserve order comes from its own generator so it never perturbs the picks.  Only
-    # the picks are stored per event; inject_event rotates the reserve itself (a full
-    # candidate table was events x sites: 1.3 GB for a 2.6 M-site box over 5 s).
-    n_sites = len(S.sites)
-    order0 = np.random.default_rng(sc.solver.seed + 7919).permutation(n_sites)
-    n_ev = max(len(picks), 1)
-    w_picks = wp.array(np.asarray(picks, dtype=np.int32).reshape(len(picks), batch) if picks
-                       else np.zeros((1, batch), dtype=np.int32), dtype=wp.int32, device=device)
-    w_order = wp.array(order0.astype(np.int32), dtype=wp.int32, device=device)
-    w_rstart = wp.array((np.arange(n_ev, dtype=np.int64) * batch % n_sites).astype(np.int32),
-                        dtype=wp.int32, device=device)
-    w_sites = wp.array(S.sites.astype(np.float32), dtype=wp.vec3, device=device)
-    S.occupied.zero_()                # stamps are event numbers: start clean on every run
-    picked = wp.zeros(n_sites, dtype=int, device=device)
-    w_event = wp.array(event_of_step, dtype=wp.int32, device=device)
+    order_rng = np.random.default_rng(sc.solver.seed + 7919)
     step_offset = solver.step_count          # device counter value at global step 0
-    lat = S.lattice
-    clear_dist = 2.0 * S.grain_radius * 1.05  # a grain closer than this would overlap
+    for k, st in enumerate(S.streams):
+        event_of_step = np.full(total_steps, -1, dtype=np.int32)
+        picks = []
+        sbatch = st["batch"]
+        _t_sim, _next = 0.0, max(S.inj.start, 0.0)
+        for gstep in range(total_steps):
+            if _t_sim >= _next and _t_sim < S.inj.stop:
+                _next += st["interval"]
+                event_of_step[gstep] = len(picks)
+                picks.append(rng.choice(len(st["sites"]), size=sbatch, replace=False))
+            _t_sim += dt
+        # Candidate order per event: its random picks first (so an unobstructed event places
+        # exactly the grains the plain schedule would), then every other site in a fixed
+        # rotating order -- the reserve used when picks are occupied or a backlog is owed.
+        # The reserve order comes from its own generator so it never perturbs the picks.
+        # Only the picks are stored per event; inject_event rotates the reserve itself (a
+        # full candidate table was events x sites: 1.3 GB for a 2.6 M-site box over 5 s).
+        n_sites = len(st["sites"])
+        order0 = order_rng.permutation(n_sites)
+        n_ev = max(len(picks), 1)
+        st["w_picks"] = wp.array(np.asarray(picks, dtype=np.int32).reshape(len(picks), sbatch) if picks
+                                 else np.zeros((1, sbatch), dtype=np.int32), dtype=wp.int32, device=device)
+        st["w_order"] = wp.array(order0.astype(np.int32), dtype=wp.int32, device=device)
+        st["w_rstart"] = wp.array((np.arange(n_ev, dtype=np.int64) * sbatch % n_sites).astype(np.int32),
+                                  dtype=wp.int32, device=device)
+        st["w_sites"] = wp.array(st["sites"].astype(np.float32), dtype=wp.vec3, device=device)
+        st["occupied"].zero_()        # stamps are event numbers: start clean on every run
+        st["picked"] = wp.zeros(n_sites, dtype=int, device=device)
+        st["w_event"] = wp.array(event_of_step, dtype=wp.int32, device=device)
+        # a grain closer than this would overlap one spawned here (any class against the
+        # largest), searched over enough neighbouring sites to cover that distance
+        st["clear"] = (st["radius"] + S.grain_radius) * 1.05
+        st["reach"] = max(1, math.ceil(st["clear"] / st["lattice"]["spacing"]))
+        off, cnt = int(S.free_off_host[k]), int(S.free_off_host[k + 1]) if k + 1 < n_cls else n_pool
+        st["free_idx"] = S.free_idx[off:cnt]
+        st["free_count"] = S.free_count[k:k + 1]
+        st["backlog"] = S.backlog[k:k + 1]
 
     def launch_steps(n, eager=True):
         if eager and n:
             solver.request_rebuild()   # graph replays do not advance the host's rebuild phase
         for _ in range(n):
-            wp.launch(mark_occupied, dim=n_pool, device=device, inputs=[
-                w_event, solver.step_arr, step_offset, s0.particle_q, model.particle_flags,
-                lat["origin"], lat["u"], lat["v"], lat["n"], lat["spacing"], lat["nu"], lat["nv"],
-                lat["nw"], lat["map"], w_sites, clear_dist, S.occupied])
-            wp.launch_tiled(inject_event, dim=[1], block_dim=INJECT_BLOCK, device=device, inputs=[
-                w_event, solver.step_arr, step_offset, w_picks, w_order, w_rstart, S.occupied,
-                picked, w_sites,
-                S.spawn_vel, S.free_idx, S.free_count, S.backlog, S.starved,
-                s0.particle_q, s0.particle_qd, model.particle_flags, solver.wall_slack,
-                S.injected])
+            for st in S.streams:
+                lat = st["lattice"]
+                wp.launch(mark_occupied, dim=n_pool, device=device, inputs=[
+                    st["w_event"], solver.step_arr, step_offset, s0.particle_q, model.particle_flags,
+                    model.particle_radius, st["radius"] if n_cls > 1 else 0.0, lat["origin"], lat["u"], lat["v"], lat["n"], lat["spacing"], lat["nu"], lat["nv"],
+                    lat["nw"], lat["map"], st["w_sites"], st["clear"], st["reach"], st["occupied"]])
+                wp.launch_tiled(inject_event, dim=[1], block_dim=INJECT_BLOCK, device=device, inputs=[
+                    st["w_event"], solver.step_arr, step_offset, st["w_picks"], st["w_order"],
+                    st["w_rstart"], st["occupied"], st["picked"], st["w_sites"],
+                    S.spawn_vel, st["free_idx"], st["free_count"], st["backlog"], S.starved,
+                    s0.particle_q, s0.particle_qd, model.particle_flags, solver.wall_slack,
+                    S.injected])
             solver.step(s0, s0, None, None, dt)     # in place -- see SolverGranularDEM.step
 
     # --- CUDA graph ------------------------------------------------------------------
@@ -1251,19 +1308,22 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 wp.launch(recycle, dim=n_pool, device=device, inputs=[
                     s0.particle_q, s0.particle_qd, model.particle_flags,
                     wp.vec3(*sc.domain_lo), wp.vec3(*sc.domain_hi), S.park_lo,
-                    S.free_idx, S.free_count, S.discharged, S.escaped, down_axis, down_sign,
-                    S.class_id])
+                    S.free_idx, S.free_count, S.free_off, S.discharged, S.escaped, down_axis,
+                    down_sign, S.class_id])
                 # recycle appends with atomics (arbitrary order): re-sort the free list so
                 # the next spawns get the same pool slots on every run.  Once per frame.
-                _fc = int(S.free_count.numpy()[0])
+                _fc = S.free_count.numpy()
                 _fi = S.free_idx.numpy()
-                _fi[:_fc] = np.sort(_fi[:_fc])[::-1]
+                for _k in range(n_cls):
+                    _o = int(S.free_off_host[_k])
+                    _fi[_o:_o + _fc[_k]] = np.sort(_fi[_o:_o + _fc[_k]])[::-1]
                 S.free_idx.assign(_fi)
                 if sc.flow_planes:
                     prev_q = s0.particle_q.numpy()      # after recycling: parked grains moved
-                owed = int(S.backlog.numpy()[0])
+                owed_k = S.backlog.numpy()
+                owed = int(owed_k.sum())
                 max_backlog = max(max_backlog, owed)
-                if owed > batch:
+                if any(int(o) > st["batch"] for o, st in zip(owed_k, S.streams)):
                     print(f"  !! injection backlog {owed} grains (> one batch): the inlet is "
                           f"choked -- sites stay occupied", flush=True)
                 starved = int(S.starved.numpy()[0])
@@ -1365,7 +1425,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
           f"({S.inj.mass_rate:g} kg/s x {t_end:.3f} s; {100*inj_kg/max(target,1e-12):.2f}%)"
           f";  held {held:.2f} + discharged {out_kg:.2f} + escaped {esc_kg:.2f} = "
           f"{held+out_kg+esc_kg:.2f} kg;  injection backlog max {max_backlog}, "
-          f"end {int(S.backlog.numpy()[0])} grains")
+          f"end {int(S.backlog.numpy().sum())} grains")
     wall = time.time() - t0
     print(f"\nwall clock {wall:.1f} s = {wall / max(sim_t, 1e-9):.1f} s per simulated second"
           f" ({sim_t:.3f} of {out.duration:g} s simulated)")
