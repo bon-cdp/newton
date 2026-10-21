@@ -31,7 +31,8 @@ import warp as wp
 import newton
 from bfa_replication_mpm import write_geometry_vtk, write_particles_vtk
 from dem_scenario import INF, Scenario, rayleigh_time
-from granular_dem import SolverGranularDEM, build_collider, build_wall_grid, lattice_sites
+from granular_dem import (SolverGranularDEM, build_collider, build_wall_grid, lattice_sites,
+                          set_part_poses)
 
 # Forward kernels only.  Nothing here is differentiated, and the adjoint of the wall kernel
 # needs a parameter block over CUDA's 4 KB limit (it failed to compile once the collider
@@ -369,6 +370,8 @@ def surface_motion(motion, gravity):
     if not motion:
         return None
     kind = motion.get("type")
+    if kind == "moving":
+        return (3, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0)     # filled per step (set_part_poses)
     if kind == "belt":
         u = np.asarray(motion["velocity"], dtype=np.float64)
         speed = float(np.linalg.norm(u))
@@ -388,7 +391,75 @@ def surface_motion(motion, gravity):
     raise ValueError(f"unknown surface motion type {kind!r}")
 
 
+def is_moving(motion) -> bool:
+    return bool(motion) and motion.get("type") == "moving"
+
+
+def _rodrigues(axis, theta):
+    """(N,3,3) rotations by angles theta (N,) about one unit axis."""
+    a = np.asarray(axis, dtype=np.float64)
+    a = a / np.linalg.norm(a)
+    K = np.array([[0.0, -a[2], a[1]], [a[2], 0.0, -a[0]], [-a[1], a[0], 0.0]])
+    st, ct = np.sin(theta)[:, None, None], np.cos(theta)[:, None, None]
+    return np.eye(3)[None] + st * K[None] + (1.0 - ct) * (K @ K)[None]
+
+
+def motion_pose(motion, t):
+    """Pose of a moving part (#14, BFA's motion manager) at times t (N,): rest geometry x
+    maps to R x + T.  motion = {"type": "moving", "steps": [...]}, each step active over
+    [start, end] s:
+
+      {"kind": "translate", "start", "end", "velocity": [vx, vy, vz]}     m/s
+      {"kind": "rotate", "start", "end", "point": [..], "axis": [..], "deg_per_s": w}
+
+    A rotation turns about a line FIXED IN THE WORLD (as picked on the geometry), at w
+    deg/s about the axis (right-hand rule).  Steps compose in list order, each acting on
+    the result of the ones before; steps whose windows overlap compose the same way, which
+    is exact for translations and close for small steps."""
+    t = np.atleast_1d(np.asarray(t, dtype=np.float64))
+    R = np.repeat(np.eye(3)[None], len(t), axis=0)
+    T = np.zeros((len(t), 3))
+    for st in motion.get("steps", []):
+        t0, t1 = float(st.get("start", 0.0)), float(st.get("end", 0.0))
+        tau = np.clip(t - t0, 0.0, max(t1 - t0, 0.0))
+        if st.get("kind") == "translate":
+            T = T + tau[:, None] * np.asarray(st["velocity"], dtype=np.float64)[None]
+        elif st.get("kind") == "rotate":
+            Rk = _rodrigues(st["axis"], np.radians(float(st["deg_per_s"])) * tau)
+            pt = np.asarray(st["point"], dtype=np.float64)
+            R = Rk @ R
+            T = np.einsum("nij,nj->ni", Rk, T - pt[None]) + pt[None]
+        else:
+            raise ValueError(f"unknown motion step kind {st.get('kind')!r}")
+    return R, T
+
+
+def motion_tables(motion, n_steps, dt):
+    """Per-step pose (R, T) and wall velocity (v of the point T, angular velocity w) of a
+    moving part, for set_part_poses: the motion over each step [t, t + dt] exactly."""
+    t = np.arange(n_steps + 1) * dt
+    R, T = motion_pose(motion, t)
+    dR = np.einsum("nij,nkj->nik", R[1:], R[:-1])           # R(t+dt) R(t)^T
+    v = (T[1:] - T[:-1]) / dt
+    cos = np.clip((np.trace(dR, axis1=1, axis2=2) - 1.0) * 0.5, -1.0, 1.0)
+    ang = np.arccos(cos)
+    ax = np.stack([dR[:, 2, 1] - dR[:, 1, 2], dR[:, 0, 2] - dR[:, 2, 0], dR[:, 1, 0] - dR[:, 0, 1]], 1)
+    sn = np.linalg.norm(ax, axis=1)
+    w = np.where(sn[:, None] > 1e-15, ax / np.maximum(sn, 1e-30)[:, None] * (ang / dt)[:, None], 0.0)
+    return R[:-1], T[:-1], v, w
+
+
 def describe_motion(motion):
+    if is_moving(motion):
+        parts = []
+        for st in motion.get("steps", []):
+            win = f"{st.get('start', 0):g}-{st.get('end', 0):g} s"
+            if st.get("kind") == "translate":
+                parts.append(f"translate {np.round(st['velocity'], 4).tolist()} m/s {win}")
+            else:
+                parts.append(f"rotate {st['deg_per_s']:g} deg/s about {np.round(st['axis'], 3).tolist()} "
+                             f"through {np.round(st['point'], 3).tolist()} {win}")
+        return "moving: " + "; ".join(parts or ["no steps"])
     if motion.get("type") == "belt":
         u = np.asarray(motion["velocity"], dtype=float)
         return f"belt {np.linalg.norm(u):g} m/s along {np.round(u / np.linalg.norm(u), 3).tolist()}"
@@ -1009,6 +1080,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         log(f"  neighbour list        rebuilt every {s.neighbor_every} steps, skin "
             f"{skin*1e3:.2f} mm (two grains closing at {s.skin_speed:g} m/s)")
     wall_grid = None
+    moving_idx = [k for k, p in enumerate(sc.parts) if is_moving(p.motion)]
+    moving_grids = []
     if not s.bvh_walls:
         # reach: contact (radius + shell) plus the 1 mm band the sign test averages over
         max_thick = max([p.thickness if p.two_sided else 0.0 for p in sc.parts] + [0.0])
@@ -1021,11 +1094,35 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
             log("  wall grid             " + note)
         s.wall_grid_cell = cell
         _t = time.time()
-        wall_grid, winfo = build_wall_grid(parts, meshes, collider.lower, collider.upper,
-                                           reach, cell, device)
+        if not moving_idx:
+            wall_grid, winfo = build_wall_grid(parts, meshes, collider.lower, collider.upper,
+                                               reach, cell, device)
+        else:
+            # moving parts (#14) each get a grid of their own, baked in their rest frame;
+            # the main grid holds the static ones
+            static_idx = [k for k in range(len(parts)) if k not in moving_idx]
+            if not static_idx:
+                raise ValueError("every part moves: keep at least one static part (a floor)")
+            lo_np, hi_np = collider.lower.numpy(), collider.upper.numpy()
+
+            def subgrid(idx, cell_k):
+                return build_wall_grid(
+                    [parts[k] for k in idx], [meshes[k] for k in idx],
+                    wp.array(lo_np[idx], dtype=wp.vec3, device=device),
+                    wp.array(hi_np[idx], dtype=wp.vec3, device=device),
+                    reach, cell_k, device, part_ids=idx)
+            wall_grid, winfo = subgrid(static_idx, cell)
+            for k in moving_idx:
+                cell_k, _n = wall_grid_cell([parts[k]], radius, reach, None)
+                g_k, info_k = subgrid([k], cell_k)
+                moving_grids.append(g_k)
+                log(f"  moving part grid      {parts[k][0]}: {info_k['dims']} cells of "
+                    f"{cell_k*1e3:.0f} mm in its own frame, {info_k['mbytes']:.0f} MB")
         log(f"  wall grid             {winfo['dims']} cells of {s.wall_grid_cell*1e3:.0f} mm, "
             f"{winfo['occupied']:,} occupied, lists mean {winfo['mean_list']:.1f} / max "
             f"{winfo['max_list']}, {winfo['mbytes']:.0f} MB, baked in {time.time()-_t:.2f} s")
+    elif moving_idx:
+        raise ValueError("moving parts need the baked wall grid: unset solver.bvh_walls")
     solver = SolverGranularDEM(model, collider, grid_cell=2.0 * radius, keepalive=meshes,
                                wall_grid=wall_grid,
                                hash_dims=tuple(s.hash_dims) if s.hash_dims else None,
@@ -1038,6 +1135,11 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                                calibrate_restitution=m.calibrate_restitution, cal_dt=dt,
                                cohesion=m.cohesion,
                                wall_cohesion=[wall_cohesion(m, p) for p in sc.parts])
+    if moving_idx:
+        solver.set_moving(moving_grids,
+                          wp.array(np.repeat(np.eye(3, dtype=np.float32)[None], len(moving_idx), 0),
+                                   dtype=wp.mat33, device=device),
+                          wp.zeros(len(moving_idx), dtype=wp.vec3, device=device))
 
     s0, s1 = model.state(), model.state()
     free_idx = wp.array(np.arange(n_pool, dtype=np.int32), dtype=wp.int32, device=device)
@@ -1071,6 +1173,7 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         out_dir=out_dir, device=device, kd_pp=kd_pp, kd_wall=kd_wall, restitution=e, zeta=zeta,
         youngs_eff=youngs_eff, skin=skin, grain_mass=gmass, grain_radius=radius,
         classes=classes, n_cls=n_cls, class_id=class_id, class_mass=class_mass,
+        moving_idx=moving_idx,
         class_host=class_host)
 
 
@@ -1207,10 +1310,27 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
         st["free_count"] = S.free_count[k:k + 1]
         st["backlog"] = S.backlog[k:k + 1]
 
+    # moving parts (#14): pose and wall velocity per global step, read on the device
+    if S.moving_idx:
+        tabs = [motion_tables(sc.parts[k].motion, total_steps, dt) for k in S.moving_idx]
+        mv_R, mv_T, mv_v, mv_w = (
+            wp.array(np.stack([tb[j] for tb in tabs], axis=1).astype(np.float32),
+                     dtype=wp.mat33 if j == 0 else wp.vec3, device=device) for j in range(4))
+        mv_part = wp.array(np.array(S.moving_idx, dtype=np.int32), dtype=int, device=device)
+        for k, tb in zip(S.moving_idx, tabs):
+            c0 = np.asarray(S.parts[k][1], dtype=np.float64).mean(axis=0)     # part centroid
+            c1 = tb[0][-1] @ c0 + tb[1][-1] if len(tb[1]) else c0
+            print(f"  moving part {sc.parts[k].name}: centroid {np.round(c0, 4).tolist()} -> "
+                  f"{np.round(c1, 4).tolist()} m by the end", flush=True)
+
     def launch_steps(n, eager=True):
         if eager and n:
             solver.request_rebuild()   # graph replays do not advance the host's rebuild phase
         for _ in range(n):
+            if S.moving_idx:
+                wp.launch(set_part_poses, dim=len(S.moving_idx), device=device, inputs=[
+                    solver.step_arr, step_offset, mv_R, mv_T, mv_v, mv_w, mv_part,
+                    solver.pose_R, solver.pose_T, solver.collider])
             for st in S.streams:
                 lat = st["lattice"]
                 wp.launch(mark_occupied, dim=n_pool, device=device, inputs=[

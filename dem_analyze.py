@@ -249,6 +249,7 @@ def _collider_for(run, device):
 
 def wall_loads(run, t0=None, t1=None, device="cuda:0", out_dir=None, quiet=False):
     """Per-frame part loads and window-mean per-triangle maps (see module docstring)."""
+    import dem_run
     wp.init()
     sc = run.sc
     m = sc.material
@@ -280,7 +281,9 @@ def wall_loads(run, t0=None, t1=None, device="cuda:0", out_dir=None, quiet=False
         spin = fr.get("spin", np.zeros_like(qd))
         rad, gmass = grain_sizes(sc, fr)
         # part activity at this time (staged deflectors)
-        act = [1 if p.active[0] <= t < p.active[1] else 0 for p in sc.parts]
+        # moving parts (#14) are left out: their loads need the pose at each frame (not yet)
+        act = [1 if p.active[0] <= t < p.active[1] and not dem_run.is_moving(p.motion) else 0
+               for p in sc.parts]
         if act != active_prev:
             collider.active.assign(np.array(act, dtype=np.int32))
             active_prev = act

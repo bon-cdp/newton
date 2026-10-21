@@ -121,7 +121,8 @@ class Part:
     thickness: float = 0.0                # m, shell half-thickness (two-sided only)
     friction: float = 0.5                 # grain-wall Coulomb
     active: list[float] = field(default_factory=lambda: [0.0, INF])   # [on, off) seconds
-    motion: dict | None = None            # surface motion (belt / rotating), see dem_run.surface_motion
+    motion: dict | None = None            # belt / rotating surface (dem_run.surface_motion), or
+                                          # "moving": rigid steps (dem_run.motion_pose, #14)
     corners: bool = False                 # second contact in concave creases of this part (#13)
     cohesion: float | None = None         # grain-wall cohesion for this part (x grain weight);
                                           # None = the material's wall_cohesion

@@ -114,8 +114,33 @@ Choosing **conveyor belt** opens a row under the part:
 
 The belt does not move: its surface carries the given velocity, exactly like a real belt
 under the material.  **Rotating** parts take a speed (rpm) and an axis (picked on an edge),
-through the part's centre; purple arrows show the axis.  Rigid motion of whole parts (gates, swinging chutes) is not available yet
-(issue #14); staged parts with on/off windows cover deflector positions.
+through the part's centre; purple arrows show the axis.
+
+### Moving parts (motion manager)
+
+**Moving (motion manager)** moves the whole part, as BFA's motion manager does: lift a
+cylinder off a pile for a **slump test**, swing a gate, or move a chute. The row under the
+part lists its **steps**, each active from *start* to *end* (s):
+
+- **translate**: a speed in m/s along a direction. The direction starts against gravity
+  (a lift); **pick edge** sets it from an edge of the part and **flip** reverses it. The row
+  shows the distance travelled.
+- **rotate**: deg/s about a line. **pick axis edge** sets the line from an edge of the part,
+  and **flip** reverses the turn (right-hand rule). The line stays fixed in the world. The
+  row shows the angle turned.
+
+Steps apply in list order, each moving the part from where the steps before left it. Make
+windows follow one another; overlapping windows still compose in list order, which is
+exact for translations only. **Preview at** shows the part at any time in the 3D view, and
+playback in Results moves it along the same schedule.
+
+The grains feel the moving wall's velocity, so friction drags them along. Notes:
+
+- At least one part must stay static (the floor, say).
+- *corners* is ignored on a moving part.
+- Part loads in Results leave moving parts out for now.
+
+Staged parts with on/off windows still cover fixed deflector positions.
 
 ## Injection
 

@@ -31,6 +31,28 @@ function discSprite() {
   return new THREE.CanvasTexture(c);
 }
 
+// Pose of a moving part at time t: rest geometry x -> M x.  Steps compose in list order,
+// each acting on the result of the ones before; rotations turn about a line fixed in the
+// world (dem_run.motion_pose).
+export function motionPose(motion, t) {
+  const M = new THREE.Matrix4();
+  for (const st of motion.steps || []) {
+    const t0 = +st.start || 0, t1 = +st.end || 0;
+    const tau = Math.min(Math.max(t - t0, 0), Math.max(t1 - t0, 0));
+    if (st.kind === "translate") {
+      const v = st.velocity;
+      M.premultiply(new THREE.Matrix4().makeTranslation(v[0] * tau, v[1] * tau, v[2] * tau));
+    } else if (st.kind === "rotate") {
+      const ax = new THREE.Vector3(...st.axis).normalize(), p = st.point;
+      const R = new THREE.Matrix4().makeRotationAxis(ax, THREE.MathUtils.degToRad(+st.deg_per_s) * tau);
+      const toP = new THREE.Matrix4().makeTranslation(p[0], p[1], p[2]);
+      const fromP = new THREE.Matrix4().makeTranslation(-p[0], -p[1], -p[2]);
+      M.premultiply(fromP).premultiply(R).premultiply(toP);
+    }
+  }
+  return M;
+}
+
 export class Viewer {
   constructor(el) {
     this.el = el;
@@ -95,7 +117,8 @@ export class Viewer {
         new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.8 }));
       this.world.add(mesh, edges);
       g.computeBoundingBox(); box.union(g.boundingBox);
-      this.parts.push({ name: p.name, mesh, edges, triOffset, nTri: p.n_tri, color: PALETTE[k % PALETTE.length], baseColors: cols.slice() });
+      this.parts.push({ name: p.name, mesh, edges, triOffset, nTri: p.n_tri, color: PALETTE[k % PALETTE.length], baseColors: cols.slice(),
+                        motion: p.motion });
       triOffset += p.n_tri;
     });
     for (const inj of geo.injectors || []) {
@@ -240,6 +263,24 @@ export class Viewer {
       canvas.addEventListener("pointerdown", onDown, true);
       window.addEventListener("keydown", onKey);
     });
+  }
+
+  // Moving parts (motion manager): pose every part whose motion is "moving" at time t
+  // (s), from its schedule -- the same composition as dem_run.motion_pose.
+  setTime(t) {
+    for (const p of this.parts) {
+      if (p.motion?.type !== "moving") {
+        if (!p.mesh.matrixAutoUpdate) for (const o of [p.mesh, p.edges]) { o.matrix.identity(); o.matrixAutoUpdate = true; }
+        continue;
+      }
+      const M = motionPose(p.motion, t);
+      for (const o of [p.mesh, p.edges]) { o.matrixAutoUpdate = false; o.matrix.copy(M); o.matrixWorldNeedsUpdate = true; }
+    }
+  }
+
+  setPartMotion(name, motion) {
+    const p = this.parts.find(q => q.name === name);
+    if (p) p.motion = motion;
   }
 
   flashEdge(a, b) {

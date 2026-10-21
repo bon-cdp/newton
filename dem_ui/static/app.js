@@ -258,7 +258,7 @@ function renderSetup() {
     const kind = p.motion?.type || "wall";
     tr.innerHTML = `<td><input type="checkbox" checked></td>
       <td><span class="swatch" style="background:${PALETTE[k % PALETTE.length]}"></span>${p.name}</td>
-      <td><select><option value="wall">wall</option><option value="belt">conveyor belt</option><option value="rotating">rotating</option></select></td>
+      <td><select><option value="wall">wall</option><option value="belt">conveyor belt</option><option value="rotating">rotating</option><option value="moving">moving (motion manager)</option></select></td>
       <td><input type="checkbox" ${p.two_sided ? "checked" : ""}></td>
       <td><input type="number" step="any" value="${p.friction}"></td>
       <td><input type="number" step="any" value="${p.cohesion ?? ""}" placeholder="material" title="grain-wall cohesion for this part (fraction of grain weight); blank = the material's wall cohesion"></td>
@@ -280,6 +280,12 @@ function renderSetup() {
       if (type.value === "wall") delete p.motion;
       if (type.value === "belt") { p.motion = { type: "belt", velocity: [1, 0, 0] }; p.corners = true; }
       if (type.value === "rotating") p.motion = { type: "rotating", point: viewer.partCentroid(p.name), axis: [0, 0, 1], rpm: 30 };
+      if (type.value === "moving") {
+        // a first step: lift against gravity at 0.1 m/s from 1 s to 3 s
+        const g = sc.gravity || [0, -9.81, 0], gn = Math.hypot(...g) || 1;
+        p.motion = { type: "moving", steps: [{ kind: "translate", start: 1, end: 3, velocity: g.map(c => +(-0.1 * c / gn).toFixed(6)) }] };
+      }
+      viewer.setPartMotion(p.name, p.motion);
       renderSetup();
     };
     del.onclick = () => { if (confirm(`Remove part ${p.name} from the scenario? (the STL file stays)`)) { sc.parts.splice(k, 1); renderSetup(); } };
@@ -287,6 +293,7 @@ function renderSetup() {
     if (p.motion) tb.appendChild(motionRow(p));
   });
   viewer.setMotionArrows(sc.parts);
+  viewer.setTime(+(S.movePreview ?? 0));       // moving parts at the preview time
   // injector
   renderInjector(sc);
   const form = $("#setup-form");
@@ -510,6 +517,7 @@ function motionRow(p) {
   const td = document.createElement("td"); td.colSpan = 9; tr.appendChild(td);
   const m = p.motion;
   const dirText = v => { const n = Math.hypot(...v) || 1; return v.map(c => (c / n).toFixed(2)).join(", "); };
+  if (m.type === "moving") { movingRows(p, td); return tr; }
   if (m.type === "belt") {
     const speed = Math.hypot(...m.velocity);
     td.innerHTML = `↳ belt speed <input type="number" step="any" value="${+speed.toFixed(4)}"> m/s
@@ -543,6 +551,71 @@ function motionRow(p) {
     };
   }
   return tr;
+}
+
+// Motion manager: a moving part's steps, each over [start, end] s -- translate at a
+// velocity, or rotate at deg/s about a line (picked on an edge of the part).  The 3D view
+// shows the part at the time in the "preview at" box.
+function movingRows(p, td) {
+  const m = p.motion; m.steps ??= [];
+  const vec = v => v.map(c => +(+c).toFixed(4)).join(", ");
+  const dirText = v => { const n = Math.hypot(...v) || 1; return v.map(c => (c / n).toFixed(2)).join(", "); };
+  td.innerHTML = `<div>↳ motion steps (compose in order; rotation lines stay fixed in the world)
+      · preview at <input type="number" step="any" class="mv-prev" value="${S.movePreview ?? 0}" style="width:4em"> s</div>
+    <table class="tbl mv-steps"><thead><tr><th>step</th><th>start (s)</th><th>end (s)</th><th>motion</th><th></th></tr></thead><tbody></tbody></table>
+    <button class="small mv-add-t">+ translate</button> <button class="small mv-add-r">+ rotate</button>`;
+  const tb = td.querySelector("tbody");
+  const changed = () => { viewer.setPartMotion(p.name, m); viewer.setTime(+(S.movePreview ?? 0)); renderSetup(); };
+  m.steps.forEach((st, k) => {
+    const tr = document.createElement("tr");
+    let body;
+    if (st.kind === "translate") {
+      const sp = Math.hypot(...st.velocity);
+      body = `speed <input type="number" step="any" value="${+sp.toFixed(5)}" class="mv-speed"> m/s along (${dirText(st.velocity)})
+        <button class="small mv-pick">pick edge</button> <button class="small mv-flip">flip</button>
+        · travel ${+(sp * Math.max(st.end - st.start, 0)).toFixed(4)} m`;
+    } else {
+      body = `<input type="number" step="any" value="${st.deg_per_s}" class="mv-rate"> deg/s about (${dirText(st.axis)})
+        through (${vec(st.point)}) <button class="small mv-pick">pick axis edge</button> <button class="small mv-flip">flip</button>
+        · turns ${+(st.deg_per_s * Math.max(st.end - st.start, 0)).toFixed(2)}°`;
+    }
+    tr.innerHTML = `<td>${k + 1}. ${st.kind}</td>
+      <td><input type="number" step="any" value="${st.start}" class="mv-t0"></td>
+      <td><input type="number" step="any" value="${st.end}" class="mv-t1"></td>
+      <td>${body}</td><td><button class="small mv-del" title="remove step">×</button></td>`;
+    tr.querySelector(".mv-t0").onchange = e => { st.start = +e.target.value; changed(); };
+    tr.querySelector(".mv-t1").onchange = e => { st.end = +e.target.value; changed(); };
+    tr.querySelector(".mv-del").onclick = () => { m.steps.splice(k, 1); changed(); };
+    tr.querySelector(".mv-flip").onclick = () => {
+      if (st.kind === "translate") st.velocity = st.velocity.map(c => -c); else st.axis = st.axis.map(c => -c);
+      changed();
+    };
+    const pick = tr.querySelector(".mv-pick");
+    pick.onclick = async () => {
+      pick.textContent = "click an edge on the part… (Esc cancels)";
+      viewer.setTime(0);                                    // pick on the rest geometry
+      const r = await viewer.pickEdge(p.name);
+      if (r && st.kind === "translate") { const s = Math.hypot(...st.velocity) || 0.1; st.velocity = orientPicked(r.dir, st.velocity).map(c => +(c * s).toFixed(6)); }
+      if (r && st.kind === "rotate") { st.axis = orientPicked(r.dir, st.axis); st.point = r.mid.map(c => +c.toFixed(6)); }
+      changed();
+    };
+    if (st.kind === "translate") tr.querySelector(".mv-speed").onchange = e => {
+      const n = Math.hypot(...st.velocity) || 1; st.velocity = st.velocity.map(c => c / n * +e.target.value); changed();
+    };
+    else tr.querySelector(".mv-rate").onchange = e => { st.deg_per_s = +e.target.value; changed(); };
+    tb.appendChild(tr);
+  });
+  const last = () => m.steps.length ? Math.max(...m.steps.map(s => +s.end || 0)) : 0;
+  td.querySelector(".mv-add-t").onclick = () => {
+    const g = S.scen.gravity || [0, -9.81, 0], gn = Math.hypot(...g) || 1;
+    m.steps.push({ kind: "translate", start: last(), end: last() + 2, velocity: g.map(c => +(-0.1 * c / gn).toFixed(6)) });
+    changed();
+  };
+  td.querySelector(".mv-add-r").onclick = () => {
+    m.steps.push({ kind: "rotate", start: last(), end: last() + 2, point: viewer.partCentroid(p.name), axis: [0, 0, 1], deg_per_s: 15 });
+    changed();
+  };
+  td.querySelector(".mv-prev").onchange = e => { S.movePreview = +e.target.value; viewer.setTime(S.movePreview); };
 }
 
 async function uploadStl() {
@@ -672,6 +745,7 @@ async function showFrame(i) {
   S.frameIdx = i; $("#frame-slider").value = i;
   const k = S.frames[i];
   $("#frame-label").textContent = `frame ${k}  ·  t = ${(k / S.fps).toFixed(2)} s`;
+  viewer.setTime(k / S.fps);                  // moving parts follow their schedule
   const buf = await api(`/api/runs/${S.run}/frame/${k}`);
   const n = new Uint32Array(buf, 0, 1)[0];
   const pos = new Float32Array(buf, 4, n * 3), spd = new Float32Array(buf, 4 + 12 * n, n);

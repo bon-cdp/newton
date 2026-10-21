@@ -94,7 +94,9 @@ class ShellCollider:
     active: wp.array(dtype=int)
     """1 = part takes part in contact, 0 = switched off (scenario time windows)."""
     motion_type: wp.array(dtype=int)
-    """Surface motion on stationary geometry (issue #11): 0 static, 1 belt, 2 rotating."""
+    """Surface motion on stationary geometry (issue #11): 0 static, 1 belt, 2 rotating;
+    3 = the part itself moves rigidly (motion manager, #14): its current wall velocity is
+    motion_vel + motion_axis x (cp - motion_point), refreshed every step by set_part_poses."""
     motion_axis: wp.array(dtype=wp.vec3)
     """Belt: its width axis a (belt velocity = speed * normalize(a x n)).  Rotating: the
     unit rotation axis."""
@@ -102,6 +104,9 @@ class ShellCollider:
     """Rotating: a point on the axis."""
     motion_rate: wp.array(dtype=float)
     """Belt: speed (m/s).  Rotating: angular speed (rad/s)."""
+    motion_vel: wp.array(dtype=wp.vec3)
+    """Moving part (type 3): velocity of motion_point (m/s); motion_axis is then the
+    angular velocity vector (rad/s)."""
     corners: wp.array(dtype=int)
     """1 = resolve concave creases within this part with a second contact (issue #13;
     eval_wall_corners_rot).  Off by default: it costs ~5-10% of wall-contact time."""
@@ -405,6 +410,7 @@ class SolverGranularDEM(SolverBase):
         super().__init__(model=model)
         # baked candidate-triangle grid; None falls back to per-step BVH queries
         self.wall_grid = wall_grid
+        self.moving_grids = []        # moving parts (#14): see set_moving
         self.wall_cache = wall_cache
         self.rotation = rotation
         self.mu_roll = float(mu_roll)
@@ -558,6 +564,12 @@ class SolverGranularDEM(SolverBase):
     def step_count(self) -> int:
         """Device step counter, read back (syncs -- not for the hot loop)."""
         return int(self.step_arr.numpy()[0])
+
+    def set_moving(self, grids, pose_R, pose_T):
+        """Moving parts (#14): one grid per part in its own frame (build_wall_grid with
+        part_ids), and the device pose arrays set_part_poses fills each step."""
+        self.moving_grids = list(grids)
+        self.pose_R, self.pose_T = pose_R, pose_T
 
     def set_part_active(self, flags):
         """Switch collider parts on/off (1/0 per part).  Takes effect on the next step;
@@ -731,6 +743,24 @@ class SolverGranularDEM(SolverBase):
                     outputs=[state_in.particle_f, self.particle_t],
                     device=model.device,
                 )
+            for k, mg in enumerate(self.moving_grids):
+                wp.launch(
+                    kernel=eval_wall_grid_moving,
+                    dim=model.particle_count,
+                    inputs=[
+                        state_in.particle_q, state_in.particle_qd, self.particle_w,
+                        model.particle_radius, model.particle_inv_mass, model.particle_flags,
+                        self.collider, mg, self.pose_R, self.pose_T, k,
+                        self.mu_roll_wall, self.rot_damp_wall, self.k_t,
+                        int(self.hertz), self.e_star_w, self.g_star_w, self.beta_w, self.step_arr,
+                        self.tang_partner, self.tang_stamp, self.tang_xi,
+                        dt, model.particle_grid.id,
+                        int(self.wall_cohesion is not None),
+                        self.wall_cohesion if self.wall_cohesion is not None else self.collider.thickness,
+                    ],
+                    outputs=[state_in.particle_f, self.particle_t],
+                    device=model.device,
+                )
         else:
             self.contact_count.zero_()
             if not self.wall_cache:
@@ -825,6 +855,7 @@ def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, 
     c.motion_axis = wp.array(np.array(ma, dtype=np.float32), dtype=wp.vec3, device=device)
     c.motion_point = wp.array(np.array(mp, dtype=np.float32), dtype=wp.vec3, device=device)
     c.motion_rate = wp.array(mr, dtype=float, device=device)
+    c.motion_vel = wp.zeros(len(parts), dtype=wp.vec3, device=device)
     c.max_dist = float(max_dist)
     # wp.Mesh objects must outlive the struct: it stores only their integer ids, so if
     # they are garbage collected the kernel reads freed BVHs.  Returned for the caller
@@ -1200,6 +1231,9 @@ def _surface_velocity(collider: ShellCollider, m: int, n: wp.vec3, cp: wp.vec3):
     elif mt == 2:
         ws = collider.motion_axis[m] * collider.motion_rate[m]
         vs = wp.cross(ws, cp - collider.motion_point[m])
+    elif mt == 3:
+        ws = collider.motion_axis[m]
+        vs = collider.motion_vel[m] + wp.cross(ws, cp - collider.motion_point[m])
     return vs, ws
 
 
@@ -1609,12 +1643,15 @@ def _bake_cells(
         counts[c] = k
 
 
-def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device, sub=4):
+def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device, sub=4,
+                    part_ids=None):
     """Bake the candidate-triangle grid for static colliders (see block comment above).
 
     ``reach`` must cover every distance at which a triangle can matter: contact
     (particle radius + shell thickness) plus the 1 mm neighbourhood used for the
-    average-normal sign test.
+    average-normal sign test.  ``part_ids``: the collider's index of each entry of
+    ``parts`` when the grid holds only some of them (static parts, or one moving part in
+    its own frame); ``collider_lo/hi`` are then per entry of ``parts``.
     """
     allv = np.vstack([np.asarray(v, dtype=np.float64) for _n, v, _f in parts])
     lo = allv.min(axis=0) - reach - cell
@@ -1625,6 +1662,7 @@ def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device
 
     # global triangle table, parts concatenated in collider order
     # per-triangle orthonormal frames, computed in float64 (see _tri_closest)
+    part_ids_in = part_ids
     v0s, us, ws, ns, t2s, part_ids, offs = [], [], [], [], [], [], []
     off = 0
     for m, (_n, v, f) in enumerate(parts):
@@ -1639,7 +1677,7 @@ def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device
         w = np.cross(nrm, u)
         t2 = np.stack([blen, (e2 * u).sum(1), (e2 * w).sum(1)], axis=1)
         v0s.append(a); us.append(u); ws.append(w); ns.append(nrm); t2s.append(t2)
-        part_ids.append(np.full(len(f), m))
+        part_ids.append(np.full(len(f), m if part_ids_in is None else part_ids_in[m]))
         offs.append(off)
         off += len(f)
     tv0, tu, tw, tn, tt2 = (wp.array(np.concatenate(x).astype(np.float32), dtype=wp.vec3,
@@ -1979,6 +2017,123 @@ def eval_wall_grid_rot(
         # plain read-modify-write is safe -- no atomic needed
         particle_f[i] = particle_f[i] + f_total
         particle_t[i] = particle_t[i] + t_total
+
+
+@wp.kernel
+def set_part_poses(
+    step_arr: wp.array(dtype=int),
+    step_offset: int,
+    table_R: wp.array2d(dtype=wp.mat33),
+    table_T: wp.array2d(dtype=wp.vec3),
+    table_v: wp.array2d(dtype=wp.vec3),
+    table_w: wp.array2d(dtype=wp.vec3),
+    part: wp.array(dtype=int),
+    pose_R: wp.array(dtype=wp.mat33),
+    pose_T: wp.array(dtype=wp.vec3),
+    collider: ShellCollider,
+):
+    """Moving parts (#14): pose and wall velocity of moving part k at this step, from
+    tables precomputed on the host (row = global step), so graph replays move them
+    smoothly.  Rest geometry x maps to R x + T; the wall velocity of a world point y is
+    v + w x (y - T)."""
+    k = wp.tid()
+    s = wp.clamp(step_arr[0] - step_offset, 0, table_R.shape[0] - 1)
+    m = part[k]
+    pose_R[k] = table_R[s, k]
+    pose_T[k] = table_T[s, k]
+    collider.motion_vel[m] = table_v[s, k]
+    collider.motion_axis[m] = table_w[s, k]
+    collider.motion_point[m] = table_T[s, k]
+
+
+@wp.kernel
+def eval_wall_grid_moving(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_w: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    collider: ShellCollider,
+    g: WallGrid,
+    pose_R: wp.array(dtype=wp.mat33),
+    pose_T: wp.array(dtype=wp.vec3),
+    k: int,
+    mu_roll: float,
+    rot_damp: float,
+    k_t: float,
+    hertz: int,
+    e_star: float,
+    g_star: float,
+    beta: float,
+    step_arr: wp.array(dtype=int),
+    tang_partner: wp.array2d(dtype=int),
+    tang_stamp: wp.array2d(dtype=int),
+    tang_xi: wp.array2d(dtype=wp.vec3),
+    dt: float,
+    grid: wp.uint64,
+    use_pull: int,
+    wall_pull: wp.array(dtype=float),
+    particle_f: wp.array(dtype=wp.vec3),
+    particle_t: wp.array(dtype=wp.vec3),
+):
+    """Grain contact with ONE moving part (#14), whose grid g is baked in the part's own
+    (rest) frame: the grain is looked up at R^T (x - T), the closest point and normal are
+    mapped back to the world, and the force law is the shared _wall_force with the part's
+    rigid wall velocity (motion type 3).  Grain-wall cohesion of the part is added here
+    too.  One part, so the closest triangle is the contact (no part segments)."""
+    i = wp.hash_grid_point_id(grid, wp.tid())
+    if ~particle_flags[i] & newton.ParticleFlags.ACTIVE:
+        return
+    R = pose_R[k]
+    T = pose_T[k]
+    x = particle_q[i]
+    xb = wp.transpose(R) * (x - T)
+    cc = _cell_of(g, xb)
+    if cc[0] < 0 or cc[1] < 0 or cc[2] < 0 or cc[0] >= g.nx or cc[1] >= g.ny or cc[2] >= g.nz:
+        return
+    cell = (cc[2] * g.ny + cc[1]) * g.nx + cc[0]
+    k0 = g.cell_start[cell]
+    ncand = g.cell_start[cell + 1] - k0
+    if ncand == 0:
+        return
+    m = g.rec[k0].part
+    if collider.active[m] == 0:
+        return
+    radius = particle_radius[i]
+    rr = radius + collider.thickness[m]
+    best_sq = rr * rr
+    best_t = int(-1)
+    for s in range(ncand):
+        r = g.rec[k0 + s]
+        h = wp.dot(xb - r.v0, r.n)
+        if h * h < best_sq:
+            sq, _c = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, xb)
+            if sq < best_sq:
+                best_sq = sq
+                best_t = k0 + s
+    if best_t < 0:
+        return
+    br = g.rec[best_t]
+    _sq, cpb = _tri_closest(br.v0, br.u, br.w, br.n, br.t2, xb)
+    face_n = br.n
+    if collider.two_sided[m] == 0:
+        face_n = _avg_normal_seg(g, k0, 0, ncand, cpb)
+    sdf, nb = _shell_sdf(collider.two_sided[m], collider.thickness[m], xb - cpb,
+                         wp.sqrt(best_sq), face_n)
+    c = sdf - radius
+    if c < 0.0 and c >= -radius:
+        n = R * nb
+        cp = R * cpb + T
+        fw, tw = _wall_force(collider, m, n, c, radius, particle_qd[i], particle_w[i],
+                             particle_inv_mass[i], mu_roll, rot_damp, k_t, hertz, e_star,
+                             g_star, beta, step_arr[0], i, -(m + 2), cp, tang_partner,
+                             tang_stamp, tang_xi, dt)
+        if use_pull == 1:
+            if wall_pull[m] > 0.0:
+                fw -= n * (wall_pull[m] / particle_inv_mass[i])
+        particle_f[i] = particle_f[i] + fw
+        particle_t[i] = particle_t[i] + tw
 
 
 @wp.kernel
