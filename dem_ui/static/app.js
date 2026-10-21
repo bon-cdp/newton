@@ -531,13 +531,25 @@ function motionRow(p) {
   if (m.type === "moving") { movingRows(p, td); return tr; }
   if (m.type === "belt") {
     const speed = Math.hypot(...m.velocity);
+    // direction: typed (x, y, z -- any length, normalised) or picked from an edge
+    const unit = m.velocity.map(c => c / (speed || 1));
     td.innerHTML = `↳ belt speed <input type="number" step="any" value="${+speed.toFixed(4)}"> m/s
-      · direction (${dirText(m.velocity)})
+      · direction x <input type="number" step="any" class="belt-dir" value="${+unit[0].toFixed(4)}" style="width:4.5em">
+      y <input type="number" step="any" class="belt-dir" value="${+unit[1].toFixed(4)}" style="width:4.5em">
+      z <input type="number" step="any" class="belt-dir" value="${+unit[2].toFixed(4)}" style="width:4.5em">
       <button class="small">pick edge</button> <button class="small">flip</button>
       <span class="msg">direction of the CARRYING side; pulley wrap and return follow it</span>`;
     const [spIn] = td.querySelectorAll("input");
+    const dirIn = [...td.querySelectorAll(".belt-dir")];
     const [pick, flip] = td.querySelectorAll("button");
     spIn.onchange = () => { const n = Math.hypot(...m.velocity) || 1; m.velocity = m.velocity.map(c => c / n * +spIn.value); renderSetup(); };
+    dirIn.forEach(inp => inp.onchange = () => {
+      const d = dirIn.map(i => +i.value || 0), n = Math.hypot(...d);
+      if (n === 0) { renderSetup(); return; }                 // all zero: keep the old direction
+      const s = Math.hypot(...m.velocity) || 1;
+      m.velocity = d.map(c => +(c / n * s).toFixed(6));
+      renderSetup();
+    });
     flip.onclick = () => { m.velocity = m.velocity.map(c => -c); renderSetup(); };
     pick.onclick = async () => {
       pick.textContent = "click an edge on the part… (Esc cancels)";
