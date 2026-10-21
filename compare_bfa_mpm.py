@@ -128,6 +128,12 @@ def read_frame(path):
     ids = block(b"SCALARS id", 1)
     if ids is not None:
         out["id"] = ids[:, 0].astype(np.int64)
+    mass = block(b"SCALARS mass", 1)
+    if mass is not None:
+        out["mass"] = mass[:, 0]                       # clump member's share of its clump
+    body = block(b"SCALARS body", 1)
+    if body is not None:
+        out["body"] = body[:, 0].astype(np.int64)
     return out
 
 

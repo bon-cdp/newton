@@ -65,6 +65,13 @@ way a sieve curve is given; percentages need not add up to 100, they are normali
   so a wide spread costs time.
 - Mass rates, held/discharged masses, flows and regions count each grain at its own mass.
 - Playback draws each size at its own diameter.
+- **spheres** makes a size a **clump**: a rigid grain of that many overlapping spheres
+  (2–12). Without size rows, *spheres per grain* does the same for the single size. Each
+  clumped size gets 8 random shapes, grown as small aggregates. Every shape is scaled to
+  the volume and mass of that row's sphere, so the mass fractions hold. Clumps land at a
+  random orientation and roll and interlock like irregular grains; playback shows their
+  member spheres. A clump costs about as much as that many spheres, and its smaller member
+  spheres shorten the timestep.
 - Each size is injected on its own lattice, spaced for that size. The sizes are still placed
   independently, so the many small grains fill gaps the big ones need. A mixture inlet
   therefore passes about **half** of what it would for one size, and the capacity check

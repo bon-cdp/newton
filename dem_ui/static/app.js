@@ -144,8 +144,10 @@ function renderSizes(sc) {
   const box = $("#size-dist"), mat = sc.material;
   const changed = () => { renderSizes(sc); updateCapacity(); refreshEstimate(); };
   const rows = mat.sizes || [];
-  box.innerHTML = `<table class="tbl"><thead><tr><th>radius (m)</th><th>mass %</th><th title="share of grains by number">grains %</th><th></th></tr></thead><tbody></tbody></table>
-    <button type="button" id="size-add">+ size</button> <span id="size-note" style="color:var(--muted);font-size:11px"></span>`;
+  box.innerHTML = `<table class="tbl"><thead><tr><th>radius (m)</th><th>mass %</th><th title="share of grains by number">grains %</th><th title="1 = a sphere; n > 1 = a rigid clump of n overlapping spheres (random shapes, same volume and mass)">spheres</th><th></th></tr></thead><tbody></tbody></table>
+    <button type="button" id="size-add">+ size</button> <span id="size-note" style="color:var(--muted);font-size:11px"></span>
+    <div id="single-spheres" style="font-size:11px;color:var(--muted);margin-top:4px">spheres per grain
+      <input type="number" min="1" max="12" step="1" style="width:3.5em"> (1 = spheres; more = random clumps of that many)</div>`;
   const tb = box.querySelector("tbody"), cls = sizeClasses(mat);
   const wsum = rows.reduce((a, s) => a + (+s.fraction > 0 ? +s.fraction : 0), 0);
   rows.forEach((s, k) => {
@@ -154,8 +156,11 @@ function renderSizes(sc) {
     const live = +s.fraction > 0 && +s.radius > 0;
     tr.innerHTML = `<td><input type="number" step="any" value="${s.radius}" style="width:6em"></td>
       <td><input type="number" step="any" value="${+(s.fraction * 100).toPrecision(6)}" style="width:5em"></td>
-      <td class="num">${live ? fmt(100 * cls[ci].p) : "—"}</td><td><button type="button" title="remove">×</button></td>`;
-    const [ir, iw] = tr.querySelectorAll("input");
+      <td class="num">${live ? fmt(100 * cls[ci].p) : "—"}</td>
+      <td><input type="number" min="1" max="12" step="1" value="${s.spheres ?? 1}" style="width:3.5em"></td>
+      <td><button type="button" title="remove">×</button></td>`;
+    const [ir, iw, isp] = tr.querySelectorAll("input");
+    isp.onchange = () => { const n = Math.max(1, Math.round(+isp.value || 1)); if (n > 1) s.spheres = n; else delete s.spheres; changed(); };
     ir.onchange = () => { s.radius = +ir.value; changed(); };
     iw.onchange = () => { s.fraction = +iw.value / 100; changed(); };
     tr.querySelector("button").onclick = () => { rows.splice(k, 1); if (!rows.length) delete mat.sizes; changed(); };
@@ -167,6 +172,12 @@ function renderSizes(sc) {
     rows.push({ radius: +(+mat.radius / 2).toPrecision(3), fraction: 0 });
     changed();
   };
+  // the single size (no rows) can be clumps too
+  const ss = box.querySelector("#single-spheres");
+  ss.hidden = rows.length > 0;
+  const ssi = ss.querySelector("input");
+  ssi.value = mat.spheres ?? 1;
+  ssi.onchange = () => { const n = Math.max(1, Math.round(+ssi.value || 1)); if (n > 1) mat.spheres = n; else delete mat.spheres; changed(); };
   const mean = cls.reduce((a, k) => a + k.p * k.m, 0);
   box.querySelector("#size-note").textContent = !rows.length
     ? "one size: every grain has the radius above"

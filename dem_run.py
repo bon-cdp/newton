@@ -236,10 +236,13 @@ def recycle(
     down_axis: int,
     down_sign: int,
     class_id: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
 ):
     i = wp.tid()
     if ~particle_flags[i] & wp.int32(newton.ParticleFlags.ACTIVE):
         return
+    if particle_body[i] >= 0:
+        return                            # clump member: recycle_clumps retires whole bodies
     p = particle_q[i]
     if p[0] >= lo[0] and p[0] <= hi[0] and p[1] >= lo[1] and p[1] <= hi[1] and p[2] >= lo[2] and p[2] <= hi[2]:
         return
@@ -258,6 +261,110 @@ def recycle(
         wp.atomic_add(discharged, c, 1)
     else:
         wp.atomic_add(escaped, c, 1)   # left through a side or the top: a leak, not discharge
+
+
+@wp.kernel
+def spawn_clumps(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_w: wp.array(dtype=wp.vec3),
+    wall_slack: wp.array(dtype=float),
+    first: wp.array(dtype=int),
+    count: wp.array(dtype=int),
+    sub_offset: wp.array(dtype=wp.vec3),
+    body_x: wp.array(dtype=wp.vec3),
+    body_v: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.quat),
+    body_L: wp.array(dtype=wp.vec3),
+    state: wp.array(dtype=int),
+    step_arr: wp.array(dtype=int),
+    seed: int,
+):
+    """Clumps (#10): inject_event spawns a clump as its FIRST member at the site; this
+    makes it a body there -- centre at the site, the spawn velocity, a random orientation
+    (uniform, Shoemake) -- and places all its members.  Free lists of clump classes hold
+    first members only."""
+    b = wp.tid()
+    if state[b] != 0:
+        return
+    i0 = first[b]
+    if (particle_flags[i0] & newton.ParticleFlags.ACTIVE) == 0:
+        return
+    x = particle_q[i0]
+    v = particle_qd[i0]
+    rng = wp.rand_init(seed, b * 7919 + step_arr[0])
+    u1 = wp.randf(rng)
+    u2 = wp.randf(rng)
+    u3 = wp.randf(rng)
+    a = wp.sqrt(1.0 - u1)
+    c = wp.sqrt(u1)
+    q = wp.quat(a * wp.sin(6.2831853 * u2), a * wp.cos(6.2831853 * u2),
+                c * wp.sin(6.2831853 * u3), c * wp.cos(6.2831853 * u3))
+    R = wp.quat_to_matrix(q)
+    body_x[b] = x
+    body_v[b] = v
+    body_q[b] = q
+    body_L[b] = wp.vec3(0.0)
+    state[b] = 1
+    for k in range(count[b]):
+        i = i0 + k
+        particle_q[i] = x + R * sub_offset[i]
+        particle_qd[i] = v
+        particle_w[i] = wp.vec3(0.0)
+        particle_flags[i] = wp.int32(newton.ParticleFlags.ACTIVE)
+        wall_slack[i] = 0.0
+
+
+@wp.kernel
+def recycle_clumps(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_w: wp.array(dtype=wp.vec3),
+    lo: wp.vec3,
+    hi: wp.vec3,
+    park: wp.vec3,
+    first: wp.array(dtype=int),
+    count: wp.array(dtype=int),
+    body_x: wp.array(dtype=wp.vec3),
+    state: wp.array(dtype=int),
+    class_id: wp.array(dtype=wp.int32),
+    free_idx: wp.array(dtype=wp.int32),
+    free_count: wp.array(dtype=wp.int32),
+    free_off: wp.array(dtype=wp.int32),
+    discharged: wp.array(dtype=wp.int32),
+    escaped: wp.array(dtype=wp.int32),
+    down_axis: int,
+    down_sign: int,
+):
+    """recycle for clumps: a body whose centre has left the domain is retired whole, its
+    first member back on its class's free list; counted as its members (each carries its
+    share of the clump's mass, so counts x class mass stay exact)."""
+    b = wp.tid()
+    if state[b] == 0:
+        return
+    p = body_x[b]
+    if p[0] >= lo[0] and p[0] <= hi[0] and p[1] >= lo[1] and p[1] <= hi[1] and p[2] >= lo[2] and p[2] <= hi[2]:
+        return
+    i0 = first[b]
+    for k in range(count[b]):
+        i = i0 + k
+        particle_flags[i] = wp.int32(0)
+        particle_q[i] = park
+        particle_qd[i] = wp.vec3(0.0)
+        particle_w[i] = wp.vec3(0.0)
+    state[b] = 0
+    c = int(class_id[i0])
+    slot = wp.atomic_add(free_count, c, 1)
+    free_idx[free_off[c] + slot] = i0
+    out_bottom = p[down_axis] < lo[down_axis]
+    if down_sign > 0:
+        out_bottom = p[down_axis] > hi[down_axis]
+    if out_bottom:
+        wp.atomic_add(discharged, c, count[b])
+    else:
+        wp.atomic_add(escaped, c, count[b])
 
 
 @wp.kernel
@@ -741,6 +848,12 @@ def holdup_estimate(sc: Scenario):
     return rate * res, res, how
 
 
+def spheres_per_grain(sc: Scenario) -> float:
+    """Mean particles per grain: 1 for spheres, more with clumps (#10)."""
+    m = sc.material
+    return sum(p * n for (_r, _m, p), n in zip(m.classes(), m.class_spheres()))
+
+
 def pool_size(sc: Scenario, device=None):
     """(pool, notes): grains to allocate.  Auto-sized from holdup_estimate unless the
     scenario sets expected_holdup_kg, and capped at what the GPU can hold -- an operator-
@@ -756,9 +869,10 @@ def pool_size(sc: Scenario, device=None):
         pool = int(max(s.min_pool, min(pool, 1.05 * total + 8192)))
     if device is not None and str(device).startswith("cuda"):
         free = wp.get_device(device).free_memory
-        fit = int(max(0.0, free - 1.5e9) / BYTES_PER_GRAIN)
+        per = BYTES_PER_GRAIN * spheres_per_grain(sc)        # a clump is n particles
+        fit = int(max(0.0, free - 1.5e9) / per)
         if pool > fit:
-            notes.append(f"pool {pool:,} grains needs {pool*BYTES_PER_GRAIN/1e9:.1f} GB; "
+            notes.append(f"pool {pool:,} grains needs {pool*per/1e9:.1f} GB; "
                          f"capped at {fit:,} to fit the GPU's {free/1e9:.1f} GB free")
             pool = max(s.min_pool, fit)
     return pool, notes
@@ -775,7 +889,7 @@ def estimate(sc: Scenario):
     step = SEC_PER_STEP + grains * SEC_PER_GRAIN_STEP
     return dict(grains_per_s=rate / gmass, grain_mass=gmass, holdup_kg=kg, holdup_grains=grains,
                 residence_s=res, holdup_how=how, dt=dt, steps=int(round(sc.output.duration / dt)),
-                memory_gb=pool_size(sc)[0] * BYTES_PER_GRAIN / 1e9,
+                memory_gb=pool_size(sc)[0] * BYTES_PER_GRAIN * spheres_per_grain(sc) / 1e9,
                 step_ms=step * 1e3, s_per_sim_s=step / dt, run_s=step / dt * sc.output.duration)
 
 
@@ -958,10 +1072,21 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
 
 
     rate = inj.mass_rate / gmass
+    # clumps (#10): per class None (spheres) or its random shapes; a clump's lattice is
+    # spaced for its reach (bounding radius), not its equivalent sphere
+    tpl = m.class_templates(s.seed)
+    nsph = m.class_spheres()
+    any_clump = any(n > 1 for n in nsph)
+    if any_clump:
+        from clumps import describe as describe_clumps
+        for k, t in enumerate(tpl):
+            if t is not None:
+                log(f"  clumps, class {k}       {describe_clumps(t)}")
     # One injection stream per size class: its own lattice (spaced for its radius), its own
     # rate (its number fraction of the grains) and schedule.  One class: one stream, as before.
     streams = []
-    for k, (r_k, _m_k, p_k) in enumerate(classes):
+    for k, (r_eq, _m_k, p_k) in enumerate(classes):
+        r_k = r_eq if tpl[k] is None else max(t.bound_radius for t in tpl[k])
         L = lattice_for(r_k)
         sites, what, n_raw, site_spacing = L["sites"], L["what"], L["n_raw"], L["spacing"]
         fr, tris, face_area, spawn_velocity = L["fr"], L["tris"], L["face_area"], L["spawn_velocity"]
@@ -975,7 +1100,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         inj_interval = batch / rate_k
         spawn_speed = float(np.linalg.norm(spawn_velocity))
         if len(classes) > 1:
-            log(f"\n  size class {k}          radius {r_k*1e3:.2f} mm, {rate_k:,.0f} grains/s")
+            log(f"\n  size class {k}          radius {r_eq*1e3:.2f} mm, {rate_k:,.0f} grains/s"
+                + ("" if tpl[k] is None else f", clumps of {nsph[k]} reaching {r_k*1e3:.2f} mm"))
         log(f"{'' if len(classes) > 1 else chr(10)}  {what} -> {len(sites)} of {n_raw} lattice "
             f"sites at {site_spacing*1e3:.1f} mm ({n_raw-len(sites)} dropped for wall clearance)")
         log(f"  batch                 {batch} grains every {inj_interval*1e3:.1f} ms -> consecutive "
@@ -1037,7 +1163,15 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     void_cell = z1 + 1 + (hash_dz - span) // 2          # middle of the unreachable residues
     park_lo = wp.vec3(float(sites[:, 0].mean()), float(sites[:, 1].max()) + 2.0,
                       (void_cell + 0.5) * gcell)
-    for _k in range(pool):
+    # grains per class (contiguous blocks; see below) and the particles they need: a clump
+    # of n spheres is n particles
+    n_cls = len(classes)
+    cls_count = np.array([pool], dtype=np.int64)
+    if n_cls > 1:
+        cls_count = np.floor(np.array([pk for _r, _m, pk in classes]) * pool).astype(np.int64)
+        cls_count[-1] = pool - cls_count[:-1].sum()
+    cls_parts = cls_count * np.array(nsph, dtype=np.int64)
+    for _k in range(int(cls_parts.sum())):
         builder.add_particle(pos=park_lo, vel=wp.vec3(0.0), mass=gmass, radius=radius, flags=0)
 
     model = builder.finalize(device=device)
@@ -1046,27 +1180,59 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
     model.particle_max_velocity = s.max_velocity
     model.set_gravity(tuple(sc.gravity))
     n_pool = model.particle_count
-    # size classes: each pool slot gets one for good (seeded draw by number fraction), so a
-    # spawned grain simply has its slot's radius and mass and the GPU injection, recycling
-    # and contact code are unchanged.  One class: nothing to set.
-    n_cls = len(classes)
-    class_host = np.zeros(n_pool, dtype=np.int32)
-    cls_count = np.array([n_pool], dtype=np.int64)
-    if n_cls > 1:
-        # a contiguous block of slots per class, sized by its number fraction, so each class
-        # keeps its own free list (its own injection stream pops from it)
-        cls_count = np.floor(np.array([pk for _r, _m, pk in classes]) * n_pool).astype(np.int64)
-        cls_count[-1] = n_pool - cls_count[:-1].sum()
-        class_host = np.repeat(np.arange(n_cls), cls_count).astype(np.int32)
-        rad = np.array([rk for rk, _m, _p in classes], dtype=np.float64)[class_host]
-        mas = np.array([mk for _r, mk, _p in classes], dtype=np.float64)[class_host]
+    # size classes: a contiguous block of pool slots per class, sized by its number
+    # fraction, so each class keeps its own free list (its own injection stream pops from
+    # it); each slot has its class's radius and mass for good, so the GPU injection,
+    # recycling and contact code are unchanged.  A clump class's block holds n particles
+    # per clump; its members carry the CLUMP's mass (contact damping sees the body) and
+    # its free list holds first members only.  One class of spheres: nothing to set.
+    multi = n_cls > 1 or any_clump
+    class_host = np.repeat(np.arange(n_cls), cls_parts).astype(np.int32)
+    radius_host = np.full(n_pool, radius, dtype=np.float32)
+    free_segs = [np.arange(n_pool, dtype=np.int32)]
+    count_mass = np.array([mk / nk for (_r, mk, _p), nk in zip(classes, nsph)])  # per counted particle
+    clump = None
+    if multi:
+        rad = np.zeros(n_pool)
+        mas = np.zeros(n_pool)
+        body = np.full(n_pool, -1, dtype=np.int32)
+        sub_off = np.zeros((n_pool, 3))
+        first, cnt, b_im, b_ii = [], [], [], []
+        free_segs = []
+        ps = 0
+        for k, ((r_k, m_k, _p), n_k) in enumerate(zip(classes, nsph)):
+            nb = int(cls_count[k])
+            if tpl[k] is None:
+                rad[ps:ps + nb] = r_k
+                mas[ps:ps + nb] = m_k
+                free_segs.append(np.arange(ps, ps + nb, dtype=np.int32))
+            else:
+                firsts = ps + n_k * np.arange(nb)
+                for b in range(nb):
+                    t = tpl[k][b % len(tpl[k])]
+                    idx = firsts[b] + np.arange(n_k)
+                    rad[idx] = t.radii
+                    mas[idx] = t.mass
+                    sub_off[idx] = t.offsets
+                    body[idx] = len(first)
+                    first.append(int(firsts[b]))
+                    cnt.append(n_k)
+                    b_im.append(1.0 / t.mass)
+                    b_ii.append(1.0 / t.inertia)
+                free_segs.append(firsts.astype(np.int32))
+            ps += int(cls_parts[k])
         model.particle_radius.assign(rad.astype(np.float32))
         model.particle_inv_mass.assign((1.0 / mas).astype(np.float32))
         if getattr(model, "particle_mass", None) is not None:
             model.particle_mass.assign(mas.astype(np.float32))
+        radius_host = rad.astype(np.float32)
+        if first:
+            clump = dict(body=body, first=first, count=cnt, inv_mass=b_im, inv_inertia=b_ii,
+                         sub_offset=sub_off)
+            log(f"  clumps                {len(first):,} bodies of {int(sum(cnt)):,} spheres in the pool")
     class_id = wp.array(class_host, dtype=wp.int32, device=device)
-    class_mass = wp.array(np.array([mk for _r, mk, _p in classes] if n_cls > 1 else [gmass],
-                                   dtype=np.float32), dtype=float, device=device)
+    class_mass = wp.array(np.asarray(count_mass if multi else [gmass], dtype=np.float32),
+                          dtype=float, device=device)
 
     collider, meshes = build_collider(
         parts,
@@ -1135,6 +1301,9 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                                calibrate_restitution=m.calibrate_restitution, cal_dt=dt,
                                cohesion=m.cohesion,
                                wall_cohesion=[wall_cohesion(m, p) for p in sc.parts])
+    if clump is not None:
+        solver.set_clumps(clump["body"], clump["first"], clump["count"], clump["inv_mass"],
+                          clump["inv_inertia"], clump["sub_offset"])
     if moving_idx:
         solver.set_moving(moving_grids,
                           wp.array(np.repeat(np.eye(3, dtype=np.float32)[None], len(moving_idx), 0),
@@ -1142,9 +1311,10 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                           wp.zeros(len(moving_idx), dtype=wp.vec3, device=device))
 
     s0, s1 = model.state(), model.state()
-    free_idx = wp.array(np.arange(n_pool, dtype=np.int32), dtype=wp.int32, device=device)
-    free_count = wp.array(cls_count.astype(np.int32), dtype=wp.int32, device=device)   # per class
-    free_off_host = np.concatenate([[0], np.cumsum(cls_count)[:-1]]).astype(np.int32)
+    free_len = np.array([len(fs) for fs in free_segs], dtype=np.int64)
+    free_idx = wp.array(np.concatenate(free_segs).astype(np.int32), dtype=wp.int32, device=device)
+    free_count = wp.array(free_len.astype(np.int32), dtype=wp.int32, device=device)   # per class
+    free_off_host = np.concatenate([[0], np.cumsum(free_len)[:-1]]).astype(np.int32)
     free_off = wp.array(free_off_host, dtype=wp.int32, device=device)
     discharged = wp.zeros(n_cls, dtype=wp.int32, device=device)    # per size class
     escaped = wp.zeros(n_cls, dtype=wp.int32, device=device)
@@ -1173,7 +1343,8 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
         out_dir=out_dir, device=device, kd_pp=kd_pp, kd_wall=kd_wall, restitution=e, zeta=zeta,
         youngs_eff=youngs_eff, skin=skin, grain_mass=gmass, grain_radius=radius,
         classes=classes, n_cls=n_cls, class_id=class_id, class_mass=class_mass,
-        moving_idx=moving_idx,
+        moving_idx=moving_idx, any_clump=clump is not None, multi=multi, nsph=nsph,
+        radius_host=radius_host, count_mass=count_mass, free_total=int(free_len.sum()),
         class_host=class_host)
 
 
@@ -1189,13 +1360,15 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     gmass, out_dir, n_pool = S.grain_mass, S.out_dir, S.n_pool
     # mass from per-size-class grain counts (exact; one class: count x grain mass as before)
     n_cls = S.n_cls
-    cls_m = np.array([mk for _r, mk, _p in S.classes], dtype=np.float64)
-    cls_r_host = (np.array([rk for rk, _m, _p in S.classes], dtype=np.float32)[S.class_host]
-                  if n_cls > 1 else None)
+    multi = S.multi                     # size classes or clumps: counts x class mass
+    cls_m = np.asarray(S.count_mass, dtype=np.float64)     # per counted particle
+    cls_r_host = S.radius_host if multi else None
+    cls_mass_host = cls_m[S.class_host].astype(np.float32) if multi else None
+    nsph = np.asarray(S.nsph, dtype=np.float64)
 
     def kg(counts):
         counts = np.asarray(counts, dtype=np.float64).reshape(-1)
-        return float(counts[0] * gmass) if n_cls == 1 else float(counts @ cls_m)
+        return float(counts[0] * gmass) if not multi else float(counts @ cls_m)
     out = sc.output
 
     if out.vtk:
@@ -1305,7 +1478,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
         # largest), searched over enough neighbouring sites to cover that distance
         st["clear"] = (st["radius"] + S.grain_radius) * 1.05
         st["reach"] = max(1, math.ceil(st["clear"] / st["lattice"]["spacing"]))
-        off, cnt = int(S.free_off_host[k]), int(S.free_off_host[k + 1]) if k + 1 < n_cls else n_pool
+        off, cnt = int(S.free_off_host[k]), int(S.free_off_host[k + 1]) if k + 1 < n_cls else S.free_total
         st["free_idx"] = S.free_idx[off:cnt]
         st["free_count"] = S.free_count[k:k + 1]
         st["backlog"] = S.backlog[k:k + 1]
@@ -1335,7 +1508,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 lat = st["lattice"]
                 wp.launch(mark_occupied, dim=n_pool, device=device, inputs=[
                     st["w_event"], solver.step_arr, step_offset, s0.particle_q, model.particle_flags,
-                    model.particle_radius, st["radius"] if n_cls > 1 else 0.0, lat["origin"], lat["u"], lat["v"], lat["n"], lat["spacing"], lat["nu"], lat["nv"],
+                    model.particle_radius, st["radius"] if multi else 0.0, lat["origin"], lat["u"], lat["v"], lat["n"], lat["spacing"], lat["nu"], lat["nv"],
                     lat["nw"], lat["map"], st["w_sites"], st["clear"], st["reach"], st["occupied"]])
                 wp.launch_tiled(inject_event, dim=[1], block_dim=INJECT_BLOCK, device=device, inputs=[
                     st["w_event"], solver.step_arr, step_offset, st["w_picks"], st["w_order"],
@@ -1343,6 +1516,13 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                     S.spawn_vel, st["free_idx"], st["free_count"], st["backlog"], S.starved,
                     s0.particle_q, s0.particle_qd, model.particle_flags, solver.wall_slack,
                     S.injected])
+                if solver.clumps is not None:
+                    cl = solver.clumps
+                    wp.launch(spawn_clumps, dim=cl["n"], device=device, inputs=[
+                        s0.particle_q, s0.particle_qd, model.particle_flags, solver.particle_w,
+                        solver.wall_slack, cl["first"], cl["count"], cl["sub_offset"], cl["x"],
+                        cl["v"], cl["q"], cl["L"], cl["state"], solver.step_arr,
+                        int(sc.solver.seed)])
             solver.step(s0, s0, None, None, dt)     # in place -- see SolverGranularDEM.step
 
     # --- CUDA graph ------------------------------------------------------------------
@@ -1422,14 +1602,22 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                                 for b in range(3):
                                     if b != a:
                                         inside &= (pt[:, b] >= fp.lo[b]) & (pt[:, b] <= fp.hi[b])
-                                flow_kg[k] += (inside.sum() * gmass if n_cls == 1 else
+                                flow_kg[k] += (inside.sum() * gmass if not multi else
                                                kg(np.bincount(S.class_host[cross][inside],
                                                               minlength=n_cls)))
                 wp.launch(recycle, dim=n_pool, device=device, inputs=[
                     s0.particle_q, s0.particle_qd, model.particle_flags,
                     wp.vec3(*sc.domain_lo), wp.vec3(*sc.domain_hi), S.park_lo,
                     S.free_idx, S.free_count, S.free_off, S.discharged, S.escaped, down_axis,
-                    down_sign, S.class_id])
+                    down_sign, S.class_id, solver.body])
+                if solver.clumps is not None:
+                    cl = solver.clumps
+                    wp.launch(recycle_clumps, dim=cl["n"], device=device, inputs=[
+                        s0.particle_q, s0.particle_qd, model.particle_flags, solver.particle_w,
+                        wp.vec3(*sc.domain_lo), wp.vec3(*sc.domain_hi), S.park_lo,
+                        cl["first"], cl["count"], cl["x"], cl["state"], S.class_id,
+                        S.free_idx, S.free_count, S.free_off, S.discharged, S.escaped,
+                        down_axis, down_sign])
                 # recycle appends with atomics (arbitrary order): re-sort the free list so
                 # the next spawns get the same pool slots on every run.  Once per frame.
                 _fc = S.free_count.numpy()
@@ -1470,8 +1658,10 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
             st = S.stats.numpy()
             n = st[0]
             cb = 4 + 3 * max(len(regs), 1)            # start of the per-class counts
-            held_kg = n * gmass if n_cls == 1 else kg(st[cb:cb + n_cls])
-            out_kg = kg(S.discharged.numpy()) if n_cls > 1 else int(S.discharged.numpy()[0]) * gmass
+            held_kg = n * gmass if not multi else kg(st[cb:cb + n_cls])
+            if S.any_clump:
+                n = float((st[cb:cb + n_cls] / nsph).sum())     # grains, not member spheres
+            out_kg = kg(S.discharged.numpy()) if multi else int(S.discharged.numpy()[0]) * gmass
             wall = time.time() - t0
             row = [f"{frame*S.frame_dt:.4f}", f"{int(n)}", f"{held_kg:.6f}", f"{st[1]:.6f}",
                    f"{st[3]:.4f}"]
@@ -1479,7 +1669,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
             for k, r in enumerate(regs):
                 c, sv = st[4 + 3 * k], st[5 + 3 * k]
                 v = sv / c if c > 0 else 0.0
-                rk = c * gmass if n_cls == 1 else kg(st[cb + n_cls * (1 + k):cb + n_cls * (2 + k)])
+                rk = c * gmass if not multi else kg(st[cb + n_cls * (1 + k):cb + n_cls * (2 + k)])
                 row += [f"{rk:.6f}", f"{v:.4f}"]
                 show.append(f"{rk:11.2f} {v:5.2f}")
             row.append(f"{(st[2] / n if n > 0 else 0.0):.3f}")
@@ -1487,9 +1677,9 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                 if r.spin:
                     c = st[4 + 3 * k]
                     row.append(f"{(st[6 + 3 * k] / c if c > 0 else 0.0):.3f}")
-            esc_kg = kg(S.escaped.numpy()) if n_cls > 1 else int(S.escaped.numpy()[0]) * gmass
+            esc_kg = kg(S.escaped.numpy()) if multi else int(S.escaped.numpy()[0]) * gmass
             # grains only enter by injection: with several sizes, injected = held + out + escaped
-            inj_kg = (int(S.injected.numpy()[0]) * gmass if n_cls == 1
+            inj_kg = (int(S.injected.numpy()[0]) * gmass if not multi
                       else held_kg + out_kg + esc_kg)
             row += [f"{out_kg:.6f}", f"{inj_kg:.6f}", f"{esc_kg:.6f}"]
             row += [f"{kg:.6f}" for kg in flow_kg]
@@ -1520,8 +1710,10 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
                     write_particles_vtk(os.path.join(out_dir, f"frame_{frame:04d}_particles.vtk"),
                                         frame, s0.particle_q.numpy()[act],
                                         s0.particle_qd.numpy()[act],
-                                        S.grain_radius if n_cls == 1 else cls_r_host[act],
-                                        spin=solver.particle_w.numpy()[act], ids=act)
+                                        S.grain_radius if not multi else cls_r_host[act],
+                                        spin=solver.particle_w.numpy()[act], ids=act,
+                                        mass=cls_mass_host[act] if S.any_clump else None,
+                                        body=solver.body.numpy()[act] if S.any_clump else None)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
@@ -1531,7 +1723,7 @@ def run(S, extra_meta: dict | None = None, reference: dict | None = None):
     # mass audit: scheduled vs delivered injection, and where the mass went
     t_end = min(sim_t, S.inj.stop) - max(S.inj.start, 0.0)
     target = S.inj.mass_rate * max(t_end, 0.0)
-    if n_cls == 1:
+    if not multi:
         inj_kg = int(S.injected.numpy()[0]) * gmass
         held = int(S.stats.numpy()[0]) * gmass
         out_kg = int(S.discharged.numpy()[0]) * gmass

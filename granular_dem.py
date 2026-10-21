@@ -411,6 +411,9 @@ class SolverGranularDEM(SolverBase):
         # baked candidate-triangle grid; None falls back to per-step BVH queries
         self.wall_grid = wall_grid
         self.moving_grids = []        # moving parts (#14): see set_moving
+        # clump body of each particle (-1 = a plain sphere) and the bodies: see set_clumps
+        self.body = wp.full(model.particle_count, -1, dtype=int, device=model.device)
+        self.clumps = None
         self.wall_cache = wall_cache
         self.rotation = rotation
         self.mu_roll = float(mu_roll)
@@ -565,6 +568,29 @@ class SolverGranularDEM(SolverBase):
         """Device step counter, read back (syncs -- not for the hot loop)."""
         return int(self.step_arr.numpy()[0])
 
+    def set_clumps(self, body, first, count, inv_mass, inv_inertia, sub_offset):
+        """Multi-sphere clumps (#10): particle -> body (-1 = sphere), and per body its first
+        member, member count, inverse mass and principal inverse inertia; sub_offset is
+        each member's centre in its body's principal frame.  Members are ordinary
+        particles that skip each other in contact; integrate_clump_bodies moves them as
+        one rigid body.  A body is born when its first member is spawned (spawn_clumps)."""
+        d = self.model.device
+        nb = len(first)
+        self.body.assign(np.asarray(body, dtype=np.int32))
+        self.clumps = dict(
+            n=nb,
+            first=wp.array(np.asarray(first, dtype=np.int32), dtype=int, device=d),
+            count=wp.array(np.asarray(count, dtype=np.int32), dtype=int, device=d),
+            inv_mass=wp.array(np.asarray(inv_mass, dtype=np.float32), dtype=float, device=d),
+            inv_inertia=wp.array(np.asarray(inv_inertia, dtype=np.float32), dtype=wp.vec3, device=d),
+            sub_offset=wp.array(np.asarray(sub_offset, dtype=np.float32), dtype=wp.vec3, device=d),
+            x=wp.zeros(nb, dtype=wp.vec3, device=d), v=wp.zeros(nb, dtype=wp.vec3, device=d),
+            q=wp.array(np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (nb, 1)), dtype=wp.quat, device=d),
+            L=wp.zeros(nb, dtype=wp.vec3, device=d),
+            state=wp.zeros(nb, dtype=int, device=d))
+        self.clump_F = wp.zeros(nb, dtype=wp.vec3, device=d)
+        self.clump_T = wp.zeros(nb, dtype=wp.vec3, device=d)
+
     def set_moving(self, grids, pose_R, pose_T):
         """Moving parts (#14): one grid per part in its own frame (build_wall_grid with
         part_ids), and the device pose arrays set_part_poses fills each step."""
@@ -607,7 +633,7 @@ class SolverGranularDEM(SolverBase):
                                           2.0 * float(model.particle_max_radius) + self.skin_max)
                 wp.launch(build_neighbor_list, dim=model.particle_count, inputs=[
                     model.particle_grid.id, state_in.particle_q, model.particle_radius,
-                    model.particle_flags, model.particle_max_radius, self.skin_arr,
+                    model.particle_flags, self.body, model.particle_max_radius, self.skin_arr,
                     self.nbr, self.nbr_count, self.x_build, self.nbr_overflow],
                     device=model.device)
                 if self.wall_grid is not None:
@@ -659,7 +685,7 @@ class SolverGranularDEM(SolverBase):
                 inputs=[
                     model.particle_grid.id, self.nbr, self.nbr_count,
                     state_in.particle_q, state_in.particle_qd,
-                    self.particle_w, model.particle_radius, model.particle_flags,
+                    self.particle_w, model.particle_radius, model.particle_flags, self.body,
                     model.particle_inv_mass,
                     model.particle_ke, model.particle_kd, model.particle_kf,
                     model.particle_mu, self.mu_roll, self.rot_damp,
@@ -677,7 +703,7 @@ class SolverGranularDEM(SolverBase):
                 dim=model.particle_count,
                 inputs=[
                     model.particle_grid.id, state_in.particle_q, state_in.particle_qd,
-                    self.particle_w, model.particle_radius, model.particle_flags,
+                    self.particle_w, model.particle_radius, model.particle_flags, self.body,
                     model.particle_inv_mass,
                     model.particle_ke, model.particle_kd, model.particle_kf,
                     model.particle_mu, self.mu_roll, self.rot_damp, model.particle_max_radius,
@@ -699,7 +725,8 @@ class SolverGranularDEM(SolverBase):
                 kernel=add_pair_cohesion,
                 dim=model.particle_count,
                 inputs=[model.particle_grid.id, state_in.particle_q, model.particle_radius,
-                        model.particle_inv_mass, model.particle_flags, model.particle_max_radius,
+                        model.particle_inv_mass, model.particle_flags, self.body,
+                        model.particle_max_radius,
                         self.skin_max if use_list else 0.0, self.cohesion * G_STD],
                 outputs=[state_in.particle_f],
                 device=model.device,
@@ -796,6 +823,15 @@ class SolverGranularDEM(SolverBase):
                 device=model.device,
             )
 
+        # clumps: sum each body's member forces and torques BEFORE integrate_fused moves
+        # the members as loose spheres (it does not touch forces); the body pass after it
+        # overwrites them with the rigid motion
+        if self.clumps is not None:
+            cl = self.clumps
+            wp.launch(clump_wrench, dim=cl["n"], device=model.device, inputs=[
+                state_in.particle_q, state_in.particle_f, self.particle_t, model.particle_flags,
+                cl["first"], cl["count"], cl["x"], cl["state"], self.clump_F, self.clump_T])
+
         # linear + angular integration and the step counter, one launch
         wp.launch(
             kernel=integrate_fused,
@@ -809,6 +845,103 @@ class SolverGranularDEM(SolverBase):
             outputs=[state_out.particle_q, state_out.particle_qd],
             device=model.device,
         )
+        if self.clumps is not None:
+            cl = self.clumps
+            wp.launch(integrate_clump_bodies, dim=cl["n"], device=model.device, inputs=[
+                state_out.particle_q, state_out.particle_qd, self.particle_w, model.particle_flags,
+                cl["first"], cl["count"], cl["sub_offset"], cl["x"], cl["v"], cl["q"], cl["L"],
+                cl["state"], self.clump_F, self.clump_T, cl["inv_mass"], cl["inv_inertia"],
+                model.gravity, dt, model.particle_max_velocity, self.max_spin])
+
+
+@wp.kernel
+def clump_wrench(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_f: wp.array(dtype=wp.vec3),
+    particle_t: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    first: wp.array(dtype=int),
+    count: wp.array(dtype=int),
+    body_x: wp.array(dtype=wp.vec3),
+    state: wp.array(dtype=int),
+    F_out: wp.array(dtype=wp.vec3),
+    T_out: wp.array(dtype=wp.vec3),
+):
+    """Force and torque (about the centre of mass) on each live clump: the sum over its
+    members of f, and of (x_s - x) x f + tau."""
+    b = wp.tid()
+    if state[b] == 0:
+        return
+    xc = body_x[b]
+    F = wp.vec3(0.0)
+    T = wp.vec3(0.0)
+    for k in range(count[b]):
+        i = first[b] + k
+        fi = particle_f[i]
+        F += fi
+        T += wp.cross(particle_x[i] - xc, fi) + particle_t[i]
+    F_out[b] = F
+    T_out[b] = T
+
+
+@wp.kernel
+def integrate_clump_bodies(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_v: wp.array(dtype=wp.vec3),
+    particle_w: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    first: wp.array(dtype=int),
+    count: wp.array(dtype=int),
+    sub_offset: wp.array(dtype=wp.vec3),
+    body_x: wp.array(dtype=wp.vec3),
+    body_v: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.quat),
+    body_L: wp.array(dtype=wp.vec3),
+    state: wp.array(dtype=int),
+    F_in: wp.array(dtype=wp.vec3),
+    T_in: wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=float),
+    inv_inertia: wp.array(dtype=wp.vec3),
+    gravity: wp.array(dtype=wp.vec3),
+    dt: float,
+    v_max: float,
+    max_spin: float,
+):
+    """Rigid-body step of each live clump (symplectic Euler, as integrate_fused): the
+    translation from F; the rotation from the world-frame angular momentum L += T dt,
+    w = R I^-1 R^T L (the gyroscopic term is implicit in carrying L), q += dt/2 (w,0) q;
+    then the members are written back as x + R o, v + w x R o, w.  Runs after
+    integrate_fused, overwriting what it did to the members."""
+    b = wp.tid()
+    if state[b] == 0:
+        return
+    v1 = body_v[b] + (F_in[b] * inv_mass[b] + gravity[0]) * dt
+    sp = wp.length(v1)
+    if sp > v_max:
+        v1 *= v_max / sp
+    x1 = body_x[b] + v1 * dt
+    q = body_q[b]
+    L = body_L[b] + T_in[b] * dt
+    Ib = inv_inertia[b]
+    R = wp.quat_to_matrix(q)
+    w = R * wp.cw_mul(Ib, wp.transpose(R) * L)
+    ws = wp.length(w)
+    if ws > max_spin:
+        L = L * (max_spin / ws)
+        w = w * (max_spin / ws)
+    q1 = wp.normalize(q + wp.quat(w[0], w[1], w[2], 0.0) * q * (0.5 * dt))
+    R1 = wp.quat_to_matrix(q1)
+    w1 = R1 * wp.cw_mul(Ib, wp.transpose(R1) * L)
+    body_x[b] = x1
+    body_v[b] = v1
+    body_q[b] = q1
+    body_L[b] = L
+    for k in range(count[b]):
+        i = first[b] + k
+        o = R1 * sub_offset[i]
+        particle_x[i] = x1 + o
+        particle_v[i] = v1 + wp.cross(w1, o)
+        particle_w[i] = w1
 
 
 @wp.kernel
@@ -1105,6 +1238,7 @@ def eval_particle_contact_rot(
     particle_w: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
     particle_inv_mass: wp.array(dtype=float),
     k_n: float,
     k_d: float,
@@ -1149,10 +1283,14 @@ def eval_particle_contact_rot(
     f = wp.vec3(0.0)
     t = wp.vec3(0.0)
 
+    bi = particle_body[i]
     query = wp.hash_grid_query(grid, x, ri + max_radius)
     index = int(0)
     while wp.hash_grid_query_next(query, index):
         if index == i:
+            continue
+        # members of one clump never touch each other (it is one rigid body)
+        if bi >= 0 and particle_body[index] == bi:
             continue
         if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
             continue
@@ -1175,6 +1313,7 @@ def add_pair_cohesion(
     particle_radius: wp.array(dtype=float),
     particle_inv_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
     max_radius: float,
     skin: float,
     pull: float,
@@ -1192,10 +1331,14 @@ def add_pair_cohesion(
     x = particle_x[i]
     ri = particle_radius[i]
     f = wp.vec3(0.0)
+    bi = particle_body[i]
     query = wp.hash_grid_query(grid, x, ri + max_radius + skin)
     j = int(0)
     while wp.hash_grid_query_next(query, j):
         if j == i:
+            continue
+        # members of one clump never touch each other (it is one rigid body)
+        if bi >= 0 and particle_body[j] == bi:
             continue
         if (particle_flags[j] & newton.ParticleFlags.ACTIVE) == 0:
             continue
@@ -2232,6 +2375,7 @@ def build_neighbor_list(
     particle_x: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
     max_radius: float,
     skin: wp.array(dtype=float),
     nbr: wp.array2d(dtype=int),
@@ -2253,10 +2397,14 @@ def build_neighbor_list(
     ri = particle_radius[i]
     sk = skin[0]
     c = int(0)
+    bi = particle_body[i]
     query = wp.hash_grid_query(grid, x, ri + max_radius + sk)
     j = int(0)
     while wp.hash_grid_query_next(query, j):
         if j == i:
+            continue
+        # members of one clump never touch each other (it is one rigid body)
+        if bi >= 0 and particle_body[j] == bi:
             continue
         if (particle_flags[j] & newton.ParticleFlags.ACTIVE) == 0:
             continue
@@ -2281,6 +2429,7 @@ def eval_particle_contact_list(
     particle_w: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
     particle_inv_mass: wp.array(dtype=float),
     k_n: float,
     k_d: float,
@@ -2321,10 +2470,14 @@ def eval_particle_contact_list(
     ri = particle_radius[i]
     f = wp.vec3(0.0)
     t = wp.vec3(0.0)
+    bi = particle_body[i]
     hs = 0.5 * skin[0]
     if wp.length_sq(x - x_build[i]) <= hs * hs:
         for k in range(nbr_count[i]):
             index = nbr[k, i]
+            # members of one clump never touch each other (it is one rigid body)
+            if bi >= 0 and particle_body[index] == bi:
+                continue
             if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
                 continue
             df, dtq = _pair_contact(i, index, x, v, w, ri, particle_x, particle_v, particle_w,
@@ -2348,6 +2501,9 @@ def eval_particle_contact_list(
         index = int(0)
         while wp.hash_grid_query_next(query, index):
             if index == i:
+                continue
+            # members of one clump never touch each other (it is one rigid body)
+            if bi >= 0 and particle_body[index] == bi:
                 continue
             if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
                 continue

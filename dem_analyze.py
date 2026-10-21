@@ -206,6 +206,8 @@ def grain_sizes(sc, fr):
     """(radius, mass) per grain of one frame.  With a size distribution each frame radius
     (float32) snaps to its class, so masses are the run's exact class masses."""
     n = len(fr["pos"])
+    if "mass" in fr:                     # clumps: frames carry each sphere's mass share
+        return fr["radius"], fr["mass"]
     cls = sc.material.classes()
     if len(cls) == 1 or "radius" not in fr:
         r, m, _p = cls[0] if len(cls) == 1 else (sc.material.radius_max, sc.material.mean_mass, 1)

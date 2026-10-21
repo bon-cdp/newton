@@ -71,6 +71,10 @@ class Material:
     # = every grain has `radius`.  Fractions are by MASS, as sieve curves are; they need not
     # sum to 1 (normalised).
     sizes: list | None = None
+    # Clumps (#10): a size row with "spheres": n > 1 is made of rigid clumps of n overlapping
+    # spheres (random shapes, clumps.py) with that row's volume and mass; `spheres` is the
+    # same for the single size (no rows).  1 = plain spheres.
+    spheres: int = 1
 
     def __post_init__(self):
         if self.bulk_density:
@@ -95,6 +99,27 @@ class Material:
         tot = sum(n)
         return [(x, mk, nk / tot) for x, mk, nk in zip(rad, m, n)]
 
+    def class_spheres(self) -> list[int]:
+        """Spheres per grain of each size class (1 = a sphere, n > 1 = a clump)."""
+        rows = [r for r in (self.sizes or []) if float(r.get("fraction", 0)) > 0]
+        if not rows:
+            return [max(1, int(self.spheres or 1))]
+        return [max(1, int(r.get("spheres", 1) or 1)) for r in rows]
+
+    def class_templates(self, seed: int = 0):
+        """Per size class: None (spheres) or its random clump shapes (clumps.templates)."""
+        from clumps import templates
+        return [None if n == 1 else templates(r, n, self.density, seed + 31 * k)
+                for k, ((r, _m, _p), n) in enumerate(zip(self.classes(), self.class_spheres()))]
+
+    def _particle_radii(self):
+        """Radii of the actual spheres simulated: each class's radius, or its clumps'
+        member spheres."""
+        out = []
+        for (r, _m, _p), t in zip(self.classes(), self.class_templates()):
+            out += [r] if t is None else [float(x) for tt in t for x in tt.radii]
+        return out
+
     @property
     def mean_mass(self) -> float:
         """Mean grain mass (kg): mass rate / mean_mass = grains per second."""
@@ -102,11 +127,17 @@ class Material:
 
     @property
     def radius_max(self) -> float:
-        return max(r for r, _m, _p in self.classes())
+        """Largest simulated sphere (a clump's member spheres, not the clump)."""
+        if all(n == 1 for n in self.class_spheres()):
+            return max(r for r, _m, _p in self.classes())
+        return max(self._particle_radii())
 
     @property
     def radius_min(self) -> float:
-        return min(r for r, _m, _p in self.classes())
+        """Smallest simulated sphere: it sets the timestep."""
+        if all(n == 1 for n in self.class_spheres()):
+            return min(r for r, _m, _p in self.classes())
+        return min(self._particle_radii())
 
 
 @dataclass
