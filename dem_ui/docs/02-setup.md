@@ -90,6 +90,22 @@ the project's *Cohesion_Coefficient* over unchanged.
   override it in the **cohesion** column of the Parts table (blank = the material's value),
   for example a sticky liner.
 
+**Consolidation strength** makes the material **harden under compaction**: the effect of
+fines, which cannot be simulated directly, on a cohesive bulk solid such as limestone. It
+is a simplified version of the Edinburgh elasto-plastic adhesion (EEPA) model. Each contact
+remembers the largest normal force it has carried, and as long as the two grains (or a grain
+and a wall) stay in contact they also hold together with *consolidation* × that force.
+
+- Loose, flowing material keeps its contacts light and brief, so it stays free-flowing.
+- Material packed under load, for example under a head of material in a spout or pressed
+  onto a liner, builds strong contacts. It can bridge, hang up and stick to the walls.
+- A contact that is pulled apart loses its strength; the material has to be compacted again
+  to regain it.
+- **0** (the default) is off and costs nothing. Typical values are 0.05–0.5; calibrate
+  against the site's hang-up, for example starting at 0.2 with a modest cohesion of 1–2.
+- **Wall consolidation** left blank is the same as grain–grain. A part can override it in
+  the **consol.** column of the Parts table, for example a liner that material builds up on.
+
 Calibrate the value against a repose or hold-up test. As a scale: above **1** a single
 grain hangs under a ceiling by cohesion alone; below 1 it falls (`test_cohesion.py`).
 Cohesion adds one extra pass per contact type when switched on.
@@ -105,6 +121,7 @@ One row per part:
 | 2-sided | Grains bounce off both faces (open sheets, chutes). One-sided parts collide on their outward face only. |
 | friction | Grain–wall sliding friction. |
 | cohesion | Grain–wall cohesion for this part (fraction of grain weight); blank = the material's wall cohesion. |
+| consol. | Grain–wall consolidation strength for this part (× the contact's largest force); blank = the material's wall consolidation. |
 | on / off (s) | Active window: the part exists only in this time span.  This is how BFA's staged deflectors are modelled — one part per position, each active for its window. Empty *off* = until the end. |
 | corners | Second contact in concave corners and creases (troughed belts, chute corners). Slightly slower; belts get it automatically. |
 | × | Remove the part from the scenario (the STL file stays). |

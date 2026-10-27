@@ -798,6 +798,14 @@ def wall_cohesion(m, part) -> float:
     return float(m.cohesion if m.wall_cohesion is None else m.wall_cohesion)
 
 
+def wall_consolidation(m, part) -> float:
+    """Grain-wall consolidation strength for one part: its own value, else the material's
+    wall_consolidation, else the grain-grain value."""
+    if part.consolidation is not None:
+        return float(part.consolidation)
+    return float(m.consolidation if m.wall_consolidation is None else m.wall_consolidation)
+
+
 def resolve_dt(sc: Scenario):
     """(dt, substeps, effective Young's modulus).  dt divides the frame interval."""
     m, s = sc.material, sc.solver
@@ -948,6 +956,10 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
             f"{', '.join(f'{x:g}' for x in wc)} x grain weight grain-wall")
         if s.bvh_walls and any(x > 0.0 for x in wc):
             log("  !! grain-wall cohesion needs the baked wall grid: ignored with bvh_walls")
+    if m.consolidation > 0.0 or any(wall_consolidation(m, p) > 0.0 for p in sc.parts):
+        wl = sorted({wall_consolidation(m, p) for p in sc.parts})
+        log(f"  consolidation         {m.consolidation:g} x max contact force grain-grain, "
+            f"{', '.join(f'{x:g}' for x in wl)} grain-wall (strength grows under compaction)")
     log(f"  dt                    {dt*1e6:.3f} us = {dt/t_r:.2f} Rayleigh time"
         f"   ({substeps} steps per frame)")
     log(f"  steps                 {int(round(sc.output.duration / dt)):,}")
@@ -1300,7 +1312,9 @@ def build(sc: Scenario, out_dir: str | None = None, quiet: bool = False):
                                hertz=hertz, youngs=youngs_eff, poisson=m.poisson, restitution=e,
                                calibrate_restitution=m.calibrate_restitution, cal_dt=dt,
                                cohesion=m.cohesion,
-                               wall_cohesion=[wall_cohesion(m, p) for p in sc.parts])
+                               wall_cohesion=[wall_cohesion(m, p) for p in sc.parts],
+                               consolidation=m.consolidation,
+                               wall_consolidation=[wall_consolidation(m, p) for p in sc.parts])
     if clump is not None:
         solver.set_clumps(clump["body"], clump["first"], clump["count"], clump["inv_mass"],
                           clump["inv_inertia"], clump["sub_offset"])

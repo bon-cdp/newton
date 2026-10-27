@@ -66,6 +66,12 @@ class Material:
     # 1 = a contact holds one grain's weight.  Calibrate against a repose test.
     cohesion: float = 0.0
     wall_cohesion: float | None = None    # grain-wall; None = same as cohesion
+    # Consolidation strength (simplified EEPA): each contact remembers the largest normal
+    # force it has carried and, while it lasts, also holds with consolidation x that force.
+    # Loose flow stays free; material compacted under load hardens, bridges and sticks --
+    # the effect of fines.  0 = off (no cost).  Typical 0.05-0.5.
+    consolidation: float = 0.0
+    wall_consolidation: float | None = None   # grain-wall; None = same as consolidation
 
     # Size distribution: [{"radius": m, "fraction": mass fraction}, ...].  None (or one row)
     # = every grain has `radius`.  Fractions are by MASS, as sieve curves are; they need not
@@ -155,6 +161,7 @@ class Part:
     motion: dict | None = None            # belt / rotating surface (dem_run.surface_motion), or
                                           # "moving": rigid steps (dem_run.motion_pose, #14)
     corners: bool = False                 # second contact in concave creases of this part (#13)
+    consolidation: float | None = None    # grain-wall consolidation strength; None = material
     cohesion: float | None = None         # grain-wall cohesion for this part (x grain weight);
                                           # None = the material's wall_cohesion
 

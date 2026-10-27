@@ -406,7 +406,8 @@ class SolverGranularDEM(SolverBase):
                  cal_v0: float = 2.4, wall_grid: WallGrid | None = None,
                  hash_dims: tuple[int, int, int] | None = None,
                  neighbor_every: int = 0, skin: float = 0.003, skin_max: float = 0.006,
-                 cohesion: float = 0.0, wall_cohesion=None):
+                 cohesion: float = 0.0, wall_cohesion=None, consolidation: float = 0.0,
+                 wall_consolidation=None):
         super().__init__(model=model)
         # baked candidate-triangle grid; None falls back to per-step BVH queries
         self.wall_grid = wall_grid
@@ -450,6 +451,24 @@ class SolverGranularDEM(SolverBase):
         self.g_star_w = ee / (2.0 * (1.0 + nu) * (2.0 - nu))
         r = max(min(float(restitution), 0.999), 1.0e-4)
         self.beta = abs(math.log(r)) / math.sqrt(math.log(r) ** 2 + math.pi ** 2)
+
+        # consolidation strength (Consolidation): grain-grain lam, and grain-wall lam per
+        # part; its contact table only exists when some lam is on
+        cs = Consolidation()
+        lw = [float(x) for x in (wall_consolidation or [0.0] * collider.mesh.shape[0])]
+        cs.on = int(float(consolidation) > 0.0 or any(x > 0.0 for x in lw))
+        cs.lam_pp = float(consolidation)
+        cs.lam_w = wp.array(lw, dtype=float, device=model.device)
+        ncs = TANGENTIAL_SLOTS if cs.on else 1
+        npc = model.particle_count if cs.on else 1
+        cs.partner = wp.full((ncs, npc), -1, dtype=int, device=model.device)
+        cs.stamp = wp.full((ncs, npc), -10, dtype=int, device=model.device)
+        cs.fmax = wp.zeros((ncs, npc), dtype=float, device=model.device)
+        cs.hertz = int(bool(hertz))
+        cs.e_pp, cs.e_w = float(self.e_star_pp), float(self.e_star_w)
+        cs.ke_pp = float(model.particle_ke)
+        self.cs = cs
+        self.no_pull = wp.zeros(collider.mesh.shape[0], dtype=float, device=model.device)
         self.beta_pp = self.beta
         self.beta_w = self.beta
         self.restitution = r
@@ -720,14 +739,15 @@ class SolverGranularDEM(SolverBase):
         # step (they are register-bound) and changed their rounding; here it costs nothing
         # when off.  The grid holds build-time positions on the neighbour-list path, so the
         # query radius carries the skin there.
-        if self.cohesion > 0.0:
+        if self.cohesion > 0.0 or self.cs.lam_pp > 0.0:
             wp.launch(
                 kernel=add_pair_cohesion,
                 dim=model.particle_count,
                 inputs=[model.particle_grid.id, state_in.particle_q, model.particle_radius,
                         model.particle_inv_mass, model.particle_flags, self.body,
                         model.particle_max_radius,
-                        self.skin_max if use_list else 0.0, self.cohesion * G_STD],
+                        self.skin_max if use_list else 0.0, self.cohesion * G_STD,
+                        self.cs, self.step_arr],
                 outputs=[state_in.particle_f],
                 device=model.device,
             )
@@ -784,6 +804,7 @@ class SolverGranularDEM(SolverBase):
                         dt, model.particle_grid.id,
                         int(self.wall_cohesion is not None),
                         self.wall_cohesion if self.wall_cohesion is not None else self.collider.thickness,
+                        self.cs,
                     ],
                     outputs=[state_in.particle_f, self.particle_t],
                     device=model.device,
@@ -812,13 +833,14 @@ class SolverGranularDEM(SolverBase):
 
         # grain-wall cohesion: a separate pass for the same reason as add_pair_cohesion (the
         # wall kernel sits at its register limit); baked wall grid only
-        if self.wall_cohesion is not None and self.wall_grid is not None:
+        if (self.wall_cohesion is not None or self.cs.on) and self.wall_grid is not None:
             wp.launch(
                 kernel=add_wall_cohesion,
                 dim=model.particle_count,
                 inputs=[state_in.particle_q, model.particle_radius, model.particle_inv_mass,
-                        model.particle_flags, self.collider, self.wall_grid, self.wall_cohesion,
-                        model.particle_grid.id],
+                        model.particle_flags, self.collider, self.wall_grid,
+                        self.wall_cohesion if self.wall_cohesion is not None else self.no_pull,
+                        model.particle_grid.id, self.cs, self.step_arr],
                 outputs=[state_in.particle_f],
                 device=model.device,
             )
@@ -1306,6 +1328,45 @@ def eval_particle_contact_rot(
     particle_t[i] = t
 
 
+@wp.struct
+class Consolidation:
+    """Consolidation strength (a simplified Edinburgh elasto-plastic adhesion, EEPA): each
+    contact remembers the largest elastic normal force it has carried, F_max, and while
+    it lasts the grains also hold together with lam * F_max.  Loose, flowing contacts
+    stay weak; contacts compacted under load (a packed spout, material pressed onto a
+    liner) gain strength -- the hardening and hang-up that fines give a bulk solid.  The
+    memory is a per-grain table like the tangential history (its own, so the two never
+    disturb each other); a contact that breaks forgets its strength."""
+
+    on: int
+    lam_pp: float
+    lam_w: wp.array(dtype=float)
+    """Per part."""
+    partner: wp.array2d(dtype=int)
+    stamp: wp.array2d(dtype=int)
+    fmax: wp.array2d(dtype=float)
+    hertz: int
+    e_pp: float
+    e_w: float
+    ke_pp: float
+
+
+@wp.func
+def _consolidated_pull(cs: Consolidation, i: int, key: int, step: int, f_el: float, lam: float):
+    """lam x the largest elastic force contact (i, key) has carried so far, this step's
+    included.  key: the partner grain, or -(part + 2) for a wall."""
+    slot = _history_slot(cs.partner, cs.stamp, i, key, step)
+    if slot < 0:
+        return lam * f_el                     # table full (rare): this step's force only
+    if cs.partner[slot, i] != key or cs.stamp[slot, i] < step - 1:
+        cs.partner[slot, i] = key             # a new contact starts with no strength
+        cs.fmax[slot, i] = 0.0
+    cs.stamp[slot, i] = step
+    fm = wp.max(cs.fmax[slot, i], f_el)
+    cs.fmax[slot, i] = fm
+    return lam * fm
+
+
 @wp.kernel
 def add_pair_cohesion(
     grid: wp.uint64,
@@ -1317,12 +1378,15 @@ def add_pair_cohesion(
     max_radius: float,
     skin: float,
     pull: float,
+    cs: Consolidation,
+    step_arr: wp.array(dtype=int),
     particle_f: wp.array(dtype=wp.vec3),
 ):
     """Grain-grain cohesion as a fraction of grain weight (BulkFlowAnalyst's convention):
     while two grains touch they also pull together with a constant force pull * m*, where
     pull = cohesion fraction x 9.81 m/s^2 and m* = 2 mi mj / (mi + mj) -- the grain's own
-    mass for equal grains.  ADDS to the contact forces; runs after them."""
+    mass for equal grains -- plus the consolidation strength lam * F_max (Consolidation).
+    ADDS to the contact forces; runs after them."""
     i = wp.hash_grid_point_id(grid, wp.tid())
     if i == -1:
         return
@@ -1347,7 +1411,15 @@ def add_pair_cohesion(
         d = wp.length(d_vec)
         if d < 1.0e-9 or d >= ri + rj:
             continue
-        f -= (d_vec / d) * (pull * 2.0 / (particle_inv_mass[i] + particle_inv_mass[j]))
+        fp = pull * 2.0 / (particle_inv_mass[i] + particle_inv_mass[j])
+        if cs.on == 1:
+            # the elastic part of the normal force, as the contact kernel computes it
+            delta = ri + rj - d
+            f_el = cs.ke_pp * delta
+            if cs.hertz == 1:
+                f_el = (4.0 / 3.0) * cs.e_pp * wp.sqrt(ri * rj / (ri + rj)) * delta * wp.sqrt(delta)
+            fp += _consolidated_pull(cs, i, j, step_arr[0], f_el, cs.lam_pp)
+        f -= (d_vec / d) * fp
     particle_f[i] = particle_f[i] + f
 
 
@@ -2217,6 +2289,7 @@ def eval_wall_grid_moving(
     grid: wp.uint64,
     use_pull: int,
     wall_pull: wp.array(dtype=float),
+    cs: Consolidation,
     particle_f: wp.array(dtype=wp.vec3),
     particle_t: wp.array(dtype=wp.vec3),
 ):
@@ -2275,6 +2348,11 @@ def eval_wall_grid_moving(
         if use_pull == 1:
             if wall_pull[m] > 0.0:
                 fw -= n * (wall_pull[m] / particle_inv_mass[i])
+        if cs.on == 1 and cs.lam_w[m] > 0.0:
+            f_el = collider.ke[m] * (-c)
+            if cs.hertz == 1:
+                f_el = (4.0 / 3.0) * cs.e_w * wp.sqrt(radius) * (-c) * wp.sqrt(-c)
+            fw -= n * _consolidated_pull(cs, i, -(m + 2), step_arr[0], f_el, cs.lam_w[m])
         particle_f[i] = particle_f[i] + fw
         particle_t[i] = particle_t[i] + tw
 
@@ -2289,10 +2367,13 @@ def add_wall_cohesion(
     g: WallGrid,
     wall_pull: wp.array(dtype=float),
     grid: wp.uint64,
+    cs: Consolidation,
+    step_arr: wp.array(dtype=int),
     particle_f: wp.array(dtype=wp.vec3),
 ):
     """Grain-wall cohesion as a fraction of grain weight: per part in contact, a constant
-    pull of wall_pull[part] * m toward the wall (wall_pull = fraction x 9.81 m/s^2).  Same search and signed distance as
+    pull of wall_pull[part] * m toward the wall (wall_pull = fraction x 9.81 m/s^2), plus
+    the consolidation strength cs.lam_w[part] * F_max.  Same search and signed distance as
     eval_wall_grid_rot (closest triangle of each part, from the grain's cell list); ADDS to
     the contact forces."""
     i = wp.hash_grid_point_id(grid, wp.tid())
@@ -2322,7 +2403,7 @@ def add_wall_cohesion(
             r = g.rec[t]
             p = r.part
         if p != cur:
-            if best_t >= 0 and wall_pull[cur] > 0.0:
+            if best_t >= 0 and (wall_pull[cur] > 0.0 or (cs.on == 1 and cs.lam_w[cur] > 0.0)):
                 br = g.rec[best_t]
                 _sq, cp = _tri_closest(br.v0, br.u, br.w, br.n, br.t2, x)
                 face_n = br.n
@@ -2332,7 +2413,13 @@ def add_wall_cohesion(
                                     wp.sqrt(best_sq), face_n)
                 c = sdf - radius
                 if c < 0.0 and c >= -radius:
-                    f -= n * (wall_pull[cur] / particle_inv_mass[i])
+                    fp = wall_pull[cur] / particle_inv_mass[i]
+                    if cs.on == 1 and cs.lam_w[cur] > 0.0:
+                        f_el = collider.ke[cur] * (-c)
+                        if cs.hertz == 1:
+                            f_el = (4.0 / 3.0) * cs.e_w * wp.sqrt(radius) * (-c) * wp.sqrt(-c)
+                        fp += _consolidated_pull(cs, i, -(cur + 2), step_arr[0], f_el, cs.lam_w[cur])
+                    f -= n * fp
             cur = p
             seg0 = s
             best_t = -1

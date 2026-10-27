@@ -136,6 +136,8 @@ const MATERIAL_FIELDS = [
   ["contact", "select:hertz,linear", "contact law"], ["tangential_ratio", "number", "Mindlin kt/kn"],
   ["cohesion", "number", "grain-grain cohesion (× grain weight)"],
   ["wall_cohesion", "number?", "wall cohesion (× grain weight, blank = same)"],
+  ["consolidation", "number", "consolidation strength (× max contact force)"],
+  ["wall_consolidation", "number?", "wall consolidation (blank = same)"],
 ];
 
 // Size distribution: rows of radius (m) and MASS fraction (%, as a sieve curve; need not
@@ -249,7 +251,7 @@ function renderSetup() {
       if (inp.type === "number") inp.step = "any";
     }
     if (type === "readonly") { inp.type = "text"; inp.readOnly = true; inp.id = "mat-" + k; inp.tabIndex = -1; }
-    inp.value = num(sc.material[k]) ?? (k === "cohesion" ? 0 : "");
+    inp.value = num(sc.material[k]) ?? (k === "cohesion" || k === "consolidation" ? 0 : "");
     inp.onchange = () => {
       sc.material[k] = type === "number?" ? (inp.value === "" ? null : +inp.value)
         : type === "number" ? +inp.value : inp.value;
@@ -273,17 +275,19 @@ function renderSetup() {
       <td><input type="checkbox" ${p.two_sided ? "checked" : ""}></td>
       <td><input type="number" step="any" value="${p.friction}"></td>
       <td><input type="number" step="any" value="${p.cohesion ?? ""}" placeholder="material" title="grain-wall cohesion for this part (fraction of grain weight); blank = the material's wall cohesion"></td>
+      <td><input type="number" step="any" value="${p.consolidation ?? ""}" placeholder="material" title="grain-wall consolidation strength for this part (x max contact force); blank = the material's wall consolidation"></td>
       <td><input type="number" step="any" value="${p.active[0]}"></td>
       <td><input type="number" step="any" value="${p.active[1] >= INF ? "" : p.active[1]}" placeholder="end"></td>
       <td><input type="checkbox" ${p.corners ? "checked" : ""}></td>
       <td><button class="small" title="remove part">×</button></td>`;
-    const [show, two, fric, coh, on, off, corn] = tr.querySelectorAll("input");
+    const [show, two, fric, coh, con, on, off, corn] = tr.querySelectorAll("input");
     const type = tr.querySelector("select"), del = tr.querySelector("button");
     type.value = kind;
     show.onchange = () => viewer.setPartVisible(p.name, show.checked);
     two.onchange = () => p.two_sided = two.checked;
     fric.onchange = () => p.friction = +fric.value;
     coh.onchange = () => { if (coh.value === "") delete p.cohesion; else p.cohesion = +coh.value; };
+    con.onchange = () => { if (con.value === "") delete p.consolidation; else p.consolidation = +con.value; };
     on.onchange = () => p.active[0] = +on.value;
     off.onchange = () => p.active[1] = off.value === "" ? INF : +off.value;
     corn.onchange = () => p.corners = corn.checked;
@@ -525,7 +529,7 @@ function orientPicked(dir, prev) {
 
 function motionRow(p) {
   const tr = document.createElement("tr"); tr.className = "motion-row";
-  const td = document.createElement("td"); td.colSpan = 9; tr.appendChild(td);
+  const td = document.createElement("td"); td.colSpan = 11; tr.appendChild(td);
   const m = p.motion;
   const dirText = v => { const n = Math.hypot(...v) || 1; return v.map(c => (c / n).toFixed(2)).join(", "); };
   if (m.type === "moving") { movingRows(p, td); return tr; }
