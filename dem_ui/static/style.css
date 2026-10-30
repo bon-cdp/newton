@@ -75,3 +75,12 @@ pre { font-size: 11px; background: #f7f8fa; padding: 8px; border-radius: 6px; ma
 #parts-table select { max-width: 6.2em; }
 .motion-row input[type=number] { width: 5em; }
 .tbl select { font: inherit; font-size: 12px; padding: 1px 2px; }
+
+/* camera box (viewer.js makeCameraPanel), top-left of the 3D view */
+.cam-panel { position: absolute; left: 12px; top: 12px; background: rgba(255,255,255,.92); border: 1px solid var(--line); border-radius: 6px; font-size: 11px; color: var(--ink); z-index: 2; }
+.cam-panel .cam-head { padding: 4px 8px; cursor: pointer; font-weight: 600; color: var(--muted); user-select: none; }
+.cam-panel .cam-body { padding: 0 8px 6px; }
+.cam-panel .cam-row { display: flex; gap: 4px; align-items: center; margin-top: 3px; }
+.cam-panel .cam-row span { color: var(--muted); min-width: 52px; }
+.cam-panel input { width: 62px; font: inherit; padding: 1px 3px; border: 1px solid var(--line); border-radius: 3px; }
+.cam-panel .cam-btns button { font: inherit; padding: 1px 6px; }

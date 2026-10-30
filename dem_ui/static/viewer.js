@@ -77,8 +77,115 @@ export class Viewer {
     this.grainRadius = 0.006;
     new ResizeObserver(() => this.resize()).observe(el);
     this.resize();
-    const loop = () => { this.controls.update(); this.renderer.render(this.scene, this.camera); requestAnimationFrame(loop); };
+    this.makeCameraPanel();
+    const loop = () => {
+      this.controls.update(); this.renderer.render(this.scene, this.camera);
+      this.refreshCameraPanel();
+      requestAnimationFrame(loop);
+    };
     loop();
+  }
+
+  // ---- camera box: see and set the view (angles, distance, FOV, target, position) -----
+  // Angles are about the target in the "up" frame (up = against gravity): azimuth from
+  // the horizontal axis e1 (x, or y for X-up) towards e2 = e1 x up, elevation above the
+  // horizontal.  Distance is the zoom (camera to target).
+  viewFrame() {
+    const up = this.up.clone();
+    const a = Math.abs(up.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const e1 = a.sub(up.clone().multiplyScalar(a.dot(up))).normalize();
+    const e2 = new THREE.Vector3().crossVectors(e1, up);
+    return { e1, e2, up };
+  }
+
+  getView() {
+    const t = this.controls.target, p = this.camera.position;
+    const off = p.clone().sub(t), dist = off.length() || 1e-9;
+    const { e1, e2, up } = this.viewFrame();
+    return {
+      azimuth: THREE.MathUtils.radToDeg(Math.atan2(off.dot(e2), off.dot(e1))),
+      elevation: THREE.MathUtils.radToDeg(Math.asin(Math.max(-1, Math.min(1, off.dot(up) / dist)))),
+      distance: dist, fov: this.camera.fov, target: t.toArray(), position: p.toArray(),
+    };
+  }
+
+  // any subset of {azimuth, elevation, distance, fov, target, position}; position wins over
+  // angles + distance when both are given
+  setView(v) {
+    const cur = this.getView();
+    if (v.target) this.controls.target.set(...v.target);
+    if (v.fov) { this.camera.fov = Math.min(Math.max(+v.fov, 5), 120); this.camera.updateProjectionMatrix(); }
+    if (v.position) {
+      this.camera.position.set(...v.position);
+    } else {
+      const az = THREE.MathUtils.degToRad(v.azimuth ?? cur.azimuth);
+      const el = THREE.MathUtils.degToRad(Math.min(Math.max(v.elevation ?? cur.elevation, -89.9), 89.9));
+      const d = Math.max(+(v.distance ?? cur.distance), 1e-6);
+      const { e1, e2, up } = this.viewFrame();
+      const off = e1.multiplyScalar(Math.cos(el) * Math.cos(az)).add(e2.multiplyScalar(Math.cos(el) * Math.sin(az)))
+        .add(up.multiplyScalar(Math.sin(el))).multiplyScalar(d);
+      this.camera.position.copy(this.controls.target).add(off);
+    }
+    const d = this.camera.position.distanceTo(this.controls.target);
+    if (this.camera.far < 3 * d) { this.camera.far = 20 * d; this.camera.near = d / 1000; this.camera.updateProjectionMatrix(); }
+    this.controls.update();
+    this._camSig = null;
+  }
+
+  makeCameraPanel() {
+    const box = document.createElement("div");
+    box.className = "cam-panel";
+    const num = (k, step = "any") => `<input type="number" step="${step}" data-k="${k}">`;
+    box.innerHTML = `<div class="cam-head" title="show / hide">camera ▾</div>
+      <div class="cam-body">
+        <div class="cam-row"><span>azimuth °</span>${num("azimuth")}<span>elevation °</span>${num("elevation")}</div>
+        <div class="cam-row"><span>distance m</span>${num("distance")}<span>FOV °</span>${num("fov")}</div>
+        <div class="cam-row"><span>target</span>${num("t0")}${num("t1")}${num("t2")}</div>
+        <div class="cam-row"><span>position</span>${num("p0")}${num("p1")}${num("p2")}</div>
+        <div class="cam-row cam-btns"><button data-v="top">top</button><button data-v="front">front</button>
+          <button data-v="side">side</button><button data-v="fit">fit</button></div>
+      </div>`;
+    this.el.appendChild(box);
+    this.camPanel = box;
+    const head = box.querySelector(".cam-head"), body = box.querySelector(".cam-body");
+    let open = true;
+    try { open = localStorage.getItem("demCamPanel") !== "closed"; } catch (_) { /* no storage */ }
+    const show = () => { body.hidden = !open; head.textContent = open ? "camera ▾" : "camera ▸"; };
+    show();
+    head.onclick = () => { open = !open; show(); try { localStorage.setItem("demCamPanel", open ? "open" : "closed"); } catch (_) { /* ignore */ } };
+    this.camInputs = Object.fromEntries([...box.querySelectorAll("input")].map(i => [i.dataset.k, i]));
+    const val = k => +this.camInputs[k].value;
+    for (const [k, inp] of Object.entries(this.camInputs)) {
+      inp.onchange = () => {
+        if (!isFinite(+inp.value) || inp.value === "") { this._camSig = null; return; }
+        if (k === "azimuth" || k === "elevation" || k === "distance") this.setView({ [k]: val(k) });
+        else if (k === "fov") this.setView({ fov: val("fov") });
+        else if (k[0] === "t") this.setView({ target: [val("t0"), val("t1"), val("t2")], position: this.camera.position.toArray() });
+        else this.setView({ position: [val("p0"), val("p1"), val("p2")] });
+      };
+      inp.onkeydown = e => { if (e.key === "Enter") inp.blur(); };
+    }
+    box.querySelectorAll("button").forEach(b => b.onclick = () => {
+      const v = b.dataset.v;
+      if (v === "fit") { if (this.lastBox) this.fit(this.lastBox); this._camSig = null; return; }
+      if (v === "top") this.setView({ elevation: 89.9, azimuth: -90 });
+      if (v === "front") this.setView({ elevation: 0, azimuth: 90 });
+      if (v === "side") this.setView({ elevation: 0, azimuth: 0 });
+    });
+  }
+
+  refreshCameraPanel() {
+    if (!this.camPanel || this.camPanel.querySelector(".cam-body").hidden) return;
+    const v = this.getView();
+    const sig = [...v.target, ...v.position, v.fov].map(x => x.toFixed(4)).join();
+    if (sig === this._camSig) return;
+    this._camSig = sig;
+    const fmt = x => +(+x).toPrecision(5);
+    const vals = { azimuth: v.azimuth.toFixed(1), elevation: v.elevation.toFixed(1), distance: fmt(v.distance),
+                   fov: v.fov.toFixed(0), t0: fmt(v.target[0]), t1: fmt(v.target[1]), t2: fmt(v.target[2]),
+                   p0: fmt(v.position[0]), p1: fmt(v.position[1]), p2: fmt(v.position[2]) };
+    for (const [k, inp] of Object.entries(this.camInputs))
+      if (document.activeElement !== inp) inp.value = vals[k];       // never under the cursor
   }
 
   resize() {

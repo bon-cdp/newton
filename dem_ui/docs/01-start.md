@@ -75,6 +75,16 @@ behind something that authenticates users.
 - **Runs** (left): every run, newest first, with its status (running, done, stopped,
   failed) and how far it got.  Click one to open it in Run (if running) or Results.
 - **Tabs** (top): [Setup](02-setup.md), [Run](03-run.md), [Results](04-results.md).
+- **Camera** box (top-left of the 3D view; click its title to fold it away): shows the view
+  as you move it, and takes typed values.
+  - **azimuth** and **elevation** (degrees) are the view angle around the target, measured
+    against "up", which follows gravity.
+  - **distance** (m) is the zoom: how far the camera is from the target. **FOV** is the
+    lens angle.
+  - **target** is the point looked at, and **position** is where the camera stands (the
+    point of view).
+  - The buttons give a **top**, **front** or **side** view, and **fit** frames the whole
+    geometry.
 
 Links can point straight at a view, e.g. to send to a colleague on the same machine:
 
