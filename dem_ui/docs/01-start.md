@@ -4,8 +4,8 @@
 
 - An NVIDIA GPU with a recent driver (developed on a Quadro P5000, 16 GB).  The browser
   only needs WebGL; it can be any machine that reaches the server.
-- The repository's Python environment, `.venv/`, with Warp and Newton installed (see the
-  repository README).
+- The repository's Python environment, `.venv/`, with Warp and Newton installed (see
+  section 1 of [`HANDOVER.md`](../../HANDOVER.md)).
 
 ## Install (once)
 
