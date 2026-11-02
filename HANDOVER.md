@@ -241,7 +241,8 @@ GitHub issues on `bon-cdp/newton`:
 Known gaps and ideas, roughly in order of value:
 
 - **Consolidation strength** (`dae5d0a1`) was added to reproduce limestone-with-fines
-  hang-up in project 22096-CM-400; it was not yet calibrated against the site observation.
+  hang-up of limestone with fines in a spout; it was not yet calibrated against the site
+  observation (the project folder and notes are with the EMS team, not in git).
 - **Clump end-to-end check** (see #10 above).
 - **Loads on moving parts** in `dem_analyze.py` (needs the part pose per frame).
 - **Mixture inlet efficiency:** placing sizes jointly (pre-packed mixed slabs) would recover
