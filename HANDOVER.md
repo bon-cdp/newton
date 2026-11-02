@@ -59,8 +59,8 @@ git pull                         # on main
 ```
 
 Until late October 2026 new work lived on a branch (`ui-units-cohesion`) that had to be
-pulled specially. That branch has been merged into `main`; nothing needs a special
-branch any more.
+pulled specially. It was merged into `main` with pull request #17 (November 2026);
+nothing needs a special branch any more.
 
 Other branches still on GitHub, **not** merged, kept for reference:
 
