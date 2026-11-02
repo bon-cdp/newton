@@ -174,7 +174,8 @@ def import_project(project: str, preset: str = "reference"):
 
 DEFAULT_SCENARIO = {
     "name": "", "units": "m", "gravity": [0.0, -9.81, 0.0],
-    "material": {"name": "material", "radius": 0.006, "density": 1000.0, "youngs": 1.0e8,
+    "material": {"name": "material", "radius": 0.006, "density": 975.0,
+                 "bulk_density": 650.0, "packing_ratio": 1.5, "youngs": 1.0e8,
                  "poisson": 0.3, "restitution": 0.2, "friction": 0.3, "rolling_friction": 0.3,
                  "wall_rolling_friction": 0.3, "tangential_ratio": 1.0, "contact": "hertz"},
     "parts": [], "injectors": [], "domain": {"lo": [-1.0, -1.0, -1.0], "hi": [1.0, 1.0, 1.0]},
@@ -262,6 +263,10 @@ async def upload(request: __import__("fastapi").Request):
             inj = (sc.get("injectors") or [None])[0] or {
                 "name": stem, "face_stl": fname, "mass_rate": 10.0, "velocity": [0.0, -1.0, 0.0]}
             inj["face_stl"] = fname
+            inj.pop("box", None)
+            if not inj.get("extrude"):
+                # grains need room to spawn: start with the face extruded 5 grain diameters
+                inj["extrude"] = round(10.0 * float(sc.get("material", {}).get("radius", 0.006)), 4)
             sc["injectors"] = [inj]
         else:
             names = {p["name"] for p in sc["parts"]}
@@ -386,6 +391,21 @@ def _geometry(sc: Scenario):
             elif i.face_stl and os.path.exists(sc.path(i.face_stl)):
                 tris, area = dem_run.face_triangles(sc.path(i.face_stl), sc.unit_scale)
                 entry.update(triangles=_b64(tris.reshape(-1), np.float32), area=area)
+                # inlet capacity, as for boxes: the inlet's cross-section seen along the
+                # injection velocity (the swept volume when extruded, else the bare face)
+                vol = (np.concatenate(dem_run.face_volume_triangles(
+                           tris, i.extrude, i.extrude_flip, i.extrude_offset))
+                       if i.extrude > 0.0 else tris)
+                entry.update(cross_section=dem_run.inlet_cross_section(vol, i.velocity),
+                             speed=float(np.linalg.norm(i.velocity)))
+                if i.extrude > 0.0:
+                    # the injection volume: the face swept along its (flippable) normal
+                    base, top = dem_run.face_volume_triangles(tris, i.extrude, i.extrude_flip,
+                                                              i.extrude_offset)
+                    p0, _e1, _e2, n = dem_run.face_frame(tris, i.extrude_flip)
+                    entry.update(top_triangles=_b64(top.reshape(-1), np.float32),
+                                 base_triangles=_b64(base.reshape(-1), np.float32),
+                                 normal=n.tolist(), centre=p0.tolist(), depth=i.extrude)
         except (ValueError, KeyError, IndexError) as e:
             entry["error"] = str(e)                # shown in the UI, e.g. no belt under the box
         inj.append(entry)
@@ -517,7 +537,8 @@ def _run_base_dir(meta: dict, d: str) -> str:
 
 @app.get("/api/runs/{run_id}/frame/{k}")
 def frame(run_id: str, k: int):
-    """Binary: uint32 n, then n*3 float32 positions, then n float32 speeds."""
+    """Binary: uint32 n, then n*3 float32 positions, n float32 speeds and, when the frame
+    has them, n float32 radii (a size distribution)."""
     d = _run_dir(run_id)
     f = os.path.join(d, f"frame_{k:04d}_particles.vtk")
     if not os.path.exists(f):
@@ -526,6 +547,8 @@ def frame(run_id: str, k: int):
     pos = fr["pos"].astype(np.float32)
     spd = np.linalg.norm(fr["vel"], axis=1).astype(np.float32)
     body = np.array([len(pos)], dtype=np.uint32).tobytes() + pos.tobytes() + spd.tobytes()
+    if "radius" in fr:
+        body += fr["radius"].astype(np.float32).tobytes()
     return Response(body, media_type="application/octet-stream")
 
 

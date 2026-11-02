@@ -280,7 +280,8 @@ def write_geometry_vtk(path, parts):
         fh.writelines(f"{p}\n" for p in part_id)
 
 
-def write_particles_vtk(path, frame, pos, vel, radius, binary=True, spin=None, ids=None):
+def write_particles_vtk(path, frame, pos, vel, radius, binary=True, spin=None, ids=None,
+                        mass=None, body=None):
     """Legacy-VTK point cloud (positions, radius, speed, velocity[, spin]) for ParaView.
 
     `spin` (angular velocity, rad/s) is what post-processing needs beyond position and
@@ -305,7 +306,7 @@ def write_particles_vtk(path, frame, pos, vel, radius, binary=True, spin=None, i
             f.writelines("1\n" for _ in range(n))
             f.write(f"\nPOINT_DATA {n}\n")
             f.write("SCALARS radius float 1\nLOOKUP_TABLE default\n")
-            f.writelines(f"{radius}\n" for _ in range(n))
+            f.writelines(f"{r}\n" for r in np.broadcast_to(np.asarray(radius, dtype=np.float32), (n,)))
             f.write("\nSCALARS speed float 1\nLOOKUP_TABLE default\n")
             f.writelines(f"{s}\n" for s in speed)
             f.write("\nVECTORS velocity float\n")
@@ -337,6 +338,14 @@ def write_particles_vtk(path, frame, pos, vel, radius, binary=True, spin=None, i
             # pool index: lets post-processing follow a grain between frames (exact up to 2^24)
             f.write(b"\nSCALARS id float 1\nLOOKUP_TABLE default\n")
             f.write(np.asarray(ids, dtype=np.float32).astype(be_f).tobytes())
+        if mass is not None:
+            # clumps (#10): each member sphere's share of its clump's mass (kg)
+            f.write(b"\nSCALARS mass float 1\nLOOKUP_TABLE default\n")
+            f.write(np.asarray(mass, dtype=np.float32).astype(be_f).tobytes())
+        if body is not None:
+            # clumps: the body each sphere belongs to (-1 = a plain sphere)
+            f.write(b"\nSCALARS body float 1\nLOOKUP_TABLE default\n")
+            f.write(np.asarray(body, dtype=np.float32).astype(be_f).tobytes())
         f.write(b"\n")
 
 

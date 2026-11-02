@@ -51,6 +51,8 @@ import newton
 from newton._src.solvers.semi_implicit.kernels_contact import eval_particle_contact
 from newton._src.solvers.solver import SolverBase
 
+G_STD = 9.81      # m/s^2: cohesion fractions are of a grain's weight under standard gravity
+
 # Forward kernels only.  Nothing here is differentiated, and the adjoint of the wall kernel
 # needs a parameter block over CUDA's 4 KB limit (it failed to compile once the collider
 # gained per-part active flags).  Also roughly halves compile time.
@@ -92,7 +94,9 @@ class ShellCollider:
     active: wp.array(dtype=int)
     """1 = part takes part in contact, 0 = switched off (scenario time windows)."""
     motion_type: wp.array(dtype=int)
-    """Surface motion on stationary geometry (issue #11): 0 static, 1 belt, 2 rotating."""
+    """Surface motion on stationary geometry (issue #11): 0 static, 1 belt, 2 rotating;
+    3 = the part itself moves rigidly (motion manager, #14): its current wall velocity is
+    motion_vel + motion_axis x (cp - motion_point), refreshed every step by set_part_poses."""
     motion_axis: wp.array(dtype=wp.vec3)
     """Belt: its width axis a (belt velocity = speed * normalize(a x n)).  Rotating: the
     unit rotation axis."""
@@ -100,6 +104,9 @@ class ShellCollider:
     """Rotating: a point on the axis."""
     motion_rate: wp.array(dtype=float)
     """Belt: speed (m/s).  Rotating: angular speed (rad/s)."""
+    motion_vel: wp.array(dtype=wp.vec3)
+    """Moving part (type 3): velocity of motion_point (m/s); motion_axis is then the
+    angular velocity vector (rad/s)."""
     corners: wp.array(dtype=int)
     """1 = resolve concave creases within this part with a second contact (issue #13;
     eval_wall_corners_rot).  Off by default: it costs ~5-10% of wall-contact time."""
@@ -398,16 +405,29 @@ class SolverGranularDEM(SolverBase):
                  calibrate_restitution: bool = False, cal_dt: float = 2.4316429e-5,
                  cal_v0: float = 2.4, wall_grid: WallGrid | None = None,
                  hash_dims: tuple[int, int, int] | None = None,
-                 neighbor_every: int = 0, skin: float = 0.003, skin_max: float = 0.006):
+                 neighbor_every: int = 0, skin: float = 0.003, skin_max: float = 0.006,
+                 cohesion: float = 0.0, wall_cohesion=None, consolidation: float = 0.0,
+                 wall_consolidation=None):
         super().__init__(model=model)
         # baked candidate-triangle grid; None falls back to per-step BVH queries
         self.wall_grid = wall_grid
+        self.moving_grids = []        # moving parts (#14): see set_moving
+        # clump body of each particle (-1 = a plain sphere) and the bodies: see set_clumps
+        self.body = wp.full(model.particle_count, -1, dtype=int, device=model.device)
+        self.clumps = None
         self.wall_cache = wall_cache
         self.rotation = rotation
         self.mu_roll = float(mu_roll)
         self.mu_roll_wall = float(mu_roll_wall)
         self.rot_damp = float(rot_damp)
         self.rot_damp_wall = float(rot_damp_wall)
+        # cohesion as fractions of grain weight (BFA): grain-grain, and grain-wall per part,
+        # held as pulls in N/kg (fraction x standard gravity, whatever the scenario's gravity).
+        # Both are applied by separate passes, launched only when non-zero.
+        self.cohesion = float(cohesion)
+        wc = [float(x) * G_STD for x in (wall_cohesion or [])]
+        self.wall_cohesion = (wp.array(wc, dtype=float, device=model.device)
+                              if any(x > 0.0 for x in wc) else None)
         # k_t as a fraction of k_n.  2/7 is the Hertz-Mindlin equal-partition value and
         # the usual default in DEM codes; 0 disables the spring and restores the
         # viscous-Coulomb law, which is the A/B control.
@@ -431,6 +451,24 @@ class SolverGranularDEM(SolverBase):
         self.g_star_w = ee / (2.0 * (1.0 + nu) * (2.0 - nu))
         r = max(min(float(restitution), 0.999), 1.0e-4)
         self.beta = abs(math.log(r)) / math.sqrt(math.log(r) ** 2 + math.pi ** 2)
+
+        # consolidation strength (Consolidation): grain-grain lam, and grain-wall lam per
+        # part; its contact table only exists when some lam is on
+        cs = Consolidation()
+        lw = [float(x) for x in (wall_consolidation or [0.0] * collider.mesh.shape[0])]
+        cs.on = int(float(consolidation) > 0.0 or any(x > 0.0 for x in lw))
+        cs.lam_pp = float(consolidation)
+        cs.lam_w = wp.array(lw, dtype=float, device=model.device)
+        ncs = TANGENTIAL_SLOTS if cs.on else 1
+        npc = model.particle_count if cs.on else 1
+        cs.partner = wp.full((ncs, npc), -1, dtype=int, device=model.device)
+        cs.stamp = wp.full((ncs, npc), -10, dtype=int, device=model.device)
+        cs.fmax = wp.zeros((ncs, npc), dtype=float, device=model.device)
+        cs.hertz = int(bool(hertz))
+        cs.e_pp, cs.e_w = float(self.e_star_pp), float(self.e_star_w)
+        cs.ke_pp = float(model.particle_ke)
+        self.cs = cs
+        self.no_pull = wp.zeros(collider.mesh.shape[0], dtype=float, device=model.device)
         self.beta_pp = self.beta
         self.beta_w = self.beta
         self.restitution = r
@@ -549,6 +587,35 @@ class SolverGranularDEM(SolverBase):
         """Device step counter, read back (syncs -- not for the hot loop)."""
         return int(self.step_arr.numpy()[0])
 
+    def set_clumps(self, body, first, count, inv_mass, inv_inertia, sub_offset):
+        """Multi-sphere clumps (#10): particle -> body (-1 = sphere), and per body its first
+        member, member count, inverse mass and principal inverse inertia; sub_offset is
+        each member's centre in its body's principal frame.  Members are ordinary
+        particles that skip each other in contact; integrate_clump_bodies moves them as
+        one rigid body.  A body is born when its first member is spawned (spawn_clumps)."""
+        d = self.model.device
+        nb = len(first)
+        self.body.assign(np.asarray(body, dtype=np.int32))
+        self.clumps = dict(
+            n=nb,
+            first=wp.array(np.asarray(first, dtype=np.int32), dtype=int, device=d),
+            count=wp.array(np.asarray(count, dtype=np.int32), dtype=int, device=d),
+            inv_mass=wp.array(np.asarray(inv_mass, dtype=np.float32), dtype=float, device=d),
+            inv_inertia=wp.array(np.asarray(inv_inertia, dtype=np.float32), dtype=wp.vec3, device=d),
+            sub_offset=wp.array(np.asarray(sub_offset, dtype=np.float32), dtype=wp.vec3, device=d),
+            x=wp.zeros(nb, dtype=wp.vec3, device=d), v=wp.zeros(nb, dtype=wp.vec3, device=d),
+            q=wp.array(np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (nb, 1)), dtype=wp.quat, device=d),
+            L=wp.zeros(nb, dtype=wp.vec3, device=d),
+            state=wp.zeros(nb, dtype=int, device=d))
+        self.clump_F = wp.zeros(nb, dtype=wp.vec3, device=d)
+        self.clump_T = wp.zeros(nb, dtype=wp.vec3, device=d)
+
+    def set_moving(self, grids, pose_R, pose_T):
+        """Moving parts (#14): one grid per part in its own frame (build_wall_grid with
+        part_ids), and the device pose arrays set_part_poses fills each step."""
+        self.moving_grids = list(grids)
+        self.pose_R, self.pose_T = pose_R, pose_T
+
     def set_part_active(self, flags):
         """Switch collider parts on/off (1/0 per part).  Takes effect on the next step;
         values live on the device, so captured graphs see them.  Turning a part ON clears
@@ -585,7 +652,7 @@ class SolverGranularDEM(SolverBase):
                                           2.0 * float(model.particle_max_radius) + self.skin_max)
                 wp.launch(build_neighbor_list, dim=model.particle_count, inputs=[
                     model.particle_grid.id, state_in.particle_q, model.particle_radius,
-                    model.particle_flags, model.particle_max_radius, self.skin_arr,
+                    model.particle_flags, self.body, model.particle_max_radius, self.skin_arr,
                     self.nbr, self.nbr_count, self.x_build, self.nbr_overflow],
                     device=model.device)
                 if self.wall_grid is not None:
@@ -637,7 +704,7 @@ class SolverGranularDEM(SolverBase):
                 inputs=[
                     model.particle_grid.id, self.nbr, self.nbr_count,
                     state_in.particle_q, state_in.particle_qd,
-                    self.particle_w, model.particle_radius, model.particle_flags,
+                    self.particle_w, model.particle_radius, model.particle_flags, self.body,
                     model.particle_inv_mass,
                     model.particle_ke, model.particle_kd, model.particle_kf,
                     model.particle_mu, self.mu_roll, self.rot_damp,
@@ -655,7 +722,7 @@ class SolverGranularDEM(SolverBase):
                 dim=model.particle_count,
                 inputs=[
                     model.particle_grid.id, state_in.particle_q, state_in.particle_qd,
-                    self.particle_w, model.particle_radius, model.particle_flags,
+                    self.particle_w, model.particle_radius, model.particle_flags, self.body,
                     model.particle_inv_mass,
                     model.particle_ke, model.particle_kd, model.particle_kf,
                     model.particle_mu, self.mu_roll, self.rot_damp, model.particle_max_radius,
@@ -664,6 +731,24 @@ class SolverGranularDEM(SolverBase):
                     self.tang_partner, self.tang_stamp, self.tang_xi,
                 ],
                 outputs=[state_in.particle_f, self.particle_t],
+                device=model.device,
+            )
+
+        # grain-grain cohesion: a separate pass, launched only when cohesion is on.  In the
+        # contact kernels above even branch-free cohesion arithmetic cost ~12% of the whole
+        # step (they are register-bound) and changed their rounding; here it costs nothing
+        # when off.  The grid holds build-time positions on the neighbour-list path, so the
+        # query radius carries the skin there.
+        if self.cohesion > 0.0 or self.cs.lam_pp > 0.0:
+            wp.launch(
+                kernel=add_pair_cohesion,
+                dim=model.particle_count,
+                inputs=[model.particle_grid.id, state_in.particle_q, model.particle_radius,
+                        model.particle_inv_mass, model.particle_flags, self.body,
+                        model.particle_max_radius,
+                        self.skin_max if use_list else 0.0, self.cohesion * G_STD,
+                        self.cs, self.step_arr],
+                outputs=[state_in.particle_f],
                 device=model.device,
             )
 
@@ -705,6 +790,25 @@ class SolverGranularDEM(SolverBase):
                     outputs=[state_in.particle_f, self.particle_t],
                     device=model.device,
                 )
+            for k, mg in enumerate(self.moving_grids):
+                wp.launch(
+                    kernel=eval_wall_grid_moving,
+                    dim=model.particle_count,
+                    inputs=[
+                        state_in.particle_q, state_in.particle_qd, self.particle_w,
+                        model.particle_radius, model.particle_inv_mass, model.particle_flags,
+                        self.collider, mg, self.pose_R, self.pose_T, k,
+                        self.mu_roll_wall, self.rot_damp_wall, self.k_t,
+                        int(self.hertz), self.e_star_w, self.g_star_w, self.beta_w, self.step_arr,
+                        self.tang_partner, self.tang_stamp, self.tang_xi,
+                        dt, model.particle_grid.id,
+                        int(self.wall_cohesion is not None),
+                        self.wall_cohesion if self.wall_cohesion is not None else self.collider.thickness,
+                        self.cs,
+                    ],
+                    outputs=[state_in.particle_f, self.particle_t],
+                    device=model.device,
+                )
         else:
             self.contact_count.zero_()
             if not self.wall_cache:
@@ -727,6 +831,29 @@ class SolverGranularDEM(SolverBase):
                 device=model.device,
             )
 
+        # grain-wall cohesion: a separate pass for the same reason as add_pair_cohesion (the
+        # wall kernel sits at its register limit); baked wall grid only
+        if (self.wall_cohesion is not None or self.cs.on) and self.wall_grid is not None:
+            wp.launch(
+                kernel=add_wall_cohesion,
+                dim=model.particle_count,
+                inputs=[state_in.particle_q, model.particle_radius, model.particle_inv_mass,
+                        model.particle_flags, self.collider, self.wall_grid,
+                        self.wall_cohesion if self.wall_cohesion is not None else self.no_pull,
+                        model.particle_grid.id, self.cs, self.step_arr],
+                outputs=[state_in.particle_f],
+                device=model.device,
+            )
+
+        # clumps: sum each body's member forces and torques BEFORE integrate_fused moves
+        # the members as loose spheres (it does not touch forces); the body pass after it
+        # overwrites them with the rigid motion
+        if self.clumps is not None:
+            cl = self.clumps
+            wp.launch(clump_wrench, dim=cl["n"], device=model.device, inputs=[
+                state_in.particle_q, state_in.particle_f, self.particle_t, model.particle_flags,
+                cl["first"], cl["count"], cl["x"], cl["state"], self.clump_F, self.clump_T])
+
         # linear + angular integration and the step counter, one launch
         wp.launch(
             kernel=integrate_fused,
@@ -740,6 +867,103 @@ class SolverGranularDEM(SolverBase):
             outputs=[state_out.particle_q, state_out.particle_qd],
             device=model.device,
         )
+        if self.clumps is not None:
+            cl = self.clumps
+            wp.launch(integrate_clump_bodies, dim=cl["n"], device=model.device, inputs=[
+                state_out.particle_q, state_out.particle_qd, self.particle_w, model.particle_flags,
+                cl["first"], cl["count"], cl["sub_offset"], cl["x"], cl["v"], cl["q"], cl["L"],
+                cl["state"], self.clump_F, self.clump_T, cl["inv_mass"], cl["inv_inertia"],
+                model.gravity, dt, model.particle_max_velocity, self.max_spin])
+
+
+@wp.kernel
+def clump_wrench(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_f: wp.array(dtype=wp.vec3),
+    particle_t: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    first: wp.array(dtype=int),
+    count: wp.array(dtype=int),
+    body_x: wp.array(dtype=wp.vec3),
+    state: wp.array(dtype=int),
+    F_out: wp.array(dtype=wp.vec3),
+    T_out: wp.array(dtype=wp.vec3),
+):
+    """Force and torque (about the centre of mass) on each live clump: the sum over its
+    members of f, and of (x_s - x) x f + tau."""
+    b = wp.tid()
+    if state[b] == 0:
+        return
+    xc = body_x[b]
+    F = wp.vec3(0.0)
+    T = wp.vec3(0.0)
+    for k in range(count[b]):
+        i = first[b] + k
+        fi = particle_f[i]
+        F += fi
+        T += wp.cross(particle_x[i] - xc, fi) + particle_t[i]
+    F_out[b] = F
+    T_out[b] = T
+
+
+@wp.kernel
+def integrate_clump_bodies(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_v: wp.array(dtype=wp.vec3),
+    particle_w: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    first: wp.array(dtype=int),
+    count: wp.array(dtype=int),
+    sub_offset: wp.array(dtype=wp.vec3),
+    body_x: wp.array(dtype=wp.vec3),
+    body_v: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.quat),
+    body_L: wp.array(dtype=wp.vec3),
+    state: wp.array(dtype=int),
+    F_in: wp.array(dtype=wp.vec3),
+    T_in: wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=float),
+    inv_inertia: wp.array(dtype=wp.vec3),
+    gravity: wp.array(dtype=wp.vec3),
+    dt: float,
+    v_max: float,
+    max_spin: float,
+):
+    """Rigid-body step of each live clump (symplectic Euler, as integrate_fused): the
+    translation from F; the rotation from the world-frame angular momentum L += T dt,
+    w = R I^-1 R^T L (the gyroscopic term is implicit in carrying L), q += dt/2 (w,0) q;
+    then the members are written back as x + R o, v + w x R o, w.  Runs after
+    integrate_fused, overwriting what it did to the members."""
+    b = wp.tid()
+    if state[b] == 0:
+        return
+    v1 = body_v[b] + (F_in[b] * inv_mass[b] + gravity[0]) * dt
+    sp = wp.length(v1)
+    if sp > v_max:
+        v1 *= v_max / sp
+    x1 = body_x[b] + v1 * dt
+    q = body_q[b]
+    L = body_L[b] + T_in[b] * dt
+    Ib = inv_inertia[b]
+    R = wp.quat_to_matrix(q)
+    w = R * wp.cw_mul(Ib, wp.transpose(R) * L)
+    ws = wp.length(w)
+    if ws > max_spin:
+        L = L * (max_spin / ws)
+        w = w * (max_spin / ws)
+    q1 = wp.normalize(q + wp.quat(w[0], w[1], w[2], 0.0) * q * (0.5 * dt))
+    R1 = wp.quat_to_matrix(q1)
+    w1 = R1 * wp.cw_mul(Ib, wp.transpose(R1) * L)
+    body_x[b] = x1
+    body_v[b] = v1
+    body_q[b] = q1
+    body_L[b] = L
+    for k in range(count[b]):
+        i = first[b] + k
+        o = R1 * sub_offset[i]
+        particle_x[i] = x1 + o
+        particle_v[i] = v1 + wp.cross(w1, o)
+        particle_w[i] = w1
 
 
 @wp.kernel
@@ -786,6 +1010,7 @@ def build_collider(parts, two_sided, friction, ke, kd, kf, thickness, max_dist, 
     c.motion_axis = wp.array(np.array(ma, dtype=np.float32), dtype=wp.vec3, device=device)
     c.motion_point = wp.array(np.array(mp, dtype=np.float32), dtype=wp.vec3, device=device)
     c.motion_rate = wp.array(mr, dtype=float, device=device)
+    c.motion_vel = wp.zeros(len(parts), dtype=wp.vec3, device=device)
     c.max_dist = float(max_dist)
     # wp.Mesh objects must outlive the struct: it stores only their integer ids, so if
     # they are garbage collected the kernel reads freed BVHs.  Returned for the caller
@@ -1035,6 +1260,7 @@ def eval_particle_contact_rot(
     particle_w: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
     particle_inv_mass: wp.array(dtype=float),
     k_n: float,
     k_d: float,
@@ -1079,10 +1305,14 @@ def eval_particle_contact_rot(
     f = wp.vec3(0.0)
     t = wp.vec3(0.0)
 
+    bi = particle_body[i]
     query = wp.hash_grid_query(grid, x, ri + max_radius)
     index = int(0)
     while wp.hash_grid_query_next(query, index):
         if index == i:
+            continue
+        # members of one clump never touch each other (it is one rigid body)
+        if bi >= 0 and particle_body[index] == bi:
             continue
         if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
             continue
@@ -1096,6 +1326,101 @@ def eval_particle_contact_rot(
 
     particle_f[i] = f
     particle_t[i] = t
+
+
+@wp.struct
+class Consolidation:
+    """Consolidation strength (a simplified Edinburgh elasto-plastic adhesion, EEPA): each
+    contact remembers the largest elastic normal force it has carried, F_max, and while
+    it lasts the grains also hold together with lam * F_max.  Loose, flowing contacts
+    stay weak; contacts compacted under load (a packed spout, material pressed onto a
+    liner) gain strength -- the hardening and hang-up that fines give a bulk solid.  The
+    memory is a per-grain table like the tangential history (its own, so the two never
+    disturb each other); a contact that breaks forgets its strength."""
+
+    on: int
+    lam_pp: float
+    lam_w: wp.array(dtype=float)
+    """Per part."""
+    partner: wp.array2d(dtype=int)
+    stamp: wp.array2d(dtype=int)
+    fmax: wp.array2d(dtype=float)
+    hertz: int
+    e_pp: float
+    e_w: float
+    ke_pp: float
+
+
+@wp.func
+def _consolidated_pull(cs: Consolidation, i: int, key: int, step: int, f_el: float, lam: float):
+    """lam x the largest elastic force contact (i, key) has carried so far, this step's
+    included.  key: the partner grain, or -(part + 2) for a wall."""
+    slot = _history_slot(cs.partner, cs.stamp, i, key, step)
+    if slot < 0:
+        return lam * f_el                     # table full (rare): this step's force only
+    if cs.partner[slot, i] != key or cs.stamp[slot, i] < step - 1:
+        cs.partner[slot, i] = key             # a new contact starts with no strength
+        cs.fmax[slot, i] = 0.0
+    cs.stamp[slot, i] = step
+    fm = wp.max(cs.fmax[slot, i], f_el)
+    cs.fmax[slot, i] = fm
+    return lam * fm
+
+
+@wp.kernel
+def add_pair_cohesion(
+    grid: wp.uint64,
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
+    max_radius: float,
+    skin: float,
+    pull: float,
+    cs: Consolidation,
+    step_arr: wp.array(dtype=int),
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    """Grain-grain cohesion as a fraction of grain weight (BulkFlowAnalyst's convention):
+    while two grains touch they also pull together with a constant force pull * m*, where
+    pull = cohesion fraction x 9.81 m/s^2 and m* = 2 mi mj / (mi + mj) -- the grain's own
+    mass for equal grains -- plus the consolidation strength lam * F_max (Consolidation).
+    ADDS to the contact forces; runs after them."""
+    i = wp.hash_grid_point_id(grid, wp.tid())
+    if i == -1:
+        return
+    if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
+        return
+    x = particle_x[i]
+    ri = particle_radius[i]
+    f = wp.vec3(0.0)
+    bi = particle_body[i]
+    query = wp.hash_grid_query(grid, x, ri + max_radius + skin)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if j == i:
+            continue
+        # members of one clump never touch each other (it is one rigid body)
+        if bi >= 0 and particle_body[j] == bi:
+            continue
+        if (particle_flags[j] & newton.ParticleFlags.ACTIVE) == 0:
+            continue
+        rj = particle_radius[j]
+        d_vec = x - particle_x[j]
+        d = wp.length(d_vec)
+        if d < 1.0e-9 or d >= ri + rj:
+            continue
+        fp = pull * 2.0 / (particle_inv_mass[i] + particle_inv_mass[j])
+        if cs.on == 1:
+            # the elastic part of the normal force, as the contact kernel computes it
+            delta = ri + rj - d
+            f_el = cs.ke_pp * delta
+            if cs.hertz == 1:
+                f_el = (4.0 / 3.0) * cs.e_pp * wp.sqrt(ri * rj / (ri + rj)) * delta * wp.sqrt(delta)
+            fp += _consolidated_pull(cs, i, j, step_arr[0], f_el, cs.lam_pp)
+        f -= (d_vec / d) * fp
+    particle_f[i] = particle_f[i] + f
 
 
 @wp.func
@@ -1121,6 +1446,9 @@ def _surface_velocity(collider: ShellCollider, m: int, n: wp.vec3, cp: wp.vec3):
     elif mt == 2:
         ws = collider.motion_axis[m] * collider.motion_rate[m]
         vs = wp.cross(ws, cp - collider.motion_point[m])
+    elif mt == 3:
+        ws = collider.motion_axis[m]
+        vs = collider.motion_vel[m] + wp.cross(ws, cp - collider.motion_point[m])
     return vs, ws
 
 
@@ -1530,12 +1858,15 @@ def _bake_cells(
         counts[c] = k
 
 
-def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device, sub=4):
+def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device, sub=4,
+                    part_ids=None):
     """Bake the candidate-triangle grid for static colliders (see block comment above).
 
     ``reach`` must cover every distance at which a triangle can matter: contact
     (particle radius + shell thickness) plus the 1 mm neighbourhood used for the
-    average-normal sign test.
+    average-normal sign test.  ``part_ids``: the collider's index of each entry of
+    ``parts`` when the grid holds only some of them (static parts, or one moving part in
+    its own frame); ``collider_lo/hi`` are then per entry of ``parts``.
     """
     allv = np.vstack([np.asarray(v, dtype=np.float64) for _n, v, _f in parts])
     lo = allv.min(axis=0) - reach - cell
@@ -1546,6 +1877,7 @@ def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device
 
     # global triangle table, parts concatenated in collider order
     # per-triangle orthonormal frames, computed in float64 (see _tri_closest)
+    part_ids_in = part_ids
     v0s, us, ws, ns, t2s, part_ids, offs = [], [], [], [], [], [], []
     off = 0
     for m, (_n, v, f) in enumerate(parts):
@@ -1560,7 +1892,7 @@ def build_wall_grid(parts, meshes, collider_lo, collider_hi, reach, cell, device
         w = np.cross(nrm, u)
         t2 = np.stack([blen, (e2 * u).sum(1), (e2 * w).sum(1)], axis=1)
         v0s.append(a); us.append(u); ws.append(w); ns.append(nrm); t2s.append(t2)
-        part_ids.append(np.full(len(f), m))
+        part_ids.append(np.full(len(f), m if part_ids_in is None else part_ids_in[m]))
         offs.append(off)
         off += len(f)
     tv0, tu, tw, tn, tt2 = (wp.array(np.concatenate(x).astype(np.float32), dtype=wp.vec3,
@@ -1656,6 +1988,19 @@ def _avg_normal_from_list(g: WallGrid, mode: int, wl: wp.array2d(dtype=int), i: 
     eps_sq = _EPS_NORMAL * _EPS_NORMAL
     for s in range(s0, s1):
         r = g.rec[_entry(mode, wl, i, k0, s)]
+        sq, _q = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, cp)
+        if sq < eps_sq:
+            acc += r.n
+    return wp.normalize(acc)
+
+
+@wp.func
+def _avg_normal_seg(g: WallGrid, k0: int, s0: int, s1: int, cp: wp.vec3):
+    """_avg_normal_from_list for a contiguous cell list (mode 0), for add_wall_cohesion."""
+    acc = wp.vec3(0.0)
+    eps_sq = _EPS_NORMAL * _EPS_NORMAL
+    for s in range(s0, s1):
+        r = g.rec[k0 + s]
         sq, _q = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, cp)
         if sq < eps_sq:
             acc += r.n
@@ -1889,6 +2234,210 @@ def eval_wall_grid_rot(
         particle_t[i] = particle_t[i] + t_total
 
 
+@wp.kernel
+def set_part_poses(
+    step_arr: wp.array(dtype=int),
+    step_offset: int,
+    table_R: wp.array2d(dtype=wp.mat33),
+    table_T: wp.array2d(dtype=wp.vec3),
+    table_v: wp.array2d(dtype=wp.vec3),
+    table_w: wp.array2d(dtype=wp.vec3),
+    part: wp.array(dtype=int),
+    pose_R: wp.array(dtype=wp.mat33),
+    pose_T: wp.array(dtype=wp.vec3),
+    collider: ShellCollider,
+):
+    """Moving parts (#14): pose and wall velocity of moving part k at this step, from
+    tables precomputed on the host (row = global step), so graph replays move them
+    smoothly.  Rest geometry x maps to R x + T; the wall velocity of a world point y is
+    v + w x (y - T)."""
+    k = wp.tid()
+    s = wp.clamp(step_arr[0] - step_offset, 0, table_R.shape[0] - 1)
+    m = part[k]
+    pose_R[k] = table_R[s, k]
+    pose_T[k] = table_T[s, k]
+    collider.motion_vel[m] = table_v[s, k]
+    collider.motion_axis[m] = table_w[s, k]
+    collider.motion_point[m] = table_T[s, k]
+
+
+@wp.kernel
+def eval_wall_grid_moving(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_w: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    collider: ShellCollider,
+    g: WallGrid,
+    pose_R: wp.array(dtype=wp.mat33),
+    pose_T: wp.array(dtype=wp.vec3),
+    k: int,
+    mu_roll: float,
+    rot_damp: float,
+    k_t: float,
+    hertz: int,
+    e_star: float,
+    g_star: float,
+    beta: float,
+    step_arr: wp.array(dtype=int),
+    tang_partner: wp.array2d(dtype=int),
+    tang_stamp: wp.array2d(dtype=int),
+    tang_xi: wp.array2d(dtype=wp.vec3),
+    dt: float,
+    grid: wp.uint64,
+    use_pull: int,
+    wall_pull: wp.array(dtype=float),
+    cs: Consolidation,
+    particle_f: wp.array(dtype=wp.vec3),
+    particle_t: wp.array(dtype=wp.vec3),
+):
+    """Grain contact with ONE moving part (#14), whose grid g is baked in the part's own
+    (rest) frame: the grain is looked up at R^T (x - T), the closest point and normal are
+    mapped back to the world, and the force law is the shared _wall_force with the part's
+    rigid wall velocity (motion type 3).  Grain-wall cohesion of the part is added here
+    too.  One part, so the closest triangle is the contact (no part segments)."""
+    i = wp.hash_grid_point_id(grid, wp.tid())
+    if ~particle_flags[i] & newton.ParticleFlags.ACTIVE:
+        return
+    R = pose_R[k]
+    T = pose_T[k]
+    x = particle_q[i]
+    xb = wp.transpose(R) * (x - T)
+    cc = _cell_of(g, xb)
+    if cc[0] < 0 or cc[1] < 0 or cc[2] < 0 or cc[0] >= g.nx or cc[1] >= g.ny or cc[2] >= g.nz:
+        return
+    cell = (cc[2] * g.ny + cc[1]) * g.nx + cc[0]
+    k0 = g.cell_start[cell]
+    ncand = g.cell_start[cell + 1] - k0
+    if ncand == 0:
+        return
+    m = g.rec[k0].part
+    if collider.active[m] == 0:
+        return
+    radius = particle_radius[i]
+    rr = radius + collider.thickness[m]
+    best_sq = rr * rr
+    best_t = int(-1)
+    for s in range(ncand):
+        r = g.rec[k0 + s]
+        h = wp.dot(xb - r.v0, r.n)
+        if h * h < best_sq:
+            sq, _c = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, xb)
+            if sq < best_sq:
+                best_sq = sq
+                best_t = k0 + s
+    if best_t < 0:
+        return
+    br = g.rec[best_t]
+    _sq, cpb = _tri_closest(br.v0, br.u, br.w, br.n, br.t2, xb)
+    face_n = br.n
+    if collider.two_sided[m] == 0:
+        face_n = _avg_normal_seg(g, k0, 0, ncand, cpb)
+    sdf, nb = _shell_sdf(collider.two_sided[m], collider.thickness[m], xb - cpb,
+                         wp.sqrt(best_sq), face_n)
+    c = sdf - radius
+    if c < 0.0 and c >= -radius:
+        n = R * nb
+        cp = R * cpb + T
+        fw, tw = _wall_force(collider, m, n, c, radius, particle_qd[i], particle_w[i],
+                             particle_inv_mass[i], mu_roll, rot_damp, k_t, hertz, e_star,
+                             g_star, beta, step_arr[0], i, -(m + 2), cp, tang_partner,
+                             tang_stamp, tang_xi, dt)
+        if use_pull == 1:
+            if wall_pull[m] > 0.0:
+                fw -= n * (wall_pull[m] / particle_inv_mass[i])
+        if cs.on == 1 and cs.lam_w[m] > 0.0:
+            f_el = collider.ke[m] * (-c)
+            if cs.hertz == 1:
+                f_el = (4.0 / 3.0) * cs.e_w * wp.sqrt(radius) * (-c) * wp.sqrt(-c)
+            fw -= n * _consolidated_pull(cs, i, -(m + 2), step_arr[0], f_el, cs.lam_w[m])
+        particle_f[i] = particle_f[i] + fw
+        particle_t[i] = particle_t[i] + tw
+
+
+@wp.kernel
+def add_wall_cohesion(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    collider: ShellCollider,
+    g: WallGrid,
+    wall_pull: wp.array(dtype=float),
+    grid: wp.uint64,
+    cs: Consolidation,
+    step_arr: wp.array(dtype=int),
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    """Grain-wall cohesion as a fraction of grain weight: per part in contact, a constant
+    pull of wall_pull[part] * m toward the wall (wall_pull = fraction x 9.81 m/s^2), plus
+    the consolidation strength cs.lam_w[part] * F_max.  Same search and signed distance as
+    eval_wall_grid_rot (closest triangle of each part, from the grain's cell list); ADDS to
+    the contact forces."""
+    i = wp.hash_grid_point_id(grid, wp.tid())
+    if ~particle_flags[i] & newton.ParticleFlags.ACTIVE:
+        return
+    x = particle_q[i]
+    cc = _cell_of(g, x)
+    if cc[0] < 0 or cc[1] < 0 or cc[2] < 0 or cc[0] >= g.nx or cc[1] >= g.ny or cc[2] >= g.nz:
+        return
+    cell = (cc[2] * g.ny + cc[1]) * g.nx + cc[0]
+    k0 = g.cell_start[cell]
+    ncand = g.cell_start[cell + 1] - k0
+    if ncand == 0:
+        return
+    radius = particle_radius[i]
+    f = wp.vec3(0.0)
+    cur = int(-1)
+    seg0 = int(0)
+    best_sq = float(0.0)
+    best_t = int(-1)
+    for s in range(ncand + 1):
+        t = int(-1)
+        p = int(-1)
+        r = WallTri()
+        if s < ncand:
+            t = k0 + s
+            r = g.rec[t]
+            p = r.part
+        if p != cur:
+            if best_t >= 0 and (wall_pull[cur] > 0.0 or (cs.on == 1 and cs.lam_w[cur] > 0.0)):
+                br = g.rec[best_t]
+                _sq, cp = _tri_closest(br.v0, br.u, br.w, br.n, br.t2, x)
+                face_n = br.n
+                if collider.two_sided[cur] == 0:
+                    face_n = _avg_normal_seg(g, k0, seg0, s, cp)
+                sdf, n = _shell_sdf(collider.two_sided[cur], collider.thickness[cur], x - cp,
+                                    wp.sqrt(best_sq), face_n)
+                c = sdf - radius
+                if c < 0.0 and c >= -radius:
+                    fp = wall_pull[cur] / particle_inv_mass[i]
+                    if cs.on == 1 and cs.lam_w[cur] > 0.0:
+                        f_el = collider.ke[cur] * (-c)
+                        if cs.hertz == 1:
+                            f_el = (4.0 / 3.0) * cs.e_w * wp.sqrt(radius) * (-c) * wp.sqrt(-c)
+                        fp += _consolidated_pull(cs, i, -(cur + 2), step_arr[0], f_el, cs.lam_w[cur])
+                    f -= n * fp
+            cur = p
+            seg0 = s
+            best_t = -1
+            rr = radius + collider.thickness[wp.max(p, 0)]
+            best_sq = rr * rr
+            if p >= 0:
+                if collider.active[p] == 0:
+                    best_sq = 0.0
+        if t >= 0:
+            h = wp.dot(x - r.v0, r.n)
+            if h * h < best_sq:
+                sq, _cand = _tri_closest(r.v0, r.u, r.w, r.n, r.t2, x)
+                if sq < best_sq:
+                    best_sq = sq
+                    best_t = t
+    particle_f[i] = particle_f[i] + f
+
+
 # ---------------------------------------------------------------------------
 # Verlet neighbour list
 #
@@ -1913,6 +2462,7 @@ def build_neighbor_list(
     particle_x: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
     max_radius: float,
     skin: wp.array(dtype=float),
     nbr: wp.array2d(dtype=int),
@@ -1934,10 +2484,14 @@ def build_neighbor_list(
     ri = particle_radius[i]
     sk = skin[0]
     c = int(0)
+    bi = particle_body[i]
     query = wp.hash_grid_query(grid, x, ri + max_radius + sk)
     j = int(0)
     while wp.hash_grid_query_next(query, j):
         if j == i:
+            continue
+        # members of one clump never touch each other (it is one rigid body)
+        if bi >= 0 and particle_body[j] == bi:
             continue
         if (particle_flags[j] & newton.ParticleFlags.ACTIVE) == 0:
             continue
@@ -1962,6 +2516,7 @@ def eval_particle_contact_list(
     particle_w: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_body: wp.array(dtype=int),
     particle_inv_mass: wp.array(dtype=float),
     k_n: float,
     k_d: float,
@@ -2002,10 +2557,14 @@ def eval_particle_contact_list(
     ri = particle_radius[i]
     f = wp.vec3(0.0)
     t = wp.vec3(0.0)
+    bi = particle_body[i]
     hs = 0.5 * skin[0]
     if wp.length_sq(x - x_build[i]) <= hs * hs:
         for k in range(nbr_count[i]):
             index = nbr[k, i]
+            # members of one clump never touch each other (it is one rigid body)
+            if bi >= 0 and particle_body[index] == bi:
+                continue
             if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
                 continue
             df, dtq = _pair_contact(i, index, x, v, w, ri, particle_x, particle_v, particle_w,
@@ -2029,6 +2588,9 @@ def eval_particle_contact_list(
         index = int(0)
         while wp.hash_grid_query_next(query, index):
             if index == i:
+                continue
+            # members of one clump never touch each other (it is one rigid body)
+            if bi >= 0 and particle_body[index] == bi:
                 continue
             if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
                 continue

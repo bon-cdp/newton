@@ -13,7 +13,8 @@ flows, dust and air — in a web browser.
 | [5. Command line](05-command-line.md) | the same workflow without the browser, and ParaView files |
 
 The physics, validation against BulkFlowAnalyst and performance history are in
-[`BFA_REPLICATION.md`](../../BFA_REPLICATION.md).
+[`BFA_REPLICATION.md`](../../BFA_REPLICATION.md). For developers (how the code is organised,
+how to make and check changes), start with [`HANDOVER.md`](../../HANDOVER.md).
 
 ## The workflow at a glance
 

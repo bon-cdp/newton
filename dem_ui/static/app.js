@@ -119,18 +119,73 @@ async function loadGeometry(kind, key) {
   const geo = await api(kind === "scenario" ? `/api/geometry?scenario=${encodeURIComponent(key)}`
                                              : `/api/runs/${encodeURIComponent(key)}/geometry`);
   const r = kind === "scenario" ? S.scen?.material?.radius : S.runInfo?.meta?.material?.radius;
+  viewer.setUp(kind === "scenario" ? S.scen?.gravity : S.runInfo?.meta?.gravity);
   viewer.setGeometry(geo, r);
   S.geo = geo;
+  if (kind === "scenario") updateCapacity();     // face inlets need the geometry first
 }
 
 // ---------------------------------------------------------------- setup
 const MATERIAL_FIELDS = [
-  ["name", "text"], ["radius", "number", "grain radius (m)"], ["density", "number", "density (kg/m³)"],
+  ["name", "text"], ["radius", "number", "grain radius (m)"],
+  ["bulk_density", "number", "bulk density (kg/m³)"], ["packing_ratio", "number", "packing ratio (particle ÷ bulk)"],
+  ["density", "readonly", "particle density (kg/m³)"],
   ["youngs", "number", "Young's modulus (Pa)"], ["poisson", "number", "Poisson ratio"],
   ["restitution", "number", "restitution"], ["friction", "number", "grain-grain sliding μ"],
   ["rolling_friction", "number", "grain-grain rolling μ"], ["wall_rolling_friction", "number", "wall rolling μ"],
   ["contact", "select:hertz,linear", "contact law"], ["tangential_ratio", "number", "Mindlin kt/kn"],
+  ["cohesion", "number", "grain-grain cohesion (× grain weight)"],
+  ["wall_cohesion", "number?", "wall cohesion (× grain weight, blank = same)"],
+  ["consolidation", "number", "consolidation strength (× max contact force)"],
+  ["wall_consolidation", "number?", "wall consolidation (blank = same)"],
 ];
+
+// Size distribution: rows of radius (m) and MASS fraction (%, as a sieve curve; need not
+// sum to 100).  No rows = every grain has the material's radius.
+function renderSizes(sc) {
+  const box = $("#size-dist"), mat = sc.material;
+  const changed = () => { renderSizes(sc); updateCapacity(); refreshEstimate(); };
+  const rows = mat.sizes || [];
+  box.innerHTML = `<table class="tbl"><thead><tr><th>radius (m)</th><th>mass %</th><th title="share of grains by number">grains %</th><th title="1 = a sphere; n > 1 = a rigid clump of n overlapping spheres (random shapes, same volume and mass)">spheres</th><th></th></tr></thead><tbody></tbody></table>
+    <button type="button" id="size-add">+ size</button> <span id="size-note" style="color:var(--muted);font-size:11px"></span>
+    <div id="single-spheres" style="font-size:11px;color:var(--muted);margin-top:4px">spheres per grain
+      <input type="number" min="1" max="12" step="1" style="width:3.5em"> (1 = spheres; more = random clumps of that many)</div>`;
+  const tb = box.querySelector("tbody"), cls = sizeClasses(mat);
+  const wsum = rows.reduce((a, s) => a + (+s.fraction > 0 ? +s.fraction : 0), 0);
+  rows.forEach((s, k) => {
+    const tr = document.createElement("tr");
+    const ci = rows.slice(0, k + 1).filter(q => +q.fraction > 0 && +q.radius > 0).length - 1;
+    const live = +s.fraction > 0 && +s.radius > 0;
+    tr.innerHTML = `<td><input type="number" step="any" value="${s.radius}" style="width:6em"></td>
+      <td><input type="number" step="any" value="${+(s.fraction * 100).toPrecision(6)}" style="width:5em"></td>
+      <td class="num">${live ? fmt(100 * cls[ci].p) : "—"}</td>
+      <td><input type="number" min="1" max="12" step="1" value="${s.spheres ?? 1}" style="width:3.5em"></td>
+      <td><button type="button" title="remove">×</button></td>`;
+    const [ir, iw, isp] = tr.querySelectorAll("input");
+    isp.onchange = () => { const n = Math.max(1, Math.round(+isp.value || 1)); if (n > 1) s.spheres = n; else delete s.spheres; changed(); };
+    ir.onchange = () => { s.radius = +ir.value; changed(); };
+    iw.onchange = () => { s.fraction = +iw.value / 100; changed(); };
+    tr.querySelector("button").onclick = () => { rows.splice(k, 1); if (!rows.length) delete mat.sizes; changed(); };
+    tb.appendChild(tr);
+  });
+  box.querySelector("#size-add").onclick = () => {
+    mat.sizes = rows;
+    if (!rows.length) rows.push({ radius: +mat.radius, fraction: 1 });   // the current size first
+    rows.push({ radius: +(+mat.radius / 2).toPrecision(3), fraction: 0 });
+    changed();
+  };
+  // the single size (no rows) can be clumps too
+  const ss = box.querySelector("#single-spheres");
+  ss.hidden = rows.length > 0;
+  const ssi = ss.querySelector("input");
+  ssi.value = mat.spheres ?? 1;
+  ssi.onchange = () => { const n = Math.max(1, Math.round(+ssi.value || 1)); if (n > 1) mat.spheres = n; else delete mat.spheres; changed(); };
+  const mean = cls.reduce((a, k) => a + k.p * k.m, 0);
+  box.querySelector("#size-note").textContent = !rows.length
+    ? "one size: every grain has the radius above"
+    : `${cls.length} size${cls.length > 1 ? "s" : ""} (the radius above is not used) · mean grain ${fmt(mean * 1e3)} g` +
+      (wsum > 0 && Math.abs(wsum - 1) > 1e-6 ? ` · mass % sum to ${fmt(wsum * 100)}, normalised` : "");
+}
 
 async function openScenario(path) {
   S.scenPath = path; S.scen = await api(`/api/scenario?path=${encodeURIComponent(path)}`);
@@ -159,19 +214,56 @@ function renderSetup() {
     if (e.target.value === "fast") Object.assign(sc.solver, { youngs_divisor: 10, dt: "auto", neighbor_every: 4, skin_speed: 6 });
     if (e.target.value === "reference") Object.assign(sc.solver, { youngs_divisor: 1, neighbor_every: 0, dt: sc.notes?.bfa_timestep || "auto" });
   };
+  // gravity: a principal direction or a custom vector (m/s²).  "Up" in the 3D view and for
+  // box injectors and belts follows it.
+  const gsel = $("#gravity-dir"), gcus = $("#gravity-custom"), gin = [...gcus.querySelectorAll("input")];
+  const gv = sc.gravity || [0, -9.81, 0];
+  const gkey = gv.map(x => +(+x).toPrecision(6) || 0).join(",");
+  gsel.value = [...gsel.options].some(o => o.value === gkey) ? gkey : "custom";
+  gcus.hidden = gsel.value !== "custom";
+  gin.forEach((inp, k) => inp.value = num(gv[k]));
+  const applyGravity = g => { sc.gravity = g; viewer.setUp(g); refreshInjectorPreview(); };
+  gsel.onchange = () => {
+    gcus.hidden = gsel.value !== "custom";
+    if (gsel.value === "custom") return;
+    const g = gsel.value.split(",").map(Number);
+    gin.forEach((inp, k) => inp.value = g[k]);
+    applyGravity(g);
+  };
+  gin.forEach(inp => inp.onchange = () => applyGravity(gin.map(i => +i.value)));
   // material
   const mf = $("#material-fields"); mf.innerHTML = "";
+  // density is entered as BULK density x packing ratio (BFA's convention); scenarios saved
+  // with only the particle density start from density / ratio
+  const mat = sc.material;
+  mat.packing_ratio ??= 1.5;
+  if (mat.bulk_density == null && mat.density) mat.bulk_density = +(mat.density / mat.packing_ratio).toPrecision(6);
   for (const [k, type, label] of MATERIAL_FIELDS) {
     const l = document.createElement("label"); l.textContent = label || k;
     let inp;
     if (type.startsWith("select:")) {
       inp = document.createElement("select");
       for (const o of type.slice(7).split(",")) inp.add(new Option(o, o));
-    } else { inp = document.createElement("input"); inp.type = type; if (type === "number") inp.step = "any"; }
-    inp.value = num(sc.material[k]);
-    inp.onchange = () => sc.material[k] = type === "number" ? +inp.value : inp.value;
+    } else {
+      // "number?" = optional number: an empty box stores null (e.g. wall cohesion = same
+      // as grain-grain)
+      inp = document.createElement("input"); inp.type = type.startsWith("number") ? "number" : type;
+      if (inp.type === "number") inp.step = "any";
+    }
+    if (type === "readonly") { inp.type = "text"; inp.readOnly = true; inp.id = "mat-" + k; inp.tabIndex = -1; }
+    inp.value = num(sc.material[k]) ?? (k === "cohesion" || k === "consolidation" ? 0 : "");
+    inp.onchange = () => {
+      sc.material[k] = type === "number?" ? (inp.value === "" ? null : +inp.value)
+        : type === "number" ? +inp.value : inp.value;
+      if (k === "bulk_density" || k === "packing_ratio") {
+        mat.density = mat.bulk_density * mat.packing_ratio;
+        $("#mat-density").value = fmt(mat.density);
+        renderSizes(sc); updateCapacity();
+      }
+    };
     l.appendChild(inp); mf.appendChild(l);
   }
+  renderSizes(sc);
   // parts
   const tb = $("#parts-table tbody"); tb.innerHTML = "";
   sc.parts.forEach((p, k) => {
@@ -179,19 +271,23 @@ function renderSetup() {
     const kind = p.motion?.type || "wall";
     tr.innerHTML = `<td><input type="checkbox" checked></td>
       <td><span class="swatch" style="background:${PALETTE[k % PALETTE.length]}"></span>${p.name}</td>
-      <td><select><option value="wall">wall</option><option value="belt">conveyor belt</option><option value="rotating">rotating</option></select></td>
+      <td><select><option value="wall">wall</option><option value="belt">conveyor belt</option><option value="rotating">rotating</option><option value="moving">moving (motion manager)</option></select></td>
       <td><input type="checkbox" ${p.two_sided ? "checked" : ""}></td>
       <td><input type="number" step="any" value="${p.friction}"></td>
+      <td><input type="number" step="any" value="${p.cohesion ?? ""}" placeholder="material" title="grain-wall cohesion for this part (fraction of grain weight); blank = the material's wall cohesion"></td>
+      <td><input type="number" step="any" value="${p.consolidation ?? ""}" placeholder="material" title="grain-wall consolidation strength for this part (x max contact force); blank = the material's wall consolidation"></td>
       <td><input type="number" step="any" value="${p.active[0]}"></td>
       <td><input type="number" step="any" value="${p.active[1] >= INF ? "" : p.active[1]}" placeholder="end"></td>
       <td><input type="checkbox" ${p.corners ? "checked" : ""}></td>
       <td><button class="small" title="remove part">×</button></td>`;
-    const [show, two, fric, on, off, corn] = tr.querySelectorAll("input");
+    const [show, two, fric, coh, con, on, off, corn] = tr.querySelectorAll("input");
     const type = tr.querySelector("select"), del = tr.querySelector("button");
     type.value = kind;
     show.onchange = () => viewer.setPartVisible(p.name, show.checked);
     two.onchange = () => p.two_sided = two.checked;
     fric.onchange = () => p.friction = +fric.value;
+    coh.onchange = () => { if (coh.value === "") delete p.cohesion; else p.cohesion = +coh.value; };
+    con.onchange = () => { if (con.value === "") delete p.consolidation; else p.consolidation = +con.value; };
     on.onchange = () => p.active[0] = +on.value;
     off.onchange = () => p.active[1] = off.value === "" ? INF : +off.value;
     corn.onchange = () => p.corners = corn.checked;
@@ -199,6 +295,12 @@ function renderSetup() {
       if (type.value === "wall") delete p.motion;
       if (type.value === "belt") { p.motion = { type: "belt", velocity: [1, 0, 0] }; p.corners = true; }
       if (type.value === "rotating") p.motion = { type: "rotating", point: viewer.partCentroid(p.name), axis: [0, 0, 1], rpm: 30 };
+      if (type.value === "moving") {
+        // a first step: lift against gravity at 0.1 m/s from 1 s to 3 s
+        const g = sc.gravity || [0, -9.81, 0], gn = Math.hypot(...g) || 1;
+        p.motion = { type: "moving", steps: [{ kind: "translate", start: 1, end: 3, velocity: g.map(c => +(-0.1 * c / gn).toFixed(6)) }] };
+      }
+      viewer.setPartMotion(p.name, p.motion);
       renderSetup();
     };
     del.onclick = () => { if (confirm(`Remove part ${p.name} from the scenario? (the STL file stays)`)) { sc.parts.splice(k, 1); renderSetup(); } };
@@ -206,6 +308,7 @@ function renderSetup() {
     if (p.motion) tb.appendChild(motionRow(p));
   });
   viewer.setMotionArrows(sc.parts);
+  viewer.setTime(+(S.movePreview ?? 0));       // moving parts at the preview time
   // injector
   renderInjector(sc);
   const form = $("#setup-form");
@@ -249,6 +352,20 @@ function refreshEstimate() {
 // "injection volume from belt reference").  A box can pass at most
 // width x height x packing x density x speed; the lattice packing is (4/3 pi r^3)/(2.2 r)^3.
 const LATTICE_PACKING = (4 / 3) * Math.PI / Math.pow(2.2, 3);
+
+// Size classes as dem_scenario.Material.classes(): [{r, m, p}] with p the NUMBER fraction
+// (mass fractions w over grain masses, normalised).  No rows = one size, material.radius.
+function sizeClasses(mat) {
+  const rows = (mat.sizes || []).filter(s => +s.fraction > 0 && +s.radius > 0);
+  if (!rows.length) return [{ r: +mat.radius, m: 4 / 3 * Math.PI * mat.radius ** 3 * mat.density, p: 1 }];
+  const c = rows.map(s => ({ r: +s.radius, m: 4 / 3 * Math.PI * s.radius ** 3 * mat.density, w: +s.fraction }));
+  const tot = c.reduce((a, k) => a + k.w / k.m, 0);
+  return c.map(k => ({ r: k.r, m: k.m, p: k.w / k.m / tot }));
+}
+// lattice packing of the injection sites.  Each size class has its own lattice, but the
+// classes are placed independently and the small grains fill the gaps big ones need: a
+// mixture passes about half what one size does (dem_run.MIXTURE_INLET_FACTOR, measured)
+function packing(mat) { return LATTICE_PACKING * (sizeClasses(mat).length > 1 ? 0.5 : 1); }
 
 async function renderInjector(sc) {
   const inf = $("#injector-fields"); inf.innerHTML = "";
@@ -294,8 +411,22 @@ async function renderInjector(sc) {
     fs.add(new Option("— choose —", ""));
     for (const f of files) fs.add(new Option(f, f));
     fs.value = inj.face_stl || "";
-    fs.onchange = () => { inj.face_stl = fs.value; refreshInjectorPreview(); };
+    // grains need room to spawn: a chosen face starts extruded by 5 grain diameters
+    const defaultDepth = () => +(10 * (sc.material.radius || 0.006)).toPrecision(3);
+    fs.onchange = () => {
+      inj.face_stl = fs.value;
+      if (fs.value && !(inj.extrude > 0)) inj.extrude = defaultDepth();
+      renderInjector(sc); refreshInjectorPreview();
+    };
     l.appendChild(fs); inf.appendChild(l);
+    field("extrude depth (m, 0 = on the face)", () => inj.extrude ?? 0, v => inj.extrude = Math.max(0, v), { preview: true });
+    field("offset from face (m)", () => inj.extrude_offset ?? 0, v => inj.extrude_offset = v, { preview: true });
+    const fl = document.createElement("label"); fl.textContent = "extrusion side";
+    const fb = document.createElement("button"); fb.className = "small";
+    fb.textContent = inj.extrude_flip ? "reversed normal — flip" : "face normal — flip";
+    fb.title = "extrude to the other side of the face (the arrow in the 3D view shows the side)";
+    fb.onclick = e => { e.preventDefault(); inj.extrude_flip = !inj.extrude_flip; renderInjector(sc); refreshInjectorPreview(); };
+    fl.appendChild(fb); inf.appendChild(fl);
   } else if (bx.reference === "belt") {
     const l = document.createElement("label"); l.textContent = "belt";
     const bs = document.createElement("select");
@@ -328,7 +459,9 @@ async function renderInjector(sc) {
     l.appendChild(c); inf.appendChild(l);
   }
   if (!(bx?.reference === "belt" && bx.match_belt !== false))
-    ["x", "y", "z"].forEach((ax, k) => field(`velocity ${ax} (m/s)`, () => inj.velocity[k], v => inj.velocity[k] = v));
+    // a face inlet's capacity depends on the velocity's direction: refresh the preview
+    ["x", "y", "z"].forEach((ax, k) => field(`velocity ${ax} (m/s)`, () => inj.velocity[k], v => inj.velocity[k] = v,
+                                              { preview: !bx }));
   field("start (s)", () => inj.start ?? 0, v => inj.start = v);
   field("stop (s)", () => ((inj.stop ?? INF) >= INF ? "" : inj.stop), v => inj.stop = v || INF);
   const cap = document.createElement("div"); cap.id = "inj-capacity"; cap.className = "msg"; cap.style.gridColumn = "1 / -1";
@@ -338,14 +471,29 @@ async function renderInjector(sc) {
 
 function updateCapacity() {
   const el = $("#inj-capacity"), sc = S.scen, inj = sc?.injectors?.[0];
-  if (!el || !inj?.box) { if (el) el.textContent = ""; return; }
+  if (!el || !inj) { if (el) el.textContent = ""; return; }
+  if (!inj.box) {
+    // STL face (extruded or not): its cross-section seen along the injection velocity, from
+    // the geometry preview, passes area x packing x density x speed -- the box rule
+    const g = S.geo?.injectors?.[0];
+    if (!inj.face_stl || g?.cross_section == null) { el.textContent = ""; return; }
+    const speed = Math.hypot(...inj.velocity);
+    const cap = g.cross_section * packing(sc.material) * sc.material.density * speed;
+    const ok = cap >= inj.mass_rate * 1.1;
+    el.className = "msg " + (ok ? "ok" : "err");
+    el.textContent = speed <= 0
+      ? "injection velocity is zero: the inlet cannot pass any mass — set a velocity"
+      : `inlet can pass ≈ ${fmt(cap)} kg/s (${fmt(cap * 3.6)} t/h) at ${fmt(speed)} m/s through ${fmt(g.cross_section)} m² — ` +
+        (ok ? "enough for the mass rate" : "LESS than the mass rate: enlarge the face or the extrusion depth, or raise the speed, or the inlet will choke");
+    return;
+  }
   const bx = inj.box;
   let speed = Math.hypot(...inj.velocity);
   if (bx.reference === "belt" && bx.match_belt !== false) {
     const p = sc.parts.find(q => q.name === bx.part);
     speed = p?.motion ? Math.hypot(...p.motion.velocity) : 0;
   }
-  const cap = bx.width * bx.height * LATTICE_PACKING * sc.material.density * speed;
+  const cap = bx.width * bx.height * packing(sc.material) * sc.material.density * speed;
   const ok = cap >= inj.mass_rate * 1.1;
   el.className = "msg " + (ok ? "ok" : "err");
   el.textContent = `box can pass ≈ ${fmt(cap)} kg/s (${fmt(cap * 3.6)} t/h) at ${fmt(speed)} m/s — ` +
@@ -361,6 +509,7 @@ async function refreshInjectorPreview() {
       const err = geo.injectors?.find(i => i.error);
       if (err) showError("Injection: " + err.error);
       viewer.setGeometry(geo, S.scen.material.radius); viewer.setMotionArrows(S.scen.parts);
+      S.geo = geo; updateCapacity();      // face inlets: capacity comes from the preview
     } catch (e) { showError(e.message); }
   }, 300);
 }
@@ -380,18 +529,31 @@ function orientPicked(dir, prev) {
 
 function motionRow(p) {
   const tr = document.createElement("tr"); tr.className = "motion-row";
-  const td = document.createElement("td"); td.colSpan = 9; tr.appendChild(td);
+  const td = document.createElement("td"); td.colSpan = 11; tr.appendChild(td);
   const m = p.motion;
   const dirText = v => { const n = Math.hypot(...v) || 1; return v.map(c => (c / n).toFixed(2)).join(", "); };
+  if (m.type === "moving") { movingRows(p, td); return tr; }
   if (m.type === "belt") {
     const speed = Math.hypot(...m.velocity);
+    // direction: typed (x, y, z -- any length, normalised) or picked from an edge
+    const unit = m.velocity.map(c => c / (speed || 1));
     td.innerHTML = `↳ belt speed <input type="number" step="any" value="${+speed.toFixed(4)}"> m/s
-      · direction (${dirText(m.velocity)})
+      · direction x <input type="number" step="any" class="belt-dir" value="${+unit[0].toFixed(4)}" style="width:4.5em">
+      y <input type="number" step="any" class="belt-dir" value="${+unit[1].toFixed(4)}" style="width:4.5em">
+      z <input type="number" step="any" class="belt-dir" value="${+unit[2].toFixed(4)}" style="width:4.5em">
       <button class="small">pick edge</button> <button class="small">flip</button>
       <span class="msg">direction of the CARRYING side; pulley wrap and return follow it</span>`;
     const [spIn] = td.querySelectorAll("input");
+    const dirIn = [...td.querySelectorAll(".belt-dir")];
     const [pick, flip] = td.querySelectorAll("button");
     spIn.onchange = () => { const n = Math.hypot(...m.velocity) || 1; m.velocity = m.velocity.map(c => c / n * +spIn.value); renderSetup(); };
+    dirIn.forEach(inp => inp.onchange = () => {
+      const d = dirIn.map(i => +i.value || 0), n = Math.hypot(...d);
+      if (n === 0) { renderSetup(); return; }                 // all zero: keep the old direction
+      const s = Math.hypot(...m.velocity) || 1;
+      m.velocity = d.map(c => +(c / n * s).toFixed(6));
+      renderSetup();
+    });
     flip.onclick = () => { m.velocity = m.velocity.map(c => -c); renderSetup(); };
     pick.onclick = async () => {
       pick.textContent = "click an edge on the part… (Esc cancels)";
@@ -416,6 +578,71 @@ function motionRow(p) {
     };
   }
   return tr;
+}
+
+// Motion manager: a moving part's steps, each over [start, end] s -- translate at a
+// velocity, or rotate at deg/s about a line (picked on an edge of the part).  The 3D view
+// shows the part at the time in the "preview at" box.
+function movingRows(p, td) {
+  const m = p.motion; m.steps ??= [];
+  const vec = v => v.map(c => +(+c).toFixed(4)).join(", ");
+  const dirText = v => { const n = Math.hypot(...v) || 1; return v.map(c => (c / n).toFixed(2)).join(", "); };
+  td.innerHTML = `<div>↳ motion steps (compose in order; rotation lines stay fixed in the world)
+      · preview at <input type="number" step="any" class="mv-prev" value="${S.movePreview ?? 0}" style="width:4em"> s</div>
+    <table class="tbl mv-steps"><thead><tr><th>step</th><th>start (s)</th><th>end (s)</th><th>motion</th><th></th></tr></thead><tbody></tbody></table>
+    <button class="small mv-add-t">+ translate</button> <button class="small mv-add-r">+ rotate</button>`;
+  const tb = td.querySelector("tbody");
+  const changed = () => { viewer.setPartMotion(p.name, m); viewer.setTime(+(S.movePreview ?? 0)); renderSetup(); };
+  m.steps.forEach((st, k) => {
+    const tr = document.createElement("tr");
+    let body;
+    if (st.kind === "translate") {
+      const sp = Math.hypot(...st.velocity);
+      body = `speed <input type="number" step="any" value="${+sp.toFixed(5)}" class="mv-speed"> m/s along (${dirText(st.velocity)})
+        <button class="small mv-pick">pick edge</button> <button class="small mv-flip">flip</button>
+        · travel ${+(sp * Math.max(st.end - st.start, 0)).toFixed(4)} m`;
+    } else {
+      body = `<input type="number" step="any" value="${st.deg_per_s}" class="mv-rate"> deg/s about (${dirText(st.axis)})
+        through (${vec(st.point)}) <button class="small mv-pick">pick axis edge</button> <button class="small mv-flip">flip</button>
+        · turns ${+(st.deg_per_s * Math.max(st.end - st.start, 0)).toFixed(2)}°`;
+    }
+    tr.innerHTML = `<td>${k + 1}. ${st.kind}</td>
+      <td><input type="number" step="any" value="${st.start}" class="mv-t0"></td>
+      <td><input type="number" step="any" value="${st.end}" class="mv-t1"></td>
+      <td>${body}</td><td><button class="small mv-del" title="remove step">×</button></td>`;
+    tr.querySelector(".mv-t0").onchange = e => { st.start = +e.target.value; changed(); };
+    tr.querySelector(".mv-t1").onchange = e => { st.end = +e.target.value; changed(); };
+    tr.querySelector(".mv-del").onclick = () => { m.steps.splice(k, 1); changed(); };
+    tr.querySelector(".mv-flip").onclick = () => {
+      if (st.kind === "translate") st.velocity = st.velocity.map(c => -c); else st.axis = st.axis.map(c => -c);
+      changed();
+    };
+    const pick = tr.querySelector(".mv-pick");
+    pick.onclick = async () => {
+      pick.textContent = "click an edge on the part… (Esc cancels)";
+      viewer.setTime(0);                                    // pick on the rest geometry
+      const r = await viewer.pickEdge(p.name);
+      if (r && st.kind === "translate") { const s = Math.hypot(...st.velocity) || 0.1; st.velocity = orientPicked(r.dir, st.velocity).map(c => +(c * s).toFixed(6)); }
+      if (r && st.kind === "rotate") { st.axis = orientPicked(r.dir, st.axis); st.point = r.mid.map(c => +c.toFixed(6)); }
+      changed();
+    };
+    if (st.kind === "translate") tr.querySelector(".mv-speed").onchange = e => {
+      const n = Math.hypot(...st.velocity) || 1; st.velocity = st.velocity.map(c => c / n * +e.target.value); changed();
+    };
+    else tr.querySelector(".mv-rate").onchange = e => { st.deg_per_s = +e.target.value; changed(); };
+    tb.appendChild(tr);
+  });
+  const last = () => m.steps.length ? Math.max(...m.steps.map(s => +s.end || 0)) : 0;
+  td.querySelector(".mv-add-t").onclick = () => {
+    const g = S.scen.gravity || [0, -9.81, 0], gn = Math.hypot(...g) || 1;
+    m.steps.push({ kind: "translate", start: last(), end: last() + 2, velocity: g.map(c => +(-0.1 * c / gn).toFixed(6)) });
+    changed();
+  };
+  td.querySelector(".mv-add-r").onclick = () => {
+    m.steps.push({ kind: "rotate", start: last(), end: last() + 2, point: viewer.partCentroid(p.name), axis: [0, 0, 1], deg_per_s: 15 });
+    changed();
+  };
+  td.querySelector(".mv-prev").onchange = e => { S.movePreview = +e.target.value; viewer.setTime(S.movePreview); };
 }
 
 async function uploadStl() {
@@ -518,6 +745,7 @@ async function refreshRun() {
   $("#results-empty").hidden = true; $("#results-view").hidden = false;
   $("#results-title").textContent = r.id;
   S.frames = r.frames; S.fps = r.fps;
+  if (S.lastRun !== r.id) S.speedMax = null;     // a new run sets its own colour range
   const slider = $("#frame-slider"); slider.max = Math.max(0, S.frames.length - 1);
   if ($("#win0").value === "" || S.lastRun !== r.id) {
     const tEnd = t.at(-1) || dur;
@@ -544,14 +772,16 @@ async function showFrame(i) {
   S.frameIdx = i; $("#frame-slider").value = i;
   const k = S.frames[i];
   $("#frame-label").textContent = `frame ${k}  ·  t = ${(k / S.fps).toFixed(2)} s`;
+  viewer.setTime(k / S.fps);                  // moving parts follow their schedule
   const buf = await api(`/api/runs/${S.run}/frame/${k}`);
   const n = new Uint32Array(buf, 0, 1)[0];
   const pos = new Float32Array(buf, 4, n * 3), spd = new Float32Array(buf, 4 + 12 * n, n);
-  S.lastSpeed = spd;
-  const hi = S.speedMax || (S.speedMax = Math.max(1, percentile(spd, 0.99)));
-  viewer.setParticles(pos, spd, 0, hi);
+  const rad = buf.byteLength >= 4 + 20 * n && n ? new Float32Array(buf, 4 + 16 * n, n) : null;
+  S.lastSpeed = spd; S.lastPos = pos; S.lastRadius = rad;
+  if (S.speedMax == null) autoSpeedRange(spd);
+  viewer.setParticles(pos, spd, S.speedMin, S.speedMax, rad);
   viewer.showParticles($("#show-particles").checked);
-  if ($("#colour-by").value === "speed") legend("speed (m/s)", 0, hi);
+  if ($("#colour-by").value === "speed") particleLegend();
   showDust(k);
 }
 
@@ -704,7 +934,7 @@ function refreshColouring() {
   }
   if (key === "speed") {
     viewer.clearWallMap();
-    if (S.lastSpeed) legend("speed (m/s)", 0, S.speedMax || 1);
+    if (S.lastSpeed) particleLegend();
     return;
   }
   const maps = S.analysis?.wall_maps;
@@ -720,9 +950,35 @@ function refreshColouring() {
   legend(`${labels[key]}${w ? `, mean ${fmt(w[0])}–${fmt(w[1])} s` : ""}`, 0, hi);
 }
 
-function legend(title, lo, hi) {
+// onRange(lo, hi), when given, makes the two ends editable (plus an "auto" button).
+function legend(title, lo, hi, onRange, onAuto) {
   const L = $("#legend"); L.hidden = false;
-  L.innerHTML = `<div>${title}</div><div class="bar" style="background:${colormapCss()}"></div><div class="ends"><span>${fmt(lo)}</span><span>${fmt(hi)}</span></div>`;
+  if (!onRange) {
+    L.innerHTML = `<div>${title}</div><div class="bar" style="background:${colormapCss()}"></div><div class="ends"><span>${fmt(lo)}</span><span>${fmt(hi)}</span></div>`;
+    return;
+  }
+  L.innerHTML = `<div>${title}</div><div class="bar" style="background:${colormapCss()}"></div>
+    <div class="ends"><input type="number" step="any" value="${fmt(lo)}" title="colour scale minimum">
+    <button class="small" title="0 to the 99th percentile of this frame">auto</button>
+    <input type="number" step="any" value="${fmt(hi)}" title="colour scale maximum"></div>`;
+  const [a, b] = L.querySelectorAll("input");
+  const apply = () => { const x = +a.value, y = +b.value; if (isFinite(x) && isFinite(y) && y > x) onRange(x, y); };
+  a.onchange = b.onchange = apply;
+  L.querySelector("button").onclick = onAuto;
+}
+
+// Particle colour = velocity magnitude.  The range is set once per run from the first frame
+// shown (0 to its 99th percentile) and then held, so frames stay comparable; the legend
+// ends edit it, "auto" resets it from the current frame.
+function autoSpeedRange(spd) { S.speedMin = 0; S.speedMax = Math.max(1e-3, percentile(spd, 0.99)); }
+function particleLegend() {
+  legend("velocity magnitude (m/s)", S.speedMin, S.speedMax,
+    (lo, hi) => { S.speedMin = lo; S.speedMax = hi; recolourParticles(); },
+    () => { autoSpeedRange(S.lastSpeed); recolourParticles(); particleLegend(); });
+}
+function recolourParticles() {
+  if (S.lastPos) viewer.setParticles(S.lastPos, S.lastSpeed, S.speedMin, S.speedMax, S.lastRadius);
+  viewer.showParticles($("#show-particles").checked);
 }
 
 // ---------------------------------------------------------------- start

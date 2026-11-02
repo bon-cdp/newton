@@ -52,6 +52,7 @@ import numpy as np
 import warp as wp
 
 from compare_bfa_mpm import read_frame
+from dem_analyze import grain_sizes
 
 wp.set_module_options({"enable_backward": False})
 
@@ -152,7 +153,8 @@ def solid_from_mask(mask: wp.array3d(dtype=wp.int32), active_bits: int,
 
 
 @wp.kernel
-def deposit_drag(pos: wp.array(dtype=wp.vec3), vel: wp.array(dtype=wp.vec3), radius: float,
+def deposit_drag(pos: wp.array(dtype=wp.vec3), vel: wp.array(dtype=wp.vec3),
+                 radius_a: wp.array(dtype=float),
                  u: wp.array3d(dtype=float), v: wp.array3d(dtype=float),
                  w: wp.array3d(dtype=float), origin: wp.vec3, h: float,
                  kc: wp.array3d(dtype=float), kuc: wp.array3d(dtype=wp.vec3)):
@@ -160,6 +162,7 @@ def deposit_drag(pos: wp.array(dtype=wp.vec3), vel: wp.array(dtype=wp.vec3), rad
     and K * v_grain, splatted trilinearly onto cell centres."""
     t = wp.tid()
     p = pos[t]
+    radius = radius_a[t]
     ua = _air_at(u, v, w, origin, h, p)
     rel = vel[t] - ua
     s = wp.length(rel)
@@ -547,6 +550,7 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
     t_start = time.time()
     for fi, (t, f) in enumerate(frames):
         fr = read_frame(f)
+        rad, gmass = grain_sizes(sc, fr)
         act = [1 if p.active[0] <= t < p.active[1] else 0 for p in sc.parts]
         if act != active_prev:
             bits = sum(1 << b for b, a in enumerate(act) if a)
@@ -568,11 +572,12 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
             j = lookup[ids]
             ok = j >= 0
             p0, v0 = ppos[j[ok]], pvel[j[ok]]
-            p1, v1 = fr["pos"][ok], fr["vel"][ok]
+            p1, v1, g1, r1 = fr["pos"][ok], fr["vel"][ok], gmass[ok], rad[ok]
             moved = np.linalg.norm(p1 - p0, axis=1) <= sc.solver.max_velocity * fdt
             p0, v0, p1, v1 = p0[moved], v0[moved], p1[moved], v1[moved]
-            diss = 0.5 * m.mass * ((v0 ** 2).sum(1) - (v1 ** 2).sum(1)) + m.mass * ((p1 - p0) @ gvec)
-            diss = np.where(diss > 1e-3 * m.mass * 9.81, diss, 0.0)   # below ~1 mm of fall: noise
+            g1, r1 = g1[moved], r1[moved]
+            diss = 0.5 * g1 * ((v0 ** 2).sum(1) - (v1 ** 2).sum(1)) + g1 * ((p1 - p0) @ gvec)
+            diss = np.where(diss > 1e-3 * g1 * 9.81, diss, 0.0)   # below ~1 mm of fall: noise
             tot = diss.sum()
             n_new = min(int(rng.poisson(parcels_per_s * fdt)) if tot > 0 else 0, cap - n_dust)
             if n_new > 0:
@@ -580,7 +585,7 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
                 src = rng.choice(len(diss), size=n_new, p=diss / tot)
                 d = rng.normal(size=(n_new, 3))
                 d /= np.linalg.norm(d, axis=1, keepdims=True)
-                xs = _open_air(p1[src], d, m.radius * 1.1, solid_np, origin, h, rng)
+                xs = _open_air(p1[src], d, float(r1[src].max()) * 1.1, solid_np, origin, h, rng)
                 cls = np.arange(n_dust, n_dust + n_new) % len(sizes)
                 sl = slice(n_dust, n_dust + n_new)
                 dx[sl].assign(xs.astype(np.float32))
@@ -597,7 +602,8 @@ def air_dust(run, t0=None, t1=None, cell=0.1, margin=0.5, nu_t=0.002, sizes_um=(
             kuc.zero_()
             if len(fr["pos"]):
                 wp.launch(deposit_drag, dim=len(fr["pos"]), device=device,
-                          inputs=[pos, vel, float(m.radius), u, v, w, org, h, kc, kuc])
+                          inputs=[pos, vel, wp.array(rad.astype(np.float32), dtype=float,
+                                                     device=device), u, v, w, org, h, kc, kuc])
             for ax, (src, dst) in enumerate(zip((u, v, w), tmp)):
                 wp.launch(advect, dim=src.shape, device=device,
                           inputs=[ax, src, u, v, w, org, h, dt, dst])

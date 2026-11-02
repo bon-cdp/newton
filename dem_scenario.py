@@ -41,6 +41,10 @@ class Material:
     name: str = "material"
     radius: float = 0.006                 # m
     density: float = 994.05               # kg/m3, intrinsic (solid) density
+    # Bulk density as entered (BFA's "Bulk Density"): when set, the grains' own density is
+    # bulk_density x packing_ratio (BFA's "Packing_Ratio" = intrinsic / bulk density).
+    bulk_density: float | None = None     # kg/m3
+    packing_ratio: float = 1.5
     youngs: float = 1.4220405e8           # Pa, TRUE modulus; the solver may soften it
     poisson: float = 0.30
     restitution: float = 0.20
@@ -57,10 +61,89 @@ class Material:
     kd_wall: float | None = None          # override grain-wall damping
     calibrate_restitution: bool = False
     rotation: bool = True
+    # Cohesion as a fraction of grain weight (BulkFlowAnalyst's Cohesion_Coefficient): while
+    # two grains touch they also pull together with cohesion x m x 9.81 N.  0 = cohesionless;
+    # 1 = a contact holds one grain's weight.  Calibrate against a repose test.
+    cohesion: float = 0.0
+    wall_cohesion: float | None = None    # grain-wall; None = same as cohesion
+    # Consolidation strength (simplified EEPA): each contact remembers the largest normal
+    # force it has carried and, while it lasts, also holds with consolidation x that force.
+    # Loose flow stays free; material compacted under load hardens, bridges and sticks --
+    # the effect of fines.  0 = off (no cost).  Typical 0.05-0.5.
+    consolidation: float = 0.0
+    wall_consolidation: float | None = None   # grain-wall; None = same as consolidation
+
+    # Size distribution: [{"radius": m, "fraction": mass fraction}, ...].  None (or one row)
+    # = every grain has `radius`.  Fractions are by MASS, as sieve curves are; they need not
+    # sum to 1 (normalised).
+    sizes: list | None = None
+    # Clumps (#10): a size row with "spheres": n > 1 is made of rigid clumps of n overlapping
+    # spheres (random shapes, clumps.py) with that row's volume and mass; `spheres` is the
+    # same for the single size (no rows).  1 = plain spheres.
+    spheres: int = 1
+
+    def __post_init__(self):
+        if self.bulk_density:
+            rho = float(self.bulk_density) * float(self.packing_ratio)
+            if abs(rho - self.density) > 1e-9 * rho:     # keep a saved value bit-exact
+                self.density = rho
 
     @property
     def mass(self) -> float:
         return 4.0 / 3.0 * math.pi * self.radius ** 3 * self.density
+
+    def classes(self) -> list[tuple[float, float, float]]:
+        """[(radius, grain mass, NUMBER fraction)] per size class.  A mass fraction w of
+        grains of mass m is w/m grains per kg, so number fractions are w_k/m_k normalised."""
+        rows = [r for r in (self.sizes or []) if float(r.get("fraction", 0)) > 0]
+        if not rows:
+            return [(self.radius, self.mass, 1.0)]
+        rad = [float(r["radius"]) for r in rows]
+        w = [float(r["fraction"]) for r in rows]
+        m = [4.0 / 3.0 * math.pi * x ** 3 * self.density for x in rad]
+        n = [wk / mk for wk, mk in zip(w, m)]
+        tot = sum(n)
+        return [(x, mk, nk / tot) for x, mk, nk in zip(rad, m, n)]
+
+    def class_spheres(self) -> list[int]:
+        """Spheres per grain of each size class (1 = a sphere, n > 1 = a clump)."""
+        rows = [r for r in (self.sizes or []) if float(r.get("fraction", 0)) > 0]
+        if not rows:
+            return [max(1, int(self.spheres or 1))]
+        return [max(1, int(r.get("spheres", 1) or 1)) for r in rows]
+
+    def class_templates(self, seed: int = 0):
+        """Per size class: None (spheres) or its random clump shapes (clumps.templates)."""
+        from clumps import templates
+        return [None if n == 1 else templates(r, n, self.density, seed + 31 * k)
+                for k, ((r, _m, _p), n) in enumerate(zip(self.classes(), self.class_spheres()))]
+
+    def _particle_radii(self):
+        """Radii of the actual spheres simulated: each class's radius, or its clumps'
+        member spheres."""
+        out = []
+        for (r, _m, _p), t in zip(self.classes(), self.class_templates()):
+            out += [r] if t is None else [float(x) for tt in t for x in tt.radii]
+        return out
+
+    @property
+    def mean_mass(self) -> float:
+        """Mean grain mass (kg): mass rate / mean_mass = grains per second."""
+        return sum(m * p for _r, m, p in self.classes())
+
+    @property
+    def radius_max(self) -> float:
+        """Largest simulated sphere (a clump's member spheres, not the clump)."""
+        if all(n == 1 for n in self.class_spheres()):
+            return max(r for r, _m, _p in self.classes())
+        return max(self._particle_radii())
+
+    @property
+    def radius_min(self) -> float:
+        """Smallest simulated sphere: it sets the timestep."""
+        if all(n == 1 for n in self.class_spheres()):
+            return min(r for r, _m, _p in self.classes())
+        return min(self._particle_radii())
 
 
 @dataclass
@@ -75,8 +158,12 @@ class Part:
     thickness: float = 0.0                # m, shell half-thickness (two-sided only)
     friction: float = 0.5                 # grain-wall Coulomb
     active: list[float] = field(default_factory=lambda: [0.0, INF])   # [on, off) seconds
-    motion: dict | None = None            # surface motion (belt / rotating), see dem_run.surface_motion
+    motion: dict | None = None            # belt / rotating surface (dem_run.surface_motion), or
+                                          # "moving": rigid steps (dem_run.motion_pose, #14)
     corners: bool = False                 # second contact in concave creases of this part (#13)
+    consolidation: float | None = None    # grain-wall consolidation strength; None = material
+    cohesion: float | None = None         # grain-wall cohesion for this part (x grain weight);
+                                          # None = the material's wall_cohesion
 
 
 @dataclass
@@ -104,6 +191,11 @@ class Injector:
     set_coordinate: list[float] | None = None   # [axis, value]: place all sites on that plane
     offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # m, added to sites
     box: dict | None = None               # box injector instead of face_stl (see above)
+    extrude: float = 0.0                  # m: fill the face extruded this far along its normal
+                                          # (0 = sites on the face itself, the original layout)
+    extrude_flip: bool = False            # extrude to the other side of the face
+    extrude_offset: float = 0.0           # m: start the extruded volume this far from the face,
+                                          # along the same (flipped) normal
 
 
 @dataclass

@@ -31,6 +31,28 @@ function discSprite() {
   return new THREE.CanvasTexture(c);
 }
 
+// Pose of a moving part at time t: rest geometry x -> M x.  Steps compose in list order,
+// each acting on the result of the ones before; rotations turn about a line fixed in the
+// world (dem_run.motion_pose).
+export function motionPose(motion, t) {
+  const M = new THREE.Matrix4();
+  for (const st of motion.steps || []) {
+    const t0 = +st.start || 0, t1 = +st.end || 0;
+    const tau = Math.min(Math.max(t - t0, 0), Math.max(t1 - t0, 0));
+    if (st.kind === "translate") {
+      const v = st.velocity;
+      M.premultiply(new THREE.Matrix4().makeTranslation(v[0] * tau, v[1] * tau, v[2] * tau));
+    } else if (st.kind === "rotate") {
+      const ax = new THREE.Vector3(...st.axis).normalize(), p = st.point;
+      const R = new THREE.Matrix4().makeRotationAxis(ax, THREE.MathUtils.degToRad(+st.deg_per_s) * tau);
+      const toP = new THREE.Matrix4().makeTranslation(p[0], p[1], p[2]);
+      const fromP = new THREE.Matrix4().makeTranslation(-p[0], -p[1], -p[2]);
+      M.premultiply(fromP).premultiply(R).premultiply(toP);
+    }
+  }
+  return M;
+}
+
 export class Viewer {
   constructor(el) {
     this.el = el;
@@ -43,7 +65,9 @@ export class Viewer {
     this.camera.position.set(3, 2, 5);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x8890a0, 1.1));
+    this.hemi = new THREE.HemisphereLight(0xffffff, 0x8890a0, 1.1);
+    this.scene.add(this.hemi);
+    this.up = new THREE.Vector3(0, 1, 0);
     const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(3, 8, 5);
     this.scene.add(sun);
     this.world = new THREE.Group(); this.scene.add(this.world);
@@ -53,8 +77,115 @@ export class Viewer {
     this.grainRadius = 0.006;
     new ResizeObserver(() => this.resize()).observe(el);
     this.resize();
-    const loop = () => { this.controls.update(); this.renderer.render(this.scene, this.camera); requestAnimationFrame(loop); };
+    this.makeCameraPanel();
+    const loop = () => {
+      this.controls.update(); this.renderer.render(this.scene, this.camera);
+      this.refreshCameraPanel();
+      requestAnimationFrame(loop);
+    };
     loop();
+  }
+
+  // ---- camera box: see and set the view (angles, distance, FOV, target, position) -----
+  // Angles are about the target in the "up" frame (up = against gravity): azimuth from
+  // the horizontal axis e1 (x, or y for X-up) towards e2 = e1 x up, elevation above the
+  // horizontal.  Distance is the zoom (camera to target).
+  viewFrame() {
+    const up = this.up.clone();
+    const a = Math.abs(up.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const e1 = a.sub(up.clone().multiplyScalar(a.dot(up))).normalize();
+    const e2 = new THREE.Vector3().crossVectors(e1, up);
+    return { e1, e2, up };
+  }
+
+  getView() {
+    const t = this.controls.target, p = this.camera.position;
+    const off = p.clone().sub(t), dist = off.length() || 1e-9;
+    const { e1, e2, up } = this.viewFrame();
+    return {
+      azimuth: THREE.MathUtils.radToDeg(Math.atan2(off.dot(e2), off.dot(e1))),
+      elevation: THREE.MathUtils.radToDeg(Math.asin(Math.max(-1, Math.min(1, off.dot(up) / dist)))),
+      distance: dist, fov: this.camera.fov, target: t.toArray(), position: p.toArray(),
+    };
+  }
+
+  // any subset of {azimuth, elevation, distance, fov, target, position}; position wins over
+  // angles + distance when both are given
+  setView(v) {
+    const cur = this.getView();
+    if (v.target) this.controls.target.set(...v.target);
+    if (v.fov) { this.camera.fov = Math.min(Math.max(+v.fov, 5), 120); this.camera.updateProjectionMatrix(); }
+    if (v.position) {
+      this.camera.position.set(...v.position);
+    } else {
+      const az = THREE.MathUtils.degToRad(v.azimuth ?? cur.azimuth);
+      const el = THREE.MathUtils.degToRad(Math.min(Math.max(v.elevation ?? cur.elevation, -89.9), 89.9));
+      const d = Math.max(+(v.distance ?? cur.distance), 1e-6);
+      const { e1, e2, up } = this.viewFrame();
+      const off = e1.multiplyScalar(Math.cos(el) * Math.cos(az)).add(e2.multiplyScalar(Math.cos(el) * Math.sin(az)))
+        .add(up.multiplyScalar(Math.sin(el))).multiplyScalar(d);
+      this.camera.position.copy(this.controls.target).add(off);
+    }
+    const d = this.camera.position.distanceTo(this.controls.target);
+    if (this.camera.far < 3 * d) { this.camera.far = 20 * d; this.camera.near = d / 1000; this.camera.updateProjectionMatrix(); }
+    this.controls.update();
+    this._camSig = null;
+  }
+
+  makeCameraPanel() {
+    const box = document.createElement("div");
+    box.className = "cam-panel";
+    const num = (k, step = "any") => `<input type="number" step="${step}" data-k="${k}">`;
+    box.innerHTML = `<div class="cam-head" title="show / hide">camera ▾</div>
+      <div class="cam-body">
+        <div class="cam-row"><span>azimuth °</span>${num("azimuth")}<span>elevation °</span>${num("elevation")}</div>
+        <div class="cam-row"><span>distance m</span>${num("distance")}<span>FOV °</span>${num("fov")}</div>
+        <div class="cam-row"><span>target</span>${num("t0")}${num("t1")}${num("t2")}</div>
+        <div class="cam-row"><span>position</span>${num("p0")}${num("p1")}${num("p2")}</div>
+        <div class="cam-row cam-btns"><button data-v="top">top</button><button data-v="front">front</button>
+          <button data-v="side">side</button><button data-v="fit">fit</button></div>
+      </div>`;
+    this.el.appendChild(box);
+    this.camPanel = box;
+    const head = box.querySelector(".cam-head"), body = box.querySelector(".cam-body");
+    let open = true;
+    try { open = localStorage.getItem("demCamPanel") !== "closed"; } catch (_) { /* no storage */ }
+    const show = () => { body.hidden = !open; head.textContent = open ? "camera ▾" : "camera ▸"; };
+    show();
+    head.onclick = () => { open = !open; show(); try { localStorage.setItem("demCamPanel", open ? "open" : "closed"); } catch (_) { /* ignore */ } };
+    this.camInputs = Object.fromEntries([...box.querySelectorAll("input")].map(i => [i.dataset.k, i]));
+    const val = k => +this.camInputs[k].value;
+    for (const [k, inp] of Object.entries(this.camInputs)) {
+      inp.onchange = () => {
+        if (!isFinite(+inp.value) || inp.value === "") { this._camSig = null; return; }
+        if (k === "azimuth" || k === "elevation" || k === "distance") this.setView({ [k]: val(k) });
+        else if (k === "fov") this.setView({ fov: val("fov") });
+        else if (k[0] === "t") this.setView({ target: [val("t0"), val("t1"), val("t2")], position: this.camera.position.toArray() });
+        else this.setView({ position: [val("p0"), val("p1"), val("p2")] });
+      };
+      inp.onkeydown = e => { if (e.key === "Enter") inp.blur(); };
+    }
+    box.querySelectorAll("button").forEach(b => b.onclick = () => {
+      const v = b.dataset.v;
+      if (v === "fit") { if (this.lastBox) this.fit(this.lastBox); this._camSig = null; return; }
+      if (v === "top") this.setView({ elevation: 89.9, azimuth: -90 });
+      if (v === "front") this.setView({ elevation: 0, azimuth: 90 });
+      if (v === "side") this.setView({ elevation: 0, azimuth: 0 });
+    });
+  }
+
+  refreshCameraPanel() {
+    if (!this.camPanel || this.camPanel.querySelector(".cam-body").hidden) return;
+    const v = this.getView();
+    const sig = [...v.target, ...v.position, v.fov].map(x => x.toFixed(4)).join();
+    if (sig === this._camSig) return;
+    this._camSig = sig;
+    const fmt = x => +(+x).toPrecision(5);
+    const vals = { azimuth: v.azimuth.toFixed(1), elevation: v.elevation.toFixed(1), distance: fmt(v.distance),
+                   fov: v.fov.toFixed(0), t0: fmt(v.target[0]), t1: fmt(v.target[1]), t2: fmt(v.target[2]),
+                   p0: fmt(v.position[0]), p1: fmt(v.position[1]), p2: fmt(v.position[2]) };
+    for (const [k, inp] of Object.entries(this.camInputs))
+      if (document.activeElement !== inp) inp.value = vals[k];       // never under the cursor
   }
 
   resize() {
@@ -93,7 +224,8 @@ export class Viewer {
         new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.8 }));
       this.world.add(mesh, edges);
       g.computeBoundingBox(); box.union(g.boundingBox);
-      this.parts.push({ name: p.name, mesh, edges, triOffset, nTri: p.n_tri, color: PALETTE[k % PALETTE.length], baseColors: cols.slice() });
+      this.parts.push({ name: p.name, mesh, edges, triOffset, nTri: p.n_tri, color: PALETTE[k % PALETTE.length], baseColors: cols.slice(),
+                        motion: p.motion });
       triOffset += p.n_tri;
     });
     for (const inj of geo.injectors || []) {
@@ -101,6 +233,27 @@ export class Viewer {
         const t = b64(inj.triangles, Float32Array);
         const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(t, 3));
         this.world.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.5 })));
+        if (inj.top_triangles) {
+          // extruded injection volume: the swept face, its outline joined to the face, and an
+          // arrow along the extrusion direction
+          const tt = b64(inj.top_triangles, Float32Array);
+          const g2 = new THREE.BufferGeometry(); g2.setAttribute("position", new THREE.BufferAttribute(tt, 3));
+          this.world.add(new THREE.Mesh(g2, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.18, depthWrite: false })));
+          // base of the volume: the face itself, or the face moved by the offset
+          const tb = inj.base_triangles ? b64(inj.base_triangles, Float32Array) : t;
+          if (inj.base_triangles) {
+            const gb = new THREE.BufferGeometry(); gb.setAttribute("position", new THREE.BufferAttribute(tb, 3));
+            this.world.add(new THREE.Mesh(gb, new THREE.MeshBasicMaterial({ color: 0x16a34a, side: THREE.DoubleSide, transparent: true, opacity: 0.18, depthWrite: false })));
+          }
+          const seg = [];
+          for (let k = 0; k < tb.length; k += 3) seg.push(tb[k], tb[k + 1], tb[k + 2], tt[k], tt[k + 1], tt[k + 2]);
+          const lg = new THREE.BufferGeometry(); lg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(seg), 3));
+          this.world.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x16a34a, transparent: true, opacity: 0.6 })));
+          const len = Math.max(inj.depth, 1e-3);
+          this.world.add(new THREE.ArrowHelper(new THREE.Vector3(...inj.normal), new THREE.Vector3(...inj.centre),
+                                               len * 1.4, 0x15803d, len * 0.35, len * 0.2));
+          for (let k = 0; k < tt.length; k += 3) box.expandByPoint(new THREE.Vector3(tt[k], tt[k + 1], tt[k + 2]));
+        }
       }
       if (inj.box_corners) this.world.add(...this.injectorBox(inj.box_corners));
     }
@@ -137,11 +290,38 @@ export class Viewer {
     return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xf59e0b, side: THREE.DoubleSide, transparent: true, opacity: 0.18, depthWrite: false }));
   }
 
+  // "Up" = against gravity: CAD geometry is often Z-up.  OrbitControls cache the camera's up
+  // when they are built, so they are rebuilt (keeping the target) when it changes.
+  setUp(gravity) {
+    const gv = gravity || [0, -9.81, 0];
+    const g = new THREE.Vector3(gv[0], gv[1], gv[2]);
+    if (g.lengthSq() < 1e-12) return;
+    const up = g.negate().normalize();
+    if (up.distanceTo(this.up) < 1e-6) return;
+    this.up = up;
+    const target = this.controls.target.clone();
+    this.controls.dispose();
+    this.camera.up.copy(up);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.target.copy(target);
+    this.hemi.position.copy(up);              // sky light from above
+    if (this.lastBox) this.fit(this.lastBox);
+  }
+
   fit(box) {
     if (box.isEmpty()) return;
+    this.lastBox = box.clone();
     const c = box.getCenter(new THREE.Vector3()), s = box.getSize(new THREE.Vector3()).length();
     this.controls.target.copy(c);
-    this.camera.position.copy(c).add(new THREE.Vector3(0.55, 0.35, 0.75).multiplyScalar(s));
+    // view from above and to one side, in a frame whose vertical is "up" (for Y-up this is
+    // the original (0.55, 0.35, 0.75) offset)
+    const up = this.up;
+    const a = Math.abs(up.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const e1 = a.sub(up.clone().multiplyScalar(a.dot(up))).normalize();
+    const e2 = new THREE.Vector3().crossVectors(e1, up);
+    const off = e1.multiplyScalar(0.55).add(up.clone().multiplyScalar(0.35)).add(e2.multiplyScalar(0.75));
+    this.camera.position.copy(c).add(off.multiplyScalar(s));
     this.camera.near = s / 1000; this.camera.far = s * 20; this.camera.updateProjectionMatrix();
   }
 
@@ -190,6 +370,24 @@ export class Viewer {
       canvas.addEventListener("pointerdown", onDown, true);
       window.addEventListener("keydown", onKey);
     });
+  }
+
+  // Moving parts (motion manager): pose every part whose motion is "moving" at time t
+  // (s), from its schedule -- the same composition as dem_run.motion_pose.
+  setTime(t) {
+    for (const p of this.parts) {
+      if (p.motion?.type !== "moving") {
+        if (!p.mesh.matrixAutoUpdate) for (const o of [p.mesh, p.edges]) { o.matrix.identity(); o.matrixAutoUpdate = true; }
+        continue;
+      }
+      const M = motionPose(p.motion, t);
+      for (const o of [p.mesh, p.edges]) { o.matrixAutoUpdate = false; o.matrix.copy(M); o.matrixWorldNeedsUpdate = true; }
+    }
+  }
+
+  setPartMotion(name, motion) {
+    const p = this.parts.find(q => q.name === name);
+    if (p) p.motion = motion;
   }
 
   flashEdge(a, b) {
@@ -241,29 +439,50 @@ export class Viewer {
     if (p) { p.mesh.visible = on; p.edges.visible = on; }
   }
 
-  setParticles(pos, scalar, lo, hi) {
+  // radii: one per grain (a size distribution), or null = every grain grainRadius.
+  // PointsMaterial has one size, so each distinct radius gets its own THREE.Points.
+  setParticles(pos, scalar, lo, hi, radii = null) {
     const n = pos.length / 3, cols = new Float32Array(n * 3);
     for (let i = 0; i < n; i++) cols.set(colormap((scalar[i] - lo) / (hi - lo || 1)), i * 3);
-    if (!this.points) {
-      const g = new THREE.BufferGeometry();
-      this.points = new THREE.Points(g, new THREE.PointsMaterial({
-        size: this.pointSize(), sizeAttenuation: true, vertexColors: true,
-        map: this.sprite, alphaTest: 0.5 }));
-      this.scene.add(this.points);
+    const groups = new Map();                       // radius (µm) -> grain indices
+    if (radii) for (let i = 0; i < n; i++) {
+      const key = Math.round(radii[i] * 1e6);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(i);
     }
-    this.points.material.size = this.pointSize();
-    const g = this.points.geometry;
-    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-    g.setAttribute("color", new THREE.BufferAttribute(cols, 3));
-    g.computeBoundingSphere();
+    const sets = groups.size > 1
+      ? [...groups].map(([key, idx]) => {
+          const p = new Float32Array(idx.length * 3), c = new Float32Array(idx.length * 3);
+          idx.forEach((i, j) => { p.set(pos.subarray(3 * i, 3 * i + 3), 3 * j); c.set(cols.subarray(3 * i, 3 * i + 3), 3 * j); });
+          return [key * 1e-6, p, c];
+        })
+      : [[groups.size ? [...groups.keys()][0] * 1e-6 : this.grainRadius, pos, cols]];
+    if (!this.points) { this.points = new THREE.Group(); this.scene.add(this.points); }
+    while (this.points.children.length > sets.length) {
+      const o = this.points.children.at(-1);
+      o.geometry.dispose(); o.material.dispose(); this.points.remove(o);
+    }
+    sets.forEach(([r, p, c], k) => {
+      let pts = this.points.children[k];
+      if (!pts) {
+        pts = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({
+          sizeAttenuation: true, vertexColors: true, map: this.sprite, alphaTest: 0.5 }));
+        this.points.add(pts);
+      }
+      pts.material.size = this.pointSize(r);
+      const g = pts.geometry;
+      g.setAttribute("position", new THREE.BufferAttribute(p, 3));
+      g.setAttribute("color", new THREE.BufferAttribute(c, 3));
+      g.computeBoundingSphere();
+    });
   }
 
   // three.js draws an attenuated point size * (viewport height / 2) / depth pixels across,
   // which leaves out the camera's field of view: a grain's true diameter on screen is
   // 2r * (height / 2) / (depth * tan(fov / 2)).  The disc sprite fills 31/32 of its texture.
-  pointSize() {
+  pointSize(r = this.grainRadius) {
     const t = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-    return 2 * this.grainRadius / t * 32 / 31;
+    return 2 * r / t * 32 / 31;
   }
 
   showParticles(on) { if (this.points) this.points.visible = on; }
